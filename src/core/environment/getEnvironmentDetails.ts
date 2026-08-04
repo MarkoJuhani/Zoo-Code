@@ -65,28 +65,33 @@ export async function getEnvironmentDetails(cline: Task, includeFileDetails: boo
 		details += `\n${allowedOpenTabs}`
 	}
 
-	// Get task-specific and background terminals.
-	const busyTerminals = [
+	// Get active terminals only to determine whether waiting is necessary.
+	const candidateBusyTerminals = [
 		...TerminalRegistry.getTerminals(true, cline.taskId),
 		...TerminalRegistry.getBackgroundTerminals(true),
 	]
 
-	const inactiveTerminals = [
-		...TerminalRegistry.getTerminals(false, cline.taskId),
-		...TerminalRegistry.getBackgroundTerminals(false),
-	]
-
-	if (busyTerminals.length > 0) {
+	if (candidateBusyTerminals.length > 0) {
 		if (cline.didEditFile) {
 			await delay(300) // Delay after saving file to let terminals catch up.
 		}
 
 		// Wait for terminals to cool down.
-		await pWaitFor(() => busyTerminals.every((t) => !TerminalRegistry.isProcessHot(t.id)), {
+		await pWaitFor(() => candidateBusyTerminals.every((t) => !TerminalRegistry.isProcessHot(t.id)), {
 			interval: 100,
 			timeout: 5_000,
 		}).catch(() => {})
 	}
+
+	// Re-query terminal state after waiting so rendering reflects lifecycle changes.
+	const busyTerminals = [
+		...TerminalRegistry.getTerminals(true, cline.taskId),
+		...TerminalRegistry.getBackgroundTerminals(true),
+	]
+	const inactiveTerminals = [
+		...TerminalRegistry.getTerminals(false, cline.taskId),
+		...TerminalRegistry.getBackgroundTerminals(false),
+	]
 
 	// Reset, this lets us know when to wait for saved files to update terminals.
 	cline.didEditFile = false
