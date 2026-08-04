@@ -246,6 +246,34 @@ describe("getEnvironmentDetails", () => {
 		expect(vi.mocked(pWaitFor)).toHaveBeenCalled()
 	})
 
+	it("renders a terminal that completes during the wait as inactive", async () => {
+		let active = true
+		const completedProcess = {
+			command: "npm test",
+			getUnretrievedOutput: vi.fn().mockReturnValue("Completed output"),
+		}
+		const terminal = {
+			id: "terminal-1",
+			getLastCommand: vi.fn().mockReturnValue("npm test"),
+			getProcessesWithOutput: vi.fn().mockReturnValue([completedProcess]),
+			cleanCompletedProcessQueue: vi.fn(),
+			getCurrentWorkingDirectory: vi.fn().mockReturnValue("/test/path"),
+		} as MockTerminal
+
+		;(TerminalRegistry.getTerminals as Mock).mockImplementation((isActive: boolean) =>
+			isActive === active ? [terminal] : [],
+		)
+		vi.mocked(pWaitFor).mockImplementation(async () => {
+			active = false
+		})
+
+		const result = await getEnvironmentDetails(mockCline as Task)
+
+		expect(result).toContain("## Terminal terminal-1 (Inactive)")
+		expect(result).toContain("Completed output")
+		expect(result).not.toContain("## Terminal terminal-1 (Active)")
+	})
+
 	it("should include inactive terminals with output", async () => {
 		const mockProcess = {
 			command: "npm build",
