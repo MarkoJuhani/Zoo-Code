@@ -11,7 +11,7 @@ vi.mock("vscode", () => {
 	}
 	const workspace = {
 		getConfiguration: vi.fn(() => ({
-			get: vi.fn((_key: string, defaultValue: any) => defaultValue),
+			get: vi.fn((_key: string, defaultValue?: unknown) => defaultValue),
 			update: vi.fn(),
 		})),
 		workspaceFolders: [],
@@ -29,15 +29,15 @@ vi.mock("@roo-code/ipc", () => {
 		public listen = vi.fn()
 		public send = vi.fn()
 		public broadcast = vi.fn()
-		private listeners: Record<string, Function[]> = {}
+		private listeners: Record<string, ((...args: unknown[]) => unknown | Promise<unknown>)[]> = {}
 
-		public on(event: string, fn: Function) {
+		public on(event: string, fn: (...args: unknown[]) => unknown | Promise<unknown>) {
 			this.listeners[event] = this.listeners[event] || []
 			this.listeners[event].push(fn)
 			return this
 		}
 
-		public async trigger(event: string, ...args: any[]) {
+		public async trigger(event: string, ...args: unknown[]) {
 			const fns = this.listeners[event] || []
 			for (const fn of fns) {
 				await fn(...args)
@@ -48,12 +48,31 @@ vi.mock("@roo-code/ipc", () => {
 })
 
 import { API } from "../extension/api"
+import type { ClineProvider } from "../core/webview/ClineProvider"
+import type * as vscode from "vscode"
+
+type MockIpcType = {
+	trigger: (event: string, ...args: unknown[]) => Promise<void>
+	send: ReturnType<typeof vi.fn>
+	broadcast: ReturnType<typeof vi.fn>
+}
 
 describe("Queue Protocol v1 - Lease, Targeted Acceptance, Snapshot and Cancellation", () => {
-	let outputChannel: any
-	let mockSidebarProvider: any
+	let outputChannel: { appendLine: ReturnType<typeof vi.fn> }
+	let mockSidebarProvider: {
+		context: { globalStorageUri: { fsPath: string } }
+		cwd: string
+		on: ReturnType<typeof vi.fn>
+		getCurrentTask: ReturnType<typeof vi.fn>
+		evictCurrentTask: ReturnType<typeof vi.fn>
+		postStateToWebview: ReturnType<typeof vi.fn>
+		postMessageToWebview: ReturnType<typeof vi.fn>
+		handleModeSwitch: ReturnType<typeof vi.fn>
+		createTask: ReturnType<typeof vi.fn>
+		cancelTask: ReturnType<typeof vi.fn>
+	}
 	let api: API
-	let mockIpc: any
+	let mockIpc: MockIpcType
 
 	beforeEach(() => {
 		vi.clearAllMocks()
@@ -71,8 +90,13 @@ describe("Queue Protocol v1 - Lease, Targeted Acceptance, Snapshot and Cancellat
 			cancelTask: vi.fn().mockResolvedValue(undefined),
 		}
 
-		api = new API(outputChannel, mockSidebarProvider, "/tmp/test.sock", false)
-		mockIpc = (api as any).ipc
+		api = new API(
+			outputChannel as unknown as vscode.OutputChannel,
+			mockSidebarProvider as unknown as ClineProvider,
+			"/tmp/test.sock",
+			false,
+		)
+		mockIpc = (api as unknown as { ipc: MockIpcType }).ipc
 	})
 
 	it("QueueAcquireLease grants exclusive lease to caller and rejects competing owner", async () => {
@@ -277,7 +301,9 @@ describe("Queue Protocol v1 - Lease, Targeted Acceptance, Snapshot and Cancellat
 
 		// Targeted cancel with valid ownership succeeds
 		mockSidebarProvider.getCurrentTask.mockReturnValue({ taskId: "root-123" })
-		;(api as any).queueDispatches.set("root-123", { rootTaskId: "root-123" })
+		;(api as unknown as { queueDispatches: Map<string, { rootTaskId: string }> }).queueDispatches.set("root-123", {
+			rootTaskId: "root-123",
+		})
 
 		await mockIpc.trigger(IpcMessageType.TaskCommand, "client-1", {
 			commandName: TaskCommandName.QueueCancelTask,

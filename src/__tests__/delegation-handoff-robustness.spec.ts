@@ -13,7 +13,7 @@ vi.mock("vscode", () => {
 	}
 	const workspace = {
 		getConfiguration: vi.fn(() => ({
-			get: vi.fn((_key: string, defaultValue: any) => defaultValue),
+			get: vi.fn((_key: string, defaultValue?: unknown) => defaultValue),
 			update: vi.fn(),
 		})),
 		workspaceFolders: [],
@@ -51,7 +51,7 @@ import { ClineProvider } from "../core/webview/ClineProvider"
 import { makeProviderStub } from "./helpers/provider-stub"
 import { TaskScheduler } from "../core/task/TaskScheduler"
 
-function makeTaskHistoryStoreStub(childItem: Record<string, any>, parentItem: Record<string, any>) {
+function makeTaskHistoryStoreStub(childItem: Partial<HistoryItem>, parentItem: Partial<HistoryItem>) {
 	const itemMap = new Map<string, Partial<HistoryItem>>([
 		[childItem.id!, childItem],
 		[parentItem.id!, parentItem],
@@ -83,7 +83,7 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 
 	it("reopenParentFromDelegation resolves immediately without waiting for a long-running parent task loop", async () => {
 		const emitSpy = vi.fn()
-		const parentItem = {
+		const parentItem: Partial<HistoryItem> = {
 			id: "parent-async",
 			status: "delegated",
 			awaitingChildId: "child-async",
@@ -124,13 +124,17 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 			createTaskWithHistoryItem: vi.fn().mockResolvedValue(parentInstance),
 			taskHistoryStore,
 			taskScheduler: scheduler,
-		} as any)
-
-		// Record transition generation 2
-		;(provider as any).delegationTransitions = new Map([["parent-async", 2]])
+			delegationTransitions: new Map([["parent-async", 2]]),
+		})
 
 		// Call reopenParentFromDelegation - this must resolve to true immediately and NOT hang!
-		const reopenPromise = (ClineProvider.prototype as any).reopenParentFromDelegation.call(provider, {
+		type ReopenMethod = (
+			this: ClineProvider,
+			params: { parentTaskId: string; childTaskId: string; completionResultSummary?: string },
+		) => Promise<boolean>
+		const reopenPromise = (
+			ClineProvider.prototype as unknown as { reopenParentFromDelegation: ReopenMethod }
+		).reopenParentFromDelegation.call(provider, {
 			parentTaskId: "parent-async",
 			childTaskId: "child-async",
 			completionResultSummary: "Subtask Done",
@@ -165,7 +169,7 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 	})
 
 	it("releases the delegation transition lock immediately so a subsequent transition can run", async () => {
-		const parentItem = {
+		const parentItem: Partial<HistoryItem> = {
 			id: "parent-lock",
 			status: "delegated",
 			awaitingChildId: "child-lock-1",
@@ -195,10 +199,16 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 			createTaskWithHistoryItem: vi.fn().mockResolvedValue(parentInstance),
 			taskHistoryStore,
 			taskScheduler: new TaskScheduler(1),
-		} as any)
+		})
 
+		type ReopenMethod = (
+			this: ClineProvider,
+			params: { parentTaskId: string; childTaskId: string; completionResultSummary?: string },
+		) => Promise<boolean>
 		// 1st reopen completes
-		await (ClineProvider.prototype as any).reopenParentFromDelegation.call(provider, {
+		await (
+			ClineProvider.prototype as unknown as { reopenParentFromDelegation: ReopenMethod }
+		).reopenParentFromDelegation.call(provider, {
 			parentTaskId: "parent-lock",
 			childTaskId: "child-lock-1",
 			completionResultSummary: "Result 1",
@@ -206,7 +216,11 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 
 		// A subsequent transition on the same parent is NOT blocked behind the running parent loop
 		let secondTransitionRan = false
-		await (provider as any).runDelegationTransition("parent-lock", async () => {
+		await (
+			provider as unknown as {
+				runDelegationTransition: (parentTaskId: string, fn: () => Promise<void>) => Promise<void>
+			}
+		).runDelegationTransition("parent-lock", async () => {
 			secondTransitionRan = true
 		})
 

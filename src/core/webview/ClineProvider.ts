@@ -535,7 +535,10 @@ export class ClineProvider
 		event: K,
 		listener: (...args: TaskProviderEvents[K]) => void | Promise<void>,
 	): this {
-		return super.on(event, listener as any)
+		return (super.on as (event: K, listener: (...args: TaskProviderEvents[K]) => void | Promise<void>) => this)(
+			event,
+			listener,
+		)
 	}
 
 	/**
@@ -545,7 +548,10 @@ export class ClineProvider
 		event: K,
 		listener: (...args: TaskProviderEvents[K]) => void | Promise<void>,
 	): this {
-		return super.off(event, listener as any)
+		return (super.off as (event: K, listener: (...args: TaskProviderEvents[K]) => void | Promise<void>) => this)(
+			event,
+			listener,
+		)
 	}
 
 	/**
@@ -959,7 +965,7 @@ export class ClineProvider
 	public static async handleCodeAction(
 		command: CodeActionId,
 		promptType: CodeActionName,
-		params: Record<string, string | any[]>,
+		params: Record<string, string | unknown[]>,
 	): Promise<void> {
 		// Capture telemetry for code action usage
 		TelemetryService.instance.captureCodeActionUsed(promptType)
@@ -991,7 +997,7 @@ export class ClineProvider
 	public static async handleTerminalAction(
 		command: TerminalActionId,
 		promptType: TerminalActionPromptType,
-		params: Record<string, string | any[]>,
+		params: Record<string, string | unknown[]>,
 	): Promise<void> {
 		TelemetryService.instance.captureCodeActionUsed(promptType)
 
@@ -1760,7 +1766,7 @@ export class ClineProvider
 				}
 
 				// Only update the task's mode after successful persistence.
-				;(task as any)._taskMode = newMode
+				;(task as unknown as { _taskMode: Mode })._taskMode = newMode
 			} catch (error) {
 				// If persistence fails, log the error but don't update the in-memory state.
 				this.log(
@@ -1878,7 +1884,7 @@ export class ClineProvider
 			task.updateApiConfiguration(providerSettings)
 		} else {
 			// No rebuild needed, just sync apiConfiguration
-			;(task as any).apiConfiguration = providerSettings
+			task.apiConfiguration = providerSettings
 		}
 	}
 
@@ -3843,7 +3849,7 @@ export class ClineProvider
 		parentTaskId: string
 		message: string
 		initialTodos: TodoItem[]
-		mode: string
+		mode: Mode
 		pendingActionId?: string
 	}): Promise<Task> {
 		const { parentTaskId, message, initialTodos, mode, pendingActionId } = params
@@ -3921,7 +3927,7 @@ export class ClineProvider
 		//    The mode switch must happen before createTask() because the Task constructor
 		//    initializes its mode from provider.getState() during initializeTaskMode().
 		try {
-			await this.handleModeSwitch(mode as any)
+			await this.handleModeSwitch(mode)
 		} catch (e) {
 			this.log(
 				`[delegateParentAndOpenChild] handleModeSwitch failed for mode '${mode}': ${
@@ -3941,7 +3947,7 @@ export class ClineProvider
 		// Without this, the child's fire-and-forget startTask() races with step 5,
 		// and the last writer to globalState overwrites the other's changes—
 		// causing the parent's delegation fields to be lost.
-		const child = await this.createTask(message, undefined, parent as any, {
+		const child = await this.createTask(message, undefined, parent, {
 			initialTodos,
 			initialStatus: "active",
 			startTask: false,
@@ -4324,20 +4330,14 @@ export class ClineProvider
 				}
 
 				// Auto-resume parent asynchronously without blocking the delegation transition lock
-				if (typeof (parentInstance as any).prepareAfterDelegation === "function") {
-					await (parentInstance as any).prepareAfterDelegation()
-					scheduleOk = scheduleTask(
-						this.taskScheduler,
-						parentInstance as Task,
-						"reopenParentFromDelegation",
-						() => (parentInstance as any).runResumeLoop(),
+				if (typeof parentInstance.prepareAfterDelegation === "function") {
+					await parentInstance.prepareAfterDelegation()
+					scheduleOk = scheduleTask(this.taskScheduler, parentInstance, "reopenParentFromDelegation", () =>
+						parentInstance.runResumeLoop(),
 					)
-				} else if (typeof (parentInstance as any).resumeAfterDelegation === "function") {
-					scheduleOk = scheduleTask(
-						this.taskScheduler,
-						parentInstance as Task,
-						"reopenParentFromDelegation",
-						() => (parentInstance as any).resumeAfterDelegation(),
+				} else if (typeof parentInstance.resumeAfterDelegation === "function") {
+					scheduleOk = scheduleTask(this.taskScheduler, parentInstance, "reopenParentFromDelegation", () =>
+						parentInstance.resumeAfterDelegation(),
 					)
 				}
 			}

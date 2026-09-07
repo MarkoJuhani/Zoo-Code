@@ -678,18 +678,6 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 				this.emit(RooCodeEventName.TaskSpawned, task.taskId, childTaskId)
 			})
 
-			task.on(RooCodeEventName.TaskDelegated as any, (childTaskId: string) => {
-				;(this.emit as any)(RooCodeEventName.TaskDelegated, task.taskId, childTaskId)
-			})
-
-			task.on(RooCodeEventName.TaskDelegationCompleted as any, (childTaskId: string, summary: string) => {
-				;(this.emit as any)(RooCodeEventName.TaskDelegationCompleted, task.taskId, childTaskId, summary)
-			})
-
-			task.on(RooCodeEventName.TaskDelegationResumed as any, (childTaskId: string) => {
-				;(this.emit as any)(RooCodeEventName.TaskDelegationResumed, task.taskId, childTaskId)
-			})
-
 			// Task Execution
 
 			task.on(RooCodeEventName.Message, async (message) => {
@@ -728,17 +716,33 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 		})
 
 		// Delegation events are emitted by the provider, not by individual task instances.
-		provider.on(RooCodeEventName.TaskDelegated, (...args: unknown[]) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegated, ...(args as any))
+		provider.on(RooCodeEventName.TaskDelegated, (parentTaskId, childTaskId, transition) => {
+			if (transition !== undefined) {
+				this.emit(RooCodeEventName.TaskDelegated, parentTaskId, childTaskId, transition)
+			} else {
+				this.emit(RooCodeEventName.TaskDelegated, parentTaskId, childTaskId)
+			}
 		})
-		provider.on(RooCodeEventName.TaskDelegationCompleted, (...args: unknown[]) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegationCompleted, ...(args as any))
+		provider.on(RooCodeEventName.TaskDelegationCompleted, (parentTaskId, childTaskId, summary, transition) => {
+			if (transition !== undefined) {
+				this.emit(RooCodeEventName.TaskDelegationCompleted, parentTaskId, childTaskId, summary, transition)
+			} else {
+				this.emit(RooCodeEventName.TaskDelegationCompleted, parentTaskId, childTaskId, summary)
+			}
 		})
-		provider.on(RooCodeEventName.TaskDelegationResumed, (...args: unknown[]) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegationResumed, ...(args as any))
+		provider.on(RooCodeEventName.TaskDelegationResumed, (parentTaskId, childTaskId, transition) => {
+			if (transition !== undefined) {
+				this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId, transition)
+			} else {
+				this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+			}
 		})
-		provider.on(RooCodeEventName.TaskResumeScheduled, (...args: unknown[]) => {
-			;(this.emit as any)(RooCodeEventName.TaskResumeScheduled, ...(args as any))
+		provider.on(RooCodeEventName.TaskResumeScheduled, (parentTaskId, childTaskId, ok, transition) => {
+			if (transition !== undefined) {
+				this.emit(RooCodeEventName.TaskResumeScheduled, parentTaskId, childTaskId, ok, transition)
+			} else {
+				this.emit(RooCodeEventName.TaskResumeScheduled, parentTaskId, childTaskId, ok)
+			}
 		})
 	}
 
