@@ -163,10 +163,28 @@ function runDelegationTransition<T>(
 	return current
 }
 
-function scheduleTask(scheduler: TaskScheduler, task: Task, source: string): void {
-	void scheduler
-		.schedule(task, () => task.run())
-		.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
+function scheduleTask(
+	scheduler: TaskScheduler | undefined,
+	task: Task,
+	source: string,
+	runner?: () => Promise<void>,
+): boolean {
+	try {
+		const runFn = runner ?? (() => task.run())
+		if (scheduler && typeof scheduler.schedule === "function") {
+			void scheduler
+				.schedule(task, runFn)
+				.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
+		} else {
+			void Promise.resolve()
+				.then(runFn)
+				.catch((error) => console.error(`[${source}] scheduled task run failed:`, error))
+		}
+		return true
+	} catch (error) {
+		console.error(`[${source}] taskScheduler.schedule failed synchronously:`, error)
+		return false
+	}
 }
 
 type GetStateOptions = {
@@ -198,6 +216,7 @@ export class ClineProvider
 	private taskRegistry = new TaskRegistry()
 	private taskScheduler = new TaskScheduler()
 	private delegationTransitionLocks?: Map<string, Promise<void>>
+	private delegationTransitions = new Map<string, number>()
 	private cancelledDelegationChildIds = new Set<string>()
 	private codeIndexStatusSubscription?: vscode.Disposable
 	private codeIndexManager?: CodeIndexManager
@@ -4007,11 +4026,14 @@ export class ClineProvider
 		}
 
 		// 6) Start the child task now that parent metadata is safely persisted.
+		const transition = (this.delegationTransitions.get(parentTaskId) ?? 0) + 1
+		this.delegationTransitions.set(parentTaskId, transition)
+
 		scheduleTask(this.taskScheduler, child, "delegateParentAndOpenChild")
 
 		// 7) Emit TaskDelegated (provider-level)
 		try {
-			this.emit(RooCodeEventName.TaskDelegated, parentTaskId, child.taskId)
+			this.emit(RooCodeEventName.TaskDelegated, parentTaskId, child.taskId, transition)
 		} catch {
 			// non-fatal
 		}
@@ -4258,9 +4280,26 @@ export class ClineProvider
 				}
 			}
 
+			const transition = this.delegationTransitions?.get(parentTaskId)
+
 			// 6) Emit TaskDelegationCompleted (provider-level)
 			try {
-				this.emit(RooCodeEventName.TaskDelegationCompleted, parentTaskId, childTaskId, completionResultSummary)
+				if (transition !== undefined) {
+					this.emit(
+						RooCodeEventName.TaskDelegationCompleted,
+						parentTaskId,
+						childTaskId,
+						completionResultSummary,
+						transition,
+					)
+				} else {
+					this.emit(
+						RooCodeEventName.TaskDelegationCompleted,
+						parentTaskId,
+						childTaskId,
+						completionResultSummary,
+					)
+				}
 			} catch {
 				// non-fatal
 			}
@@ -4269,7 +4308,9 @@ export class ClineProvider
 			//    IMPORTANT: startTask=false to suppress resume-from-history ask scheduling
 			const parentInstance = await this.createTaskWithHistoryItem(updatedHistory, { startTask: false })
 
-			// 8) Inject restored histories into the in-memory instance before resuming
+			let scheduleOk = false
+
+			// 8) Inject restored histories into the in-memory instance and schedule resume
 			if (parentInstance) {
 				try {
 					await parentInstance.overwriteClineMessages(parentClineMessages, false)
@@ -4282,13 +4323,41 @@ export class ClineProvider
 					// non-fatal
 				}
 
-				// Auto-resume parent without ask("resume_task")
-				await parentInstance.resumeAfterDelegation()
+				// Auto-resume parent asynchronously without blocking the delegation transition lock
+				if (typeof (parentInstance as any).prepareAfterDelegation === "function") {
+					await (parentInstance as any).prepareAfterDelegation()
+					scheduleOk = scheduleTask(
+						this.taskScheduler,
+						parentInstance as Task,
+						"reopenParentFromDelegation",
+						() => (parentInstance as any).runResumeLoop(),
+					)
+				} else if (typeof (parentInstance as any).resumeAfterDelegation === "function") {
+					scheduleOk = scheduleTask(
+						this.taskScheduler,
+						parentInstance as Task,
+						"reopenParentFromDelegation",
+						() => (parentInstance as any).resumeAfterDelegation(),
+					)
+				}
 			}
 
-			// 9) Emit TaskDelegationResumed (provider-level)
+			// 9) Emit TaskResumeScheduled and TaskDelegationResumed (provider-level)
 			try {
-				this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+				if (transition !== undefined) {
+					this.emit(RooCodeEventName.TaskResumeScheduled, parentTaskId, childTaskId, scheduleOk, transition)
+				} else {
+					this.emit(RooCodeEventName.TaskResumeScheduled, parentTaskId, childTaskId, scheduleOk)
+				}
+			} catch {
+				// non-fatal
+			}
+			try {
+				if (transition !== undefined) {
+					this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId, transition)
+				} else {
+					this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+				}
 			} catch {
 				// non-fatal
 			}

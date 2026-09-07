@@ -17,15 +17,21 @@ export class IpcServer extends EventEmitter<IpcServerEvents> implements RooCodeI
 	private readonly _socketPath: string
 	private readonly _log: (...args: unknown[]) => void
 	private readonly _clients: Map<string, Socket>
+	private readonly _ackMetadata?: Record<string, unknown> | (() => Record<string, unknown>)
 
 	private _isListening = false
 
-	constructor(socketPath: string, log = console.log) {
+	constructor(
+		socketPath: string,
+		log = console.log,
+		ackMetadata?: Record<string, unknown> | (() => Record<string, unknown>),
+	) {
 		super()
 
 		this._socketPath = socketPath
 		this._log = log
 		this._clients = new Map()
+		this._ackMetadata = ackMetadata
 	}
 
 	public listen() {
@@ -47,10 +53,11 @@ export class IpcServer extends EventEmitter<IpcServerEvents> implements RooCodeI
 		this._clients.set(clientId, socket)
 		this.log(`[server#onConnect] clientId = ${clientId}, # clients = ${this._clients.size}`)
 
+		const meta = typeof this._ackMetadata === "function" ? this._ackMetadata() : this._ackMetadata
 		this.send(socket, {
 			type: IpcMessageType.Ack,
 			origin: IpcOrigin.Server,
-			data: { clientId, pid: process.pid, ppid: process.ppid },
+			data: { clientId, pid: process.pid, ppid: process.ppid, ...(meta ?? {}) },
 		})
 
 		this.emit(IpcMessageType.Connect, clientId)
@@ -113,7 +120,7 @@ export class IpcServer extends EventEmitter<IpcServerEvents> implements RooCodeI
 		ipc.server.broadcast("message", message)
 	}
 
-	public send(client: string | Socket, message: IpcMessage) {
+	public send(client: string | Socket, message: IpcMessage | Record<string, unknown>) {
 		// this.log("[server#send] message =", message)
 
 		if (typeof client === "string") {

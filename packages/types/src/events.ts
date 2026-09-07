@@ -30,6 +30,7 @@ export enum RooCodeEventName {
 	TaskDelegated = "taskDelegated",
 	TaskDelegationCompleted = "taskDelegationCompleted",
 	TaskDelegationResumed = "taskDelegationResumed",
+	TaskResumeScheduled = "taskResumeScheduled",
 
 	// Task Execution
 	Message = "message",
@@ -79,18 +80,53 @@ export const rooCodeEventsSchema = z.object({
 	[RooCodeEventName.TaskPaused]: z.tuple([z.string()]),
 	[RooCodeEventName.TaskUnpaused]: z.tuple([z.string()]),
 	[RooCodeEventName.TaskSpawned]: z.tuple([z.string(), z.string()]),
-	[RooCodeEventName.TaskDelegated]: z.tuple([
-		z.string(), // parentTaskId
-		z.string(), // childTaskId
+	[RooCodeEventName.TaskDelegated]: z.union([
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+		]),
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.number(), // transition generation
+		]),
 	]),
-	[RooCodeEventName.TaskDelegationCompleted]: z.tuple([
-		z.string(), // parentTaskId
-		z.string(), // childTaskId
-		z.string(), // completionResultSummary
+	[RooCodeEventName.TaskDelegationCompleted]: z.union([
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.string(), // completionResultSummary
+		]),
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.string(), // completionResultSummary
+			z.number(), // transition generation
+		]),
 	]),
-	[RooCodeEventName.TaskDelegationResumed]: z.tuple([
-		z.string(), // parentTaskId
-		z.string(), // childTaskId
+	[RooCodeEventName.TaskDelegationResumed]: z.union([
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+		]),
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.number(), // transition generation
+		]),
+	]),
+	[RooCodeEventName.TaskResumeScheduled]: z.union([
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.boolean(), // ok
+		]),
+		z.tuple([
+			z.string(), // parentTaskId
+			z.string(), // childTaskId
+			z.boolean(), // ok
+			z.number(), // transition generation
+		]),
 	]),
 
 	[RooCodeEventName.Message]: z.tuple([
@@ -216,6 +252,11 @@ export const taskEventSchema = z.discriminatedUnion("eventName", [
 	z.object({
 		eventName: z.literal(RooCodeEventName.TaskDelegationResumed),
 		payload: rooCodeEventsSchema.shape[RooCodeEventName.TaskDelegationResumed],
+		taskId: z.number().optional(),
+	}),
+	z.object({
+		eventName: z.literal(RooCodeEventName.TaskResumeScheduled),
+		payload: rooCodeEventsSchema.shape[RooCodeEventName.TaskResumeScheduled],
 		taskId: z.number().optional(),
 	}),
 

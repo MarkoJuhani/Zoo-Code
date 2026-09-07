@@ -38,7 +38,24 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 	private readonly context: vscode.ExtensionContext
 	private readonly ipc?: IpcServer
 	private readonly log: (...args: unknown[]) => void
+	private readonly serverInstanceId: string = Math.random().toString(36).slice(2)
 	private logfile?: string
+	private queueLease?: { queueId: string; ownerToken: string; leasedAt: number }
+	private queueDispatches = new Map<
+		string,
+		{
+			queueId: string
+			generation: number
+			requestId: string
+			rootTaskId: string
+			mode: string
+			sequence: number
+			result?: string
+			terminalState?: "completed" | "aborted" | "denied" | "failed"
+			ownershipReleased: boolean
+			accepted: boolean
+		}
+	>()
 
 	constructor(
 		outputChannel: vscode.OutputChannel,
@@ -66,7 +83,22 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 		this.registerListeners(this.sidebarProvider)
 
 		if (socketPath) {
-			const ipc = (this.ipc = new IpcServer(socketPath, this.log))
+			const ackMetadata = () => ({
+				queueProtocol: 1,
+				workspace: this.sidebarProvider.cwd,
+				serverInstance: this.serverInstanceId,
+				extensionVersion: Package.version,
+				buildRevision: "current",
+				capabilities: [
+					"queue-lease",
+					"correlated-start",
+					"targeted-accept",
+					"terminal-release",
+					"targeted-cancel",
+					"snapshot-subscribe",
+				],
+			})
+			const ipc = (this.ipc = new IpcServer(socketPath, this.log, ackMetadata))
 
 			ipc.listen()
 			this.log(`[API] ipc server started: socketPath=${socketPath}, pid=${process.pid}, ppid=${process.ppid}`)
@@ -80,6 +112,26 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 					})
 				}
 
+				const sendQueueRpcResponse = (
+					rpcId: string | undefined,
+					commandName: string,
+					ok: boolean,
+					value?: unknown,
+					error?: string,
+				) => {
+					ipc.send(clientId, {
+						type: IpcMessageType.QueueResponse,
+						origin: IpcOrigin.Server,
+						data: {
+							rpcId,
+							commandName,
+							ok,
+							value,
+							...(error ? { error } : {}),
+						},
+					})
+				}
+
 				switch (command.commandName) {
 					case TaskCommandName.StartNewTask:
 						this.log(
@@ -89,6 +141,10 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 						break
 					case TaskCommandName.CancelTask:
 						this.log(`[API] CancelTask`)
+						if (this.queueLease) {
+							this.log(`[API] Untargeted CancelTask ignored while queue lease is active`)
+							break
+						}
 						await this.cancelCurrentTask()
 						break
 					case TaskCommandName.CloseTask:
@@ -155,6 +211,230 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 							this.log(`[API] DeleteQueuedMessage failed for messageId ${command.data}: ${errorMessage}`)
 						}
 						break
+
+					case TaskCommandName.QueueAcquireLease: {
+						const { rpcId, queueId, ownerToken } = command.data
+						if (this.queueLease && this.queueLease.ownerToken !== ownerToken) {
+							sendQueueRpcResponse(rpcId, command.commandName, false, undefined, "Runtime already leased")
+							break
+						}
+						this.queueLease = { queueId, ownerToken, leasedAt: Date.now() }
+						sendQueueRpcResponse(rpcId, command.commandName, true, { queueId, exclusive: true })
+						break
+					}
+
+					case TaskCommandName.QueueStartTask: {
+						const { rpcId, queueId, ownerToken, generation, requestId, mode, text, configuration, images } =
+							command.data
+						if (
+							!this.queueLease ||
+							this.queueLease.queueId !== queueId ||
+							this.queueLease.ownerToken !== ownerToken
+						) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Lease ownership mismatch",
+							)
+							break
+						}
+
+						const existing = this.queueDispatches.get(requestId)
+						if (existing) {
+							sendQueueRpcResponse(rpcId, command.commandName, true, {
+								queueId,
+								generation,
+								requestId,
+								rootTaskId: existing.rootTaskId,
+								mode: existing.mode,
+							})
+							break
+						}
+
+						try {
+							if (mode) {
+								await this.sidebarProvider.handleModeSwitch(mode as Mode)
+							}
+							const taskId = await this.startNewTask({
+								configuration: { autoApprovalEnabled: false, ...(configuration ?? {}) },
+								text,
+								images,
+							})
+							const dispatch = {
+								queueId,
+								generation,
+								requestId,
+								rootTaskId: taskId,
+								mode,
+								sequence: 0,
+								ownershipReleased: false,
+								accepted: false,
+							}
+							this.queueDispatches.set(requestId, dispatch)
+							this.queueDispatches.set(taskId, dispatch)
+							sendQueueRpcResponse(rpcId, command.commandName, true, {
+								queueId,
+								generation,
+								requestId,
+								rootTaskId: taskId,
+								mode,
+							})
+						} catch (error) {
+							const errMsg = error instanceof Error ? error.message : String(error)
+							sendQueueRpcResponse(rpcId, command.commandName, false, undefined, errMsg)
+						}
+						break
+					}
+
+					case TaskCommandName.QueueSubscribe: {
+						const { rpcId, queueId, ownerToken, generation, requestId, rootTaskId } = command.data
+						if (
+							!this.queueLease ||
+							this.queueLease.queueId !== queueId ||
+							this.queueLease.ownerToken !== ownerToken
+						) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Lease ownership mismatch",
+							)
+							break
+						}
+
+						const dispatch =
+							(requestId ? this.queueDispatches.get(requestId) : undefined) ||
+							(rootTaskId ? this.queueDispatches.get(rootTaskId) : undefined)
+						const currentTask = this.sidebarProvider.getCurrentTask()
+
+						sendQueueRpcResponse(rpcId, command.commandName, true, {
+							scope: {
+								queueId,
+								generation: generation ?? dispatch?.generation ?? 0,
+								requestId: requestId ?? dispatch?.requestId ?? "",
+								rootTaskId: rootTaskId ?? dispatch?.rootTaskId ?? null,
+								mode: dispatch?.mode ?? "",
+							},
+							found: Boolean(dispatch),
+							sequence: dispatch?.sequence ?? 0,
+							runtimeState: dispatch?.terminalState ?? (currentTask ? "running" : "idle"),
+							ownershipReleased: dispatch?.ownershipReleased ?? false,
+							accepted: dispatch?.accepted ?? false,
+							result: dispatch?.result ?? null,
+							activeTaskId: currentTask?.taskId ?? null,
+							orderedEdges: [],
+						})
+						break
+					}
+
+					case TaskCommandName.QueueAcceptCompletion: {
+						const { rpcId, queueId, ownerToken, rootTaskId, result } = command.data
+						if (
+							!this.queueLease ||
+							this.queueLease.queueId !== queueId ||
+							this.queueLease.ownerToken !== ownerToken
+						) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Lease ownership mismatch",
+							)
+							break
+						}
+
+						const dispatch = this.queueDispatches.get(rootTaskId)
+						const currentTask = this.sidebarProvider.getCurrentTask()
+
+						if (!dispatch || dispatch.rootTaskId !== rootTaskId) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Target task not found in dispatch journal",
+							)
+							break
+						}
+
+						if (currentTask && currentTask.taskId === rootTaskId) {
+							await this.approveCurrentAsk()
+						}
+						dispatch.accepted = true
+						dispatch.result = result
+						sendQueueRpcResponse(rpcId, command.commandName, true, {
+							accepted: true,
+							taskId: rootTaskId,
+						})
+						break
+					}
+
+					case TaskCommandName.QueueReleaseLease: {
+						const { rpcId, queueId, ownerToken } = command.data
+						if (
+							!this.queueLease ||
+							this.queueLease.queueId !== queueId ||
+							this.queueLease.ownerToken !== ownerToken
+						) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Lease ownership mismatch",
+							)
+							break
+						}
+
+						this.queueLease = undefined
+						sendQueueRpcResponse(rpcId, command.commandName, true, { released: true })
+						break
+					}
+
+					case TaskCommandName.QueueCancelTask: {
+						const { rpcId, queueId, ownerToken, rootTaskId } = command.data
+						if (
+							!this.queueLease ||
+							this.queueLease.queueId !== queueId ||
+							this.queueLease.ownerToken !== ownerToken
+						) {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Lease ownership mismatch",
+							)
+							break
+						}
+
+						const currentTask = this.sidebarProvider.getCurrentTask()
+						if (currentTask && currentTask.taskId === rootTaskId) {
+							await this.cancelCurrentTask()
+							const dispatch = this.queueDispatches.get(rootTaskId)
+							if (dispatch) {
+								dispatch.terminalState = "aborted"
+								dispatch.ownershipReleased = true
+							}
+							sendQueueRpcResponse(rpcId, command.commandName, true, {
+								cancelled: true,
+								taskId: rootTaskId,
+							})
+						} else {
+							sendQueueRpcResponse(
+								rpcId,
+								command.commandName,
+								false,
+								undefined,
+								"Task not currently active",
+							)
+						}
+						break
+					}
 				}
 			})
 		}
@@ -448,14 +728,17 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 		})
 
 		// Delegation events are emitted by the provider, not by individual task instances.
-		provider.on(RooCodeEventName.TaskDelegated, (parentTaskId, childTaskId) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegated, parentTaskId, childTaskId)
+		provider.on(RooCodeEventName.TaskDelegated, (...args: unknown[]) => {
+			;(this.emit as any)(RooCodeEventName.TaskDelegated, ...(args as any))
 		})
-		provider.on(RooCodeEventName.TaskDelegationCompleted, (parentTaskId, childTaskId, summary) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegationCompleted, parentTaskId, childTaskId, summary)
+		provider.on(RooCodeEventName.TaskDelegationCompleted, (...args: unknown[]) => {
+			;(this.emit as any)(RooCodeEventName.TaskDelegationCompleted, ...(args as any))
 		})
-		provider.on(RooCodeEventName.TaskDelegationResumed, (parentTaskId, childTaskId) => {
-			;(this.emit as any)(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+		provider.on(RooCodeEventName.TaskDelegationResumed, (...args: unknown[]) => {
+			;(this.emit as any)(RooCodeEventName.TaskDelegationResumed, ...(args as any))
+		})
+		provider.on(RooCodeEventName.TaskResumeScheduled, (...args: unknown[]) => {
+			;(this.emit as any)(RooCodeEventName.TaskResumeScheduled, ...(args as any))
 		})
 	}
 

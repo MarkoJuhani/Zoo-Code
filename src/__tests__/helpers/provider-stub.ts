@@ -4,10 +4,12 @@ import { type Task } from "../../core/task/Task"
 
 type ProviderStubFields = {
 	delegationTransitionLocks?: Map<string, Promise<void>>
+	delegationTransitions?: Map<string, number>
 	cancelledDelegationChildIds?: Set<string>
 	log?: ReturnType<typeof vi.fn>
 	taskHistoryStore?: { get: (id: string) => unknown }
 	taskRegistry?: TaskRegistry
+	taskScheduler?: any
 	clineStack?: Task[]
 	tasks?: Task[]
 	runDelegationTransition?: unknown
@@ -35,6 +37,7 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	const s = stub as T & ProviderStubFields
 	const proto = ClineProvider.prototype as unknown as PrivateProviderMethods
 	s.delegationTransitionLocks ??= new Map()
+	s.delegationTransitions ??= new Map()
 	s.cancelledDelegationChildIds ??= new Set()
 	s.log ??= vi.fn()
 	s.taskHistoryStore ??= { get: () => undefined }
