@@ -38,7 +38,8 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 	private readonly context: vscode.ExtensionContext
 	private readonly ipc?: IpcServer
 	private readonly log: (...args: unknown[]) => void
-	private readonly serverInstanceId: string = Math.random().toString(36).slice(2)
+	private readonly serverInstanceId: string =
+		process.env.ROO_CODE_SERVER_INSTANCE || Math.random().toString(36).slice(2)
 	private logfile?: string
 	private queueLease?: { queueId: string; ownerToken: string; leasedAt: number }
 	private queueDispatches = new Map<
@@ -88,7 +89,7 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 				workspace: this.sidebarProvider.cwd,
 				serverInstance: this.serverInstanceId,
 				extensionVersion: Package.version,
-				buildRevision: "current",
+				buildRevision: process.env.ROO_CODE_BUILD_REVISION || "current",
 				capabilities: [
 					"queue-lease",
 					"correlated-start",
