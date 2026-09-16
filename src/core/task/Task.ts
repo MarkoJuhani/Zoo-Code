@@ -35,6 +35,7 @@ import {
 	type PendingTaskAction,
 	type CreateTaskOptions,
 	type ModelInfo,
+	type TaskAbortReason,
 	type ClineApiReqCancelReason,
 	type ClineApiReqInfo,
 	RooCodeEventName,
@@ -312,7 +313,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	didFinishAbortingStream = false
 	abandoned = false
-	abortReason?: ClineApiReqCancelReason
+	abortReason?: TaskAbortReason
 	isInitialized = false
 	isPaused: boolean = false
 
@@ -2531,7 +2532,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			)
 		}
 
-		this.emit(RooCodeEventName.TaskAborted)
+		if (this.abortReason) {
+			this.emit(RooCodeEventName.TaskAborted, this.abortReason)
+		} else {
+			this.emit(RooCodeEventName.TaskAborted)
+		}
 
 		try {
 			void this.dispose().catch((error) => {

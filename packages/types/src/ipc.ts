@@ -14,6 +14,22 @@ export enum IpcMessageType {
 	TaskCommand = "TaskCommand",
 	TaskEvent = "TaskEvent",
 	QueueResponse = "QueueResponse",
+	QueueEvent = "QueueEvent",
+}
+
+/**
+ * QueueEventName
+ */
+
+export enum QueueEventName {
+	Result = "result",
+	Terminal = "terminal",
+	Acceptance = "acceptance",
+	Delegated = "delegated",
+	DelegationCompleted = "delegationCompleted",
+	ResumeScheduled = "resumeScheduled",
+	DelegationResumed = "delegationResumed",
+	Progress = "progress",
 }
 
 /**
@@ -64,6 +80,28 @@ export enum TaskCommandName {
 	QueueReleaseLease = "QueueReleaseLease",
 	QueueCancelTask = "QueueCancelTask",
 }
+
+/**
+ * QueueResult
+ */
+
+export const queueResultSchema = z.discriminatedUnion("QUEUE_RESULT", [
+	z.object({
+		QUEUE_RESULT: z.literal("DONE"),
+		TICKET_ID: z.string().regex(/^[0-9]+(?:-[0-9]+)*$/),
+		TASK_FILE: z.string().min(1).max(1024),
+		FINAL_COMMIT: z.string().regex(/^[0-9a-f]{7,64}$/i),
+	}),
+	z.object({
+		QUEUE_RESULT: z.literal("EMPTY"),
+	}),
+	z.object({
+		QUEUE_RESULT: z.literal("BLOCKED"),
+		REASON: z.string().max(1024),
+	}),
+])
+
+export type QueueResult = z.infer<typeof queueResultSchema>
 
 /**
  * TaskCommand
@@ -152,7 +190,7 @@ export const taskCommandSchema = z.discriminatedUnion("commandName", [
 			generation: z.number(),
 			requestId: z.string(),
 			rootTaskId: z.string(),
-			result: z.string(),
+			result: z.union([queueResultSchema, z.string()]),
 		}),
 	}),
 	z.object({
@@ -211,9 +249,54 @@ export const ipcMessageSchema = z.discriminatedUnion("type", [
 			error: z.string().optional(),
 		}),
 	}),
+	z.object({
+		type: z.literal(IpcMessageType.QueueEvent),
+		origin: z.literal(IpcOrigin.Server),
+		data: z.object({
+			queueId: z.string(),
+			generation: z.number(),
+			requestId: z.string(),
+			rootTaskId: z.string(),
+			mode: z.string(),
+			sequence: z.number(),
+			eventName: z.union([
+				z.literal(QueueEventName.Result),
+				z.literal(QueueEventName.Terminal),
+				z.literal(QueueEventName.Acceptance),
+				z.literal(QueueEventName.Delegated),
+				z.literal(QueueEventName.DelegationCompleted),
+				z.literal(QueueEventName.ResumeScheduled),
+				z.literal(QueueEventName.DelegationResumed),
+				z.literal(QueueEventName.Progress),
+			]),
+			payload: z.record(z.string(), z.unknown()),
+		}),
+	}),
 ])
 
 export type IpcMessage = z.infer<typeof ipcMessageSchema>
+
+export const queueEventSchema = z.object({
+	queueId: z.string(),
+	generation: z.number(),
+	requestId: z.string(),
+	rootTaskId: z.string(),
+	mode: z.string(),
+	sequence: z.number(),
+	eventName: z.union([
+		z.literal(QueueEventName.Result),
+		z.literal(QueueEventName.Terminal),
+		z.literal(QueueEventName.Acceptance),
+		z.literal(QueueEventName.Delegated),
+		z.literal(QueueEventName.DelegationCompleted),
+		z.literal(QueueEventName.ResumeScheduled),
+		z.literal(QueueEventName.DelegationResumed),
+		z.literal(QueueEventName.Progress),
+	]),
+	payload: z.record(z.string(), z.unknown()),
+})
+
+export type QueueEvent = z.infer<typeof queueEventSchema>
 
 /**
  * IpcClientEvents
@@ -225,6 +308,10 @@ export type IpcClientEvents = {
 	[IpcMessageType.Ack]: [data: Ack]
 	[IpcMessageType.TaskCommand]: [data: TaskCommand]
 	[IpcMessageType.TaskEvent]: [data: TaskEvent]
+	[IpcMessageType.QueueResponse]: [
+		data: { rpcId?: string; commandName: string; ok: boolean; value?: unknown; error?: string },
+	]
+	[IpcMessageType.QueueEvent]: [data: QueueEvent]
 }
 
 /**
@@ -236,4 +323,9 @@ export type IpcServerEvents = {
 	[IpcMessageType.Disconnect]: [clientId: string]
 	[IpcMessageType.TaskCommand]: [clientId: string, data: TaskCommand]
 	[IpcMessageType.TaskEvent]: [relayClientId: string | undefined, data: TaskEvent]
+	[IpcMessageType.QueueResponse]: [
+		clientId: string,
+		data: { rpcId?: string; commandName: string; ok: boolean; value?: unknown; error?: string },
+	]
+	[IpcMessageType.QueueEvent]: [data: QueueEvent]
 }

@@ -69,7 +69,10 @@ export const rooCodeEventsSchema = z.object({
 			isSubtask: z.boolean(),
 		}),
 	]),
-	[RooCodeEventName.TaskAborted]: z.tuple([z.string()]),
+	[RooCodeEventName.TaskAborted]: z.union([
+		z.tuple([z.string()]),
+		z.tuple([z.string(), z.enum(["streaming_failed", "user_cancelled", "delegation_disposal"])]),
+	]),
 	[RooCodeEventName.TaskFocused]: z.tuple([z.string()]),
 	[RooCodeEventName.TaskUnfocused]: z.tuple([z.string()]),
 	[RooCodeEventName.TaskActive]: z.tuple([z.string()]),

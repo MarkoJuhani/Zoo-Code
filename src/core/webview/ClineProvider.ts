@@ -14,6 +14,7 @@ import * as vscode from "vscode"
 import {
 	type TaskProviderLike,
 	type TaskProviderEvents,
+	type TaskAbortReason,
 	type GlobalState,
 	type ProviderName,
 	type ProviderSettings,
@@ -421,8 +422,12 @@ export class ClineProvider
 				}
 				this.emit(RooCodeEventName.TaskCompleted, taskId, tokenUsage, toolUsage)
 			}
-			const onTaskAborted = async () => {
-				this.emit(RooCodeEventName.TaskAborted, instance.taskId)
+			const onTaskAborted = async (reason?: TaskAbortReason) => {
+				if (reason) {
+					this.emit(RooCodeEventName.TaskAborted, instance.taskId, reason)
+				} else {
+					this.emit(RooCodeEventName.TaskAborted, instance.taskId)
+				}
 
 				try {
 					// Only rehydrate on genuine streaming failures.
@@ -624,7 +629,7 @@ export class ClineProvider
 
 	// Removes and destroys the top Cline instance (the current finished task),
 	// activating the previous one (resuming the parent task).
-	async removeClineFromStack() {
+	async removeClineFromStack(abortReason?: TaskAbortReason) {
 		if (this.taskRegistry.length === 0) {
 			return
 		}
@@ -641,6 +646,9 @@ export class ClineProvider
 			try {
 				// Abort the running task and set isAbandoned to true so
 				// all running promises will exit as well.
+				if (abortReason) {
+					task.abortReason = abortReason
+				}
 				await task.abortTask(true)
 			} catch (e) {
 				this.log(
@@ -3845,7 +3853,24 @@ export class ClineProvider
 	 * - Emit TaskDelegated (task-level; API forwards to provider/bridge)
 	 * - Create child as sole active and switch mode to child's mode
 	 */
-	public async delegateParentAndOpenChild(params: {
+	public delegateParentAndOpenChild(params: {
+		parentTaskId: string
+		message: string
+		initialTodos: TodoItem[]
+		mode: Mode
+		pendingActionId?: string
+	}): Promise<Task> {
+		// Structural provider fixtures used by integration consumers may invoke this
+		// public method without the class prototype. Real providers always take the
+		// serialized path; the fallback keeps that legacy test seam functional.
+		const runTransition: (parentTaskId: string, fn: () => Promise<Task>) => Promise<Task> =
+			this.runDelegationTransition ?? ((_parentTaskId: string, fn: () => Promise<Task>) => fn())
+		const delegate =
+			this.delegateParentAndOpenChildUnlocked ?? ClineProvider.prototype.delegateParentAndOpenChildUnlocked
+		return runTransition.call(this, params.parentTaskId, () => delegate.call(this, params))
+	}
+
+	private async delegateParentAndOpenChildUnlocked(params: {
 		parentTaskId: string
 		message: string
 		initialTodos: TodoItem[]
@@ -3908,11 +3933,15 @@ export class ClineProvider
 			)
 		}
 
-		// 3) Enforce single-open invariant by closing/disposing the parent first
-		//    This ensures we never have >1 tasks open at any time during delegation.
-		//    Await abort completion to ensure clean disposal and prevent unhandled rejections.
+		// 3) Allocate the transition before parent teardown. Its internal disposal
+		//    reason prevents a queue root from becoming terminal during handoff.
+		const delegationTransitions = this.delegationTransitions ?? (this.delegationTransitions = new Map())
+		const transition = (delegationTransitions.get(parentTaskId) ?? 0) + 1
+		delegationTransitions.set(parentTaskId, transition)
+
+		// Enforce single-open invariant by closing/disposing the parent first.
 		try {
-			await this.removeClineFromStack()
+			await this.removeClineFromStack("delegation_disposal")
 		} catch (error) {
 			this.log(
 				`[delegateParentAndOpenChild] Error during parent disposal (non-fatal): ${
@@ -4031,17 +4060,16 @@ export class ClineProvider
 			throw err
 		}
 
-		// 6) Start the child task now that parent metadata is safely persisted.
-		const transition = (this.delegationTransitions.get(parentTaskId) ?? 0) + 1
-		this.delegationTransitions.set(parentTaskId, transition)
-
-		scheduleTask(this.taskScheduler, child, "delegateParentAndOpenChild")
-
+		// 6) Register lineage before scheduling so no child-owned progress is untracked.
 		// 7) Emit TaskDelegated (provider-level)
 		try {
 			this.emit(RooCodeEventName.TaskDelegated, parentTaskId, child.taskId, transition)
 		} catch {
 			// non-fatal
+		}
+
+		if (!scheduleTask(this.taskScheduler, child, "delegateParentAndOpenChild")) {
+			throw new Error(`[delegateParentAndOpenChild] Failed to schedule child ${child.taskId}`)
 		}
 
 		return child

@@ -247,7 +247,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		expect(childRun).toHaveBeenCalledTimes(1)
 
 		// Provider-level event
-		expect(providerEmit).toHaveBeenCalledWith(RooCodeEventName.TaskDelegated, "parent-1", "child-1")
+		expect(providerEmit).toHaveBeenCalledWith(RooCodeEventName.TaskDelegated, "parent-1", "child-1", 1)
 
 		// Mode switch
 		expect(handleModeSwitch).toHaveBeenCalledWith("code")
@@ -523,7 +523,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		).rejects.toThrow(persistError)
 
 		expect(childRun).not.toHaveBeenCalled()
-		expect(removeClineFromStack).toHaveBeenNthCalledWith(1)
+		expect(removeClineFromStack).toHaveBeenNthCalledWith(1, "delegation_disposal")
 		expect(removeClineFromStack).toHaveBeenNthCalledWith(2)
 		expect(deleteTaskWithId).toHaveBeenCalledWith("child-1", false)
 		expect(createTaskWithHistoryItem).toHaveBeenCalledWith(parentHistoryItem)
