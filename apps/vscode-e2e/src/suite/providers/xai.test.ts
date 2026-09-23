@@ -364,7 +364,7 @@ async function runXAIToolProbe(
 			}
 		}
 
-		const taskAbortedHandler = (abortedTaskId: string) => {
+		const taskAbortedHandler = (abortedTaskId: string, _reason?: string) => {
 			if (abortedTaskId === taskId) {
 				taskAborted = true
 			}

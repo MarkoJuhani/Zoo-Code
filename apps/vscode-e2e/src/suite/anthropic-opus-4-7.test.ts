@@ -243,7 +243,7 @@ suite("Claude Opus 4.7 (Anthropic)", function () {
 						}
 					}
 
-					const onAborted = (abortedId: string) => {
+					const onAborted = (abortedId: string, _reason?: string) => {
 						if (abortedId === taskId) {
 							cleanup()
 							reject(new Error("Task was aborted - Anthropic API request failed"))
