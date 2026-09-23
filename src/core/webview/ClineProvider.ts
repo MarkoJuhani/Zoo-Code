@@ -3895,18 +3895,6 @@ export class ClineProvider
 		mode: Mode
 		pendingActionId?: string
 	}): Promise<Task> {
-		return runDelegationTransition(ClineProvider.delegationTransitionLocks, params.parentTaskId, () =>
-			ClineProvider.prototype.delegateParentAndOpenChildUnlocked.call(this, params),
-		)
-	}
-
-	private async delegateParentAndOpenChildUnlocked(params: {
-		parentTaskId: string
-		message: string
-		initialTodos: TodoItem[]
-		mode: string
-		pendingActionId?: string
-	}): Promise<Task> {
 		const { parentTaskId, message, initialTodos, mode, pendingActionId } = params
 
 		// Metadata-driven delegation is always enabled

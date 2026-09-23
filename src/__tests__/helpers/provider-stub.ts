@@ -1,7 +1,6 @@
 import { ClineProvider } from "../../core/webview/ClineProvider"
 import { TaskRegistry } from "../../core/task/TaskRegistry"
 import { type Task } from "../../core/task/Task"
-import { type TaskScheduler } from "../../core/task/TaskScheduler"
 
 type ProviderStubFields = {
 	delegationTransitionLocks?: Map<string, Promise<void>>
@@ -11,7 +10,6 @@ type ProviderStubFields = {
 	taskHistoryStore?: { get: (id: string) => unknown; invalidate?: (id: string) => Promise<void> }
 	taskScheduler?: { schedule: (task: Task, run: () => Promise<void>) => Promise<void> }
 	taskRegistry?: TaskRegistry
-	taskScheduler?: TaskScheduler
 	clineStack?: Task[]
 	tasks?: Task[]
 	runDelegationTransition?: unknown
