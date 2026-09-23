@@ -358,7 +358,12 @@ suite("Roo Code Subtasks", function () {
 			}
 		}
 
-		const delegationCompletedHandler = (parentId: string, childId: string, summary: string) => {
+		const delegationCompletedHandler = (
+			parentId: string,
+			childId: string,
+			summary: string,
+			_transition?: number,
+		) => {
 			delegationCompletedParentId = parentId
 			delegationCompletedChildId = childId
 			delegationCompletedSummary = summary

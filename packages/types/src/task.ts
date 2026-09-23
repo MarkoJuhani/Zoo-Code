@@ -2,6 +2,7 @@ import { z } from "zod"
 
 import { RooCodeEventName } from "./events.js"
 import type { RooCodeSettings } from "./global-settings.js"
+import type { ClineApiReqCancelReason } from "./vscode-extension-host.js"
 import type { ClineMessage, QueuedMessage, TokenUsage } from "./message.js"
 import type { ToolUsage, ToolName } from "./tool.js"
 import type { TodoItem } from "./todo.js"
@@ -56,7 +57,7 @@ export type TaskProviderEvents = {
 	[RooCodeEventName.TaskCreated]: [task: TaskLike]
 	[RooCodeEventName.TaskStarted]: [taskId: string]
 	[RooCodeEventName.TaskCompleted]: [taskId: string, tokenUsage: TokenUsage, toolUsage: ToolUsage]
-	[RooCodeEventName.TaskAborted]: [taskId: string]
+	[RooCodeEventName.TaskAborted]: [taskId: string, reason?: TaskAbortReason]
 	[RooCodeEventName.TaskFocused]: [taskId: string]
 	[RooCodeEventName.TaskUnfocused]: [taskId: string]
 	[RooCodeEventName.TaskActive]: [taskId: string]
@@ -67,9 +68,20 @@ export type TaskProviderEvents = {
 	[RooCodeEventName.TaskPaused]: [taskId: string]
 	[RooCodeEventName.TaskUnpaused]: [taskId: string]
 	[RooCodeEventName.TaskSpawned]: [taskId: string]
-	[RooCodeEventName.TaskDelegated]: [parentTaskId: string, childTaskId: string]
-	[RooCodeEventName.TaskDelegationCompleted]: [parentTaskId: string, childTaskId: string, summary: string]
-	[RooCodeEventName.TaskDelegationResumed]: [parentTaskId: string, childTaskId: string]
+	[RooCodeEventName.TaskDelegated]: [parentTaskId: string, childTaskId: string, transition?: number]
+	[RooCodeEventName.TaskDelegationCompleted]: [
+		parentTaskId: string,
+		childTaskId: string,
+		summary: string,
+		transition?: number,
+	]
+	[RooCodeEventName.TaskDelegationResumed]: [parentTaskId: string, childTaskId: string, transition?: number]
+	[RooCodeEventName.TaskResumeScheduled]: [
+		parentTaskId: string,
+		childTaskId: string,
+		ok: boolean,
+		transition?: number,
+	]
 
 	[RooCodeEventName.TaskUserMessage]: [taskId: string]
 
@@ -131,11 +143,13 @@ export interface TaskLike {
 	abortTask(): Promise<void>
 }
 
+export type TaskAbortReason = ClineApiReqCancelReason | "delegation_disposal"
+
 export type TaskEvents = {
 	// Task Lifecycle
 	[RooCodeEventName.TaskStarted]: []
 	[RooCodeEventName.TaskCompleted]: [taskId: string, tokenUsage: TokenUsage, toolUsage: ToolUsage]
-	[RooCodeEventName.TaskAborted]: []
+	[RooCodeEventName.TaskAborted]: [reason?: TaskAbortReason]
 	[RooCodeEventName.TaskFocused]: []
 	[RooCodeEventName.TaskUnfocused]: []
 	[RooCodeEventName.TaskActive]: [taskId: string]

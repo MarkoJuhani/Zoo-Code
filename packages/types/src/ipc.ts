@@ -13,6 +13,23 @@ export enum IpcMessageType {
 	Ack = "Ack",
 	TaskCommand = "TaskCommand",
 	TaskEvent = "TaskEvent",
+	QueueResponse = "QueueResponse",
+	QueueEvent = "QueueEvent",
+}
+
+/**
+ * QueueEventName
+ */
+
+export enum QueueEventName {
+	Result = "result",
+	Terminal = "terminal",
+	Acceptance = "acceptance",
+	Delegated = "delegated",
+	DelegationCompleted = "delegationCompleted",
+	ResumeScheduled = "resumeScheduled",
+	DelegationResumed = "delegationResumed",
+	Progress = "progress",
 }
 
 /**
@@ -32,6 +49,12 @@ export const ackSchema = z.object({
 	clientId: z.string(),
 	pid: z.number(),
 	ppid: z.number(),
+	queueProtocol: z.number().optional(),
+	workspace: z.string().optional(),
+	serverInstance: z.string().optional(),
+	extensionVersion: z.string().optional(),
+	buildRevision: z.string().optional(),
+	capabilities: z.array(z.string()).optional(),
 })
 
 export type Ack = z.infer<typeof ackSchema>
@@ -50,7 +73,35 @@ export enum TaskCommandName {
 	GetModes = "GetModes",
 	GetModels = "GetModels",
 	DeleteQueuedMessage = "DeleteQueuedMessage",
+	QueueAcquireLease = "QueueAcquireLease",
+	QueueStartTask = "QueueStartTask",
+	QueueSubscribe = "QueueSubscribe",
+	QueueAcceptCompletion = "QueueAcceptCompletion",
+	QueueReleaseLease = "QueueReleaseLease",
+	QueueCancelTask = "QueueCancelTask",
 }
+
+/**
+ * QueueResult
+ */
+
+export const queueResultSchema = z.discriminatedUnion("QUEUE_RESULT", [
+	z.object({
+		QUEUE_RESULT: z.literal("DONE"),
+		TICKET_ID: z.string().regex(/^[0-9]+(?:-[0-9]+)*$/),
+		TASK_FILE: z.string().min(1).max(1024),
+		FINAL_COMMIT: z.string().regex(/^[0-9a-f]{7,64}$/i),
+	}),
+	z.object({
+		QUEUE_RESULT: z.literal("EMPTY"),
+	}),
+	z.object({
+		QUEUE_RESULT: z.literal("BLOCKED"),
+		REASON: z.string().max(1024),
+	}),
+])
+
+export type QueueResult = z.infer<typeof queueResultSchema>
 
 /**
  * TaskCommand
@@ -96,6 +147,71 @@ export const taskCommandSchema = z.discriminatedUnion("commandName", [
 		commandName: z.literal(TaskCommandName.DeleteQueuedMessage),
 		data: z.string(), // messageId
 	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueAcquireLease),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+		}),
+	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueStartTask),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+			generation: z.number(),
+			requestId: z.string(),
+			rootTaskId: z.string().nullable().optional(),
+			mode: z.string(),
+			text: z.string(),
+			configuration: rooCodeSettingsSchema.optional(),
+			images: z.array(z.string()).optional(),
+		}),
+	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueSubscribe),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+			generation: z.number().optional(),
+			requestId: z.string().optional(),
+			rootTaskId: z.string().nullable().optional(),
+		}),
+	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueAcceptCompletion),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+			generation: z.number(),
+			requestId: z.string(),
+			rootTaskId: z.string(),
+			result: z.union([queueResultSchema, z.string()]),
+		}),
+	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueReleaseLease),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+		}),
+	}),
+	z.object({
+		commandName: z.literal(TaskCommandName.QueueCancelTask),
+		data: z.object({
+			rpcId: z.string().optional(),
+			queueId: z.string(),
+			ownerToken: z.string(),
+			generation: z.number(),
+			requestId: z.string(),
+			rootTaskId: z.string(),
+		}),
+	}),
 ])
 
 export type TaskCommand = z.infer<typeof taskCommandSchema>
@@ -122,9 +238,65 @@ export const ipcMessageSchema = z.discriminatedUnion("type", [
 		relayClientId: z.string().optional(),
 		data: taskEventSchema,
 	}),
+	z.object({
+		type: z.literal(IpcMessageType.QueueResponse),
+		origin: z.literal(IpcOrigin.Server),
+		data: z.object({
+			rpcId: z.string().optional(),
+			commandName: z.string(),
+			ok: z.boolean(),
+			value: z.unknown().optional(),
+			error: z.string().optional(),
+		}),
+	}),
+	z.object({
+		type: z.literal(IpcMessageType.QueueEvent),
+		origin: z.literal(IpcOrigin.Server),
+		data: z.object({
+			queueId: z.string(),
+			generation: z.number(),
+			requestId: z.string(),
+			rootTaskId: z.string(),
+			mode: z.string(),
+			sequence: z.number(),
+			eventName: z.union([
+				z.literal(QueueEventName.Result),
+				z.literal(QueueEventName.Terminal),
+				z.literal(QueueEventName.Acceptance),
+				z.literal(QueueEventName.Delegated),
+				z.literal(QueueEventName.DelegationCompleted),
+				z.literal(QueueEventName.ResumeScheduled),
+				z.literal(QueueEventName.DelegationResumed),
+				z.literal(QueueEventName.Progress),
+			]),
+			payload: z.record(z.string(), z.unknown()),
+		}),
+	}),
 ])
 
 export type IpcMessage = z.infer<typeof ipcMessageSchema>
+
+export const queueEventSchema = z.object({
+	queueId: z.string(),
+	generation: z.number(),
+	requestId: z.string(),
+	rootTaskId: z.string(),
+	mode: z.string(),
+	sequence: z.number(),
+	eventName: z.union([
+		z.literal(QueueEventName.Result),
+		z.literal(QueueEventName.Terminal),
+		z.literal(QueueEventName.Acceptance),
+		z.literal(QueueEventName.Delegated),
+		z.literal(QueueEventName.DelegationCompleted),
+		z.literal(QueueEventName.ResumeScheduled),
+		z.literal(QueueEventName.DelegationResumed),
+		z.literal(QueueEventName.Progress),
+	]),
+	payload: z.record(z.string(), z.unknown()),
+})
+
+export type QueueEvent = z.infer<typeof queueEventSchema>
 
 /**
  * IpcClientEvents
@@ -136,6 +308,10 @@ export type IpcClientEvents = {
 	[IpcMessageType.Ack]: [data: Ack]
 	[IpcMessageType.TaskCommand]: [data: TaskCommand]
 	[IpcMessageType.TaskEvent]: [data: TaskEvent]
+	[IpcMessageType.QueueResponse]: [
+		data: { rpcId?: string; commandName: string; ok: boolean; value?: unknown; error?: string },
+	]
+	[IpcMessageType.QueueEvent]: [data: QueueEvent]
 }
 
 /**
@@ -147,4 +323,9 @@ export type IpcServerEvents = {
 	[IpcMessageType.Disconnect]: [clientId: string]
 	[IpcMessageType.TaskCommand]: [clientId: string, data: TaskCommand]
 	[IpcMessageType.TaskEvent]: [relayClientId: string | undefined, data: TaskEvent]
+	[IpcMessageType.QueueResponse]: [
+		clientId: string,
+		data: { rpcId?: string; commandName: string; ok: boolean; value?: unknown; error?: string },
+	]
+	[IpcMessageType.QueueEvent]: [data: QueueEvent]
 }

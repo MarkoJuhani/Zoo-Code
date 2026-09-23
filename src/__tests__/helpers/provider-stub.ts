@@ -1,13 +1,17 @@
 import { ClineProvider } from "../../core/webview/ClineProvider"
 import { TaskRegistry } from "../../core/task/TaskRegistry"
 import { type Task } from "../../core/task/Task"
+import { type TaskScheduler } from "../../core/task/TaskScheduler"
 
 type ProviderStubFields = {
+	delegationTransitionLocks?: Map<string, Promise<void>>
+	delegationTransitions?: Map<string, number>
 	cancelledDelegationChildIds?: Set<string>
 	log?: ReturnType<typeof vi.fn>
 	taskHistoryStore?: { get: (id: string) => unknown; invalidate?: (id: string) => Promise<void> }
 	taskScheduler?: { schedule: (task: Task, run: () => Promise<void>) => Promise<void> }
 	taskRegistry?: TaskRegistry
+	taskScheduler?: TaskScheduler
 	clineStack?: Task[]
 	tasks?: Task[]
 	runDelegationTransition?: unknown
@@ -34,6 +38,8 @@ type PrivateProviderMethods = {
 export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	const s = stub as T & ProviderStubFields
 	const proto = ClineProvider.prototype as unknown as PrivateProviderMethods
+	s.delegationTransitionLocks ??= new Map()
+	s.delegationTransitions ??= new Map()
 	s.cancelledDelegationChildIds ??= new Set()
 	s.log ??= vi.fn()
 	s.taskHistoryStore ??= { get: () => undefined }

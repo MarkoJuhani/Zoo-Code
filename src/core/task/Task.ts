@@ -35,6 +35,7 @@ import {
 	type PendingTaskAction,
 	type CreateTaskOptions,
 	type ModelInfo,
+	type TaskAbortReason,
 	type ClineApiReqCancelReason,
 	type ClineApiReqInfo,
 	RooCodeEventName,
@@ -340,7 +341,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	didFinishAbortingStream = false
 	abandoned = false
-	abortReason?: ClineApiReqCancelReason
+	abortReason?: TaskAbortReason
 	isInitialized = false
 	isPaused: boolean = false
 
@@ -2707,7 +2708,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			)
 		}
 
-		this.emit(RooCodeEventName.TaskAborted)
+		if (this.abortReason) {
+			this.emit(RooCodeEventName.TaskAborted, this.abortReason)
+		} else {
+			this.emit(RooCodeEventName.TaskAborted)
+		}
 
 		try {
 			void this.dispose().catch((error) => {
@@ -2871,7 +2876,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * - Ensures next API call includes full context
 	 * - Immediately continues task loop without user interaction
 	 */
-	public async resumeAfterDelegation(): Promise<void> {
+	/**
+	 * Prepare parent task state after delegation completion prior to async scheduling.
+	 * Hydrates history, updates environment details, resets abort/stream flags.
+	 */
+	public async prepareAfterDelegation(): Promise<void> {
 		// Clear any ask states that might have been set during history load
 		this.idleAsk = undefined
 		this.resumableAsk = undefined
@@ -2888,9 +2897,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Ensure next API call includes full context after delegation
 		this.skipPrevResponseIdOnce = true
 
-		// Mark as initialized and active
+		// Mark as initialized
 		this.isInitialized = true
-		this.emit(RooCodeEventName.TaskActive, this.taskId)
 
 		// Load conversation history if not already loaded
 		if (this.apiConversationHistory.length === 0) {
@@ -2929,10 +2937,23 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Save the updated history
 		await this.saveApiConversationHistory()
+	}
 
-		// Continue task loop - pass empty array to signal no new user content needed
-		// The initiateTaskLoop will handle this by skipping user message addition
+	/**
+	 * Run the task loop after delegation resumption.
+	 */
+	public async runResumeLoop(): Promise<void> {
+		this.emit(RooCodeEventName.TaskActive, this.taskId)
 		await this.initiateTaskLoop([])
+	}
+
+	/**
+	 * Resume parent task after delegation completion without showing resume ask.
+	 * Kept for backwards compatibility.
+	 */
+	public async resumeAfterDelegation(): Promise<void> {
+		await this.prepareAfterDelegation()
+		await this.runResumeLoop()
 	}
 
 	// Task Loop
