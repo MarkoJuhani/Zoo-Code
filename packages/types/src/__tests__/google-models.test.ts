@@ -1,3 +1,22 @@
+describe.each([
+	["Gemini API", geminiModels["gemini-3.8-flash"]],
+	["Vertex AI", vertexModels["gemini-3.8-flash"]],
+])("Gemini 3.8 Flash on %s", (_provider, model) => {
+	it("exposes documented limits, capabilities, thinking levels, and pricing", () => {
+		expect(model.maxTokens).toBe(65_536)
+		expect(model.contextWindow).toBe(1_048_576)
+		expect(model.supportsImages).toBe(true)
+		expect(model.supportsPromptCache).toBe(true)
+		expect(model.supportsReasoningEffort).toEqual(["low", "medium", "high"])
+		expect(model.reasoningEffort).toBe("medium")
+		expect(model.inputPrice).toBe(0.75)
+		expect(model.outputPrice).toBe(3.75)
+		expect(model.cacheReadsPrice).toBe(0.075)
+		expect(model.cacheWritesPrice).toBe(0.5)
+		expect(model.supportsReasoningBudget).toBe(false)
+	})
+})
+
 import { geminiModels } from "../providers/gemini.js"
 import { vertexModels } from "../providers/vertex.js"
 

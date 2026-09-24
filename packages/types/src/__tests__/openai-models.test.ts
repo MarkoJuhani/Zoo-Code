@@ -1,3 +1,4 @@
+import { openAiCodexModels } from "../providers/openai-codex.js"
 import { openAiNativeDefaultModelId, openAiNativeModels } from "../providers/openai.js"
 
 describe("OpenAI native models", () => {
@@ -44,6 +45,43 @@ describe("OpenAI native models", () => {
 				cacheReadsPrice: 2,
 			},
 		])
+	})
+
+	it("adds documented GPT-6 Sol and Luna catalogs", () => {
+		expect(openAiNativeModels["gpt-6-sol"]).toMatchObject({
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+			supportsImages: true,
+			supportsPromptCache: true,
+			supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
+			inputPrice: 2,
+			cacheWritesPrice: 2.5,
+			cacheReadsPrice: 0.2,
+			outputPrice: 10,
+		})
+		expect(openAiNativeModels["gpt-6-luna"]).toMatchObject({
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+			supportsImages: true,
+			supportsPromptCache: true,
+			supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
+			inputPrice: 0.1,
+			cacheWritesPrice: 0.125,
+			cacheReadsPrice: 0.01,
+			outputPrice: 0.5,
+		})
+		expect(openAiCodexModels["gpt-6-sol"]).toMatchObject({
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+			inputPrice: 0,
+			outputPrice: 0,
+		})
+		expect(openAiCodexModels["gpt-6-luna"]).toMatchObject({
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+			inputPrice: 0,
+			outputPrice: 0,
+		})
 	})
 
 	it("uses current GPT-5.6 base pricing and context metadata", () => {

@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Add documented Gemini 3.8 Flash, GPT-6 Sol, and GPT-6 Luna support
 - Prevent unavailable tools from appearing in system prompts (#505 by @DScoNOIZ, #1240 by @JunyongParkDev, PR #1505 by @DaubnerF)
 - Fix DeepSeek Flash image input by adding the new deepseek-flash model ID (PR #1618 by @app/zoomote)
 - Fix token usage tracking for Grok and xAI-compatible endpoints whose domains contain "x.ai" (#1483 by @BambinoSK, PR #1484 by @BambinoSK)
