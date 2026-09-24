@@ -54,6 +54,7 @@ export const openAiCodexModels = {
 		supportsTemperature: false,
 		description: "GPT-6 Luna: Efficient model for focused, high-volume tasks via ChatGPT subscription",
 	},
+
 	"gpt-6-astra": {
 		maxTokens: 128000,
 		contextWindow: 872000,
