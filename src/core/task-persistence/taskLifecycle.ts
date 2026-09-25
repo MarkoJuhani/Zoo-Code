@@ -4,9 +4,10 @@ import type { HistoryItem } from "@roo-code/types"
 export type HistoryItemStatus = NonNullable<HistoryItem["status"]>
 
 export const VALID_TASK_STATUS_TRANSITIONS: Readonly<Record<HistoryItemStatus, readonly HistoryItemStatus[]>> = {
-	active: ["delegated", "completed", "interrupted"],
-	delegated: ["active"],
-	interrupted: ["completed"],
+	active: ["delegated", "completed", "interrupted", "blocked_protocol_error"],
+	delegated: ["active", "blocked_protocol_error"],
+	interrupted: ["completed", "blocked_protocol_error"],
+	blocked_protocol_error: ["active", "completed", "interrupted"],
 	completed: [],
 }
 
@@ -41,6 +42,8 @@ export function delegateTaskToChild(
 			status: "active",
 			awaitingChildId: undefined,
 			delegatedToId: undefined,
+			protocolErrorCode: undefined,
+			protocolErrorChildId: undefined,
 		}
 	}
 
@@ -59,7 +62,33 @@ export function interruptDelegatedChild(parent: HistoryItem, child: HistoryItem)
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
 	assertValidTransition(child.status, "interrupted")
-	return { ...child, status: "interrupted" }
+	return { ...child, status: "interrupted", protocolErrorCode: undefined }
+}
+
+export function blockDelegatedChildProtocol(
+	parent: HistoryItem,
+	child: HistoryItem,
+): { parent: HistoryItem; child: HistoryItem } {
+	if (
+		(parent.status !== "delegated" && parent.status !== "active" && parent.status !== "blocked_protocol_error") ||
+		parent.awaitingChildId !== child.id
+	) {
+		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
+	}
+	let blockedChild = child
+	if (child.status !== "blocked_protocol_error") {
+		assertValidTransition(child.status, "blocked_protocol_error")
+		blockedChild = { ...child, status: "blocked_protocol_error", protocolErrorCode: "missing_attempt_completion" }
+	}
+	return {
+		child: blockedChild,
+		parent: {
+			...parent,
+			status: "blocked_protocol_error",
+			protocolErrorCode: "missing_attempt_completion",
+			protocolErrorChildId: child.id,
+		},
+	}
 }
 
 export function completeDelegatedChild(
@@ -67,7 +96,10 @@ export function completeDelegatedChild(
 	child: HistoryItem,
 	completionResultSummary: string,
 ): { parent: HistoryItem; child: HistoryItem } {
-	if ((parent.status !== "delegated" && parent.status !== "active") || parent.awaitingChildId !== child.id) {
+	if (
+		(parent.status !== "delegated" && parent.status !== "active" && parent.status !== "blocked_protocol_error") ||
+		parent.awaitingChildId !== child.id
+	) {
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
 	assertValidTransition(child.status, "completed")
@@ -78,6 +110,7 @@ export function completeDelegatedChild(
 			...child,
 			status: "completed",
 			completionResultSummary,
+			protocolErrorCode: undefined,
 		},
 		parent: {
 			...parent,
@@ -86,6 +119,8 @@ export function completeDelegatedChild(
 			completionResultSummary,
 			awaitingChildId: undefined,
 			delegatedToId: undefined,
+			protocolErrorCode: undefined,
+			protocolErrorChildId: undefined,
 			childIds: Array.from(new Set([...(parent.childIds ?? []), child.id])),
 		},
 	}
@@ -110,6 +145,8 @@ export function abandonDelegatedChild(
 			status: "active",
 			awaitingChildId: undefined,
 			delegatedToId: undefined,
+			protocolErrorCode: undefined,
+			protocolErrorChildId: undefined,
 		},
 	}
 }

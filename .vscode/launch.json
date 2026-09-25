@@ -81,7 +81,7 @@
 			"runtimeExecutable": "${execPath}",
 			"args": [
 				"--extensionDevelopmentPath=${workspaceFolder}/src-queue-v18-task3",
-				"--folder-uri=vscode-remote://wsl+<exact-wsl-distribution-name>/home/markooo/V18_task3"
+				"--folder-uri=vscode-remote://wsl+Ubuntu-20.04/home/markooo/V18_task3"
 			],
 			"sourceMaps": true,
 			"outFiles": ["${workspaceFolder}/src/dist/**/*.js"],
@@ -121,6 +121,58 @@
 				"hidden": false,
 				"group": "tasks",
 				"order": 3
+			}
+		},
+		{
+			"name": "Zoo Queue V16",
+			"type": "extensionHost",
+			"request": "launch",
+			"runtimeExecutable": "${execPath}",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}/src-queue-v16",
+				"--folder-uri=vscode-remote://wsl+Ubuntu-20.04/home/markooo/V16"
+			],
+			"sourceMaps": true,
+			"outFiles": ["${workspaceFolder}/src/dist/**/*.js"],
+			"preLaunchTask": "${defaultBuildTask}",
+			"env": {
+				"NODE_ENV": "development",
+				"VSCODE_DEBUG_MODE": "true",
+				"ROO_CODE_IPC_SOCKET_PATH": "/tmp/zoo-queue-v16.sock",
+				"ROO_CODE_SERVER_INSTANCE": "v16-queue-1",
+				"ROO_CODE_BUILD_REVISION": "9bb6c0d44078fa4cb88ea28741fb7429188d3e2d"
+			},
+			"resolveSourceMapLocations": ["${workspaceFolder}/**", "!**/node_modules/**"],
+			"presentation": {
+				"hidden": false,
+				"group": "tasks",
+				"order": 5
+			}
+		},
+		{
+			"name": "Zoo Queue V19 task 3",
+			"type": "extensionHost",
+			"request": "launch",
+			"runtimeExecutable": "${execPath}",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}/src-queue-v19-task3",
+				"--folder-uri=vscode-remote://wsl+Ubuntu-20.04/home/markooo/V19_task3"
+			],
+			"sourceMaps": true,
+			"outFiles": ["${workspaceFolder}/src/dist/**/*.js"],
+			"preLaunchTask": "${defaultBuildTask}",
+			"env": {
+				"NODE_ENV": "development",
+				"VSCODE_DEBUG_MODE": "true",
+				"ROO_CODE_IPC_SOCKET_PATH": "/tmp/zoo-queue-v19_task3.sock",
+				"ROO_CODE_SERVER_INSTANCE": "v19-queue-2",
+				"ROO_CODE_BUILD_REVISION": "9bb6c0d44078fa4cb88ea28741fb7429188d3e2d"
+			},
+			"resolveSourceMapLocations": ["${workspaceFolder}/**", "!**/node_modules/**"],
+			"presentation": {
+				"hidden": false,
+				"group": "tasks",
+				"order": 6
 			}
 		}
 	]

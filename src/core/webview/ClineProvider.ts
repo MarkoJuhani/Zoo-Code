@@ -124,6 +124,7 @@ import {
 	saveTaskMessages,
 	TaskHistoryStore,
 	abandonDelegatedChild,
+	blockDelegatedChildProtocol,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
@@ -4162,6 +4163,58 @@ export class ClineProvider
 	/**
 	 * Reopen parent task from delegation with write-back and events.
 	 */
+	public async markDelegatedChildProtocolBlocked(params: {
+		parentTaskId: string
+		childTaskId: string
+	}): Promise<boolean> {
+		const { parentTaskId, childTaskId } = params
+		return this.runDelegationTransition(parentTaskId, async () => {
+			await this.taskHistoryStore.invalidate(parentTaskId)
+			await this.taskHistoryStore.invalidate(childTaskId)
+			const parent = this.taskHistoryStore.get(parentTaskId)
+			const child = this.taskHistoryStore.get(childTaskId)
+			if (!parent || !child) {
+				throw new Error(
+					`[childCompletionProtocol] Missing correlated history for ${parentTaskId} -> ${childTaskId}`,
+				)
+			}
+			if (parent.awaitingChildId !== childTaskId || child.parentTaskId !== parentTaskId) {
+				return false
+			}
+			if (child.status === "blocked_protocol_error" && parent.status === "blocked_protocol_error") {
+				return true
+			}
+			if (
+				(parent.status !== "delegated" && parent.status !== "active") ||
+				(child.status !== "active" &&
+					child.status !== "interrupted" &&
+					child.status !== "blocked_protocol_error")
+			) {
+				return false
+			}
+
+			let lockedChild!: HistoryItem
+			await this.taskHistoryStore.atomicUpdatePair(
+				childTaskId,
+				parentTaskId,
+				(currentChild) => {
+					lockedChild = currentChild
+					return blockDelegatedChildProtocol(parent, currentChild).child
+				},
+				(currentParent) => blockDelegatedChildProtocol(currentParent, lockedChild).parent,
+			)
+			this.recentTasksCache = undefined
+			if (this.isViewLaunched) {
+				for (const id of [childTaskId, parentTaskId]) {
+					const item = this.taskHistoryStore.get(id)
+					if (item) await this.postMessageToWebview({ type: "taskHistoryItemUpdated", taskHistoryItem: item })
+				}
+			}
+			this.log(`[childCompletionProtocol] Blocked child ${childTaskId}; parent ${parentTaskId} remains delegated`)
+			return true
+		})
+	}
+
 	public async reopenParentFromDelegation(params: {
 		parentTaskId: string
 		childTaskId: string
@@ -4189,7 +4242,9 @@ export class ClineProvider
 			// routing output back would corrupt an unrelated task.
 			if (
 				this.cancelledDelegationChildIds.has(childTaskId) ||
-				(historyItem.status !== "delegated" && historyItem.status !== "active") ||
+				(historyItem.status !== "delegated" &&
+					historyItem.status !== "active" &&
+					historyItem.status !== "blocked_protocol_error") ||
 				historyItem.awaitingChildId !== childTaskId
 			) {
 				this.log(

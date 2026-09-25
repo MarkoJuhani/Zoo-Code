@@ -21,7 +21,7 @@ export interface HistoryResult extends AutocompleteItem {
 	/** Mode the task was run in */
 	mode?: string
 	/** Task status */
-	status?: "active" | "completed" | "delegated" | "interrupted"
+	status?: "active" | "completed" | "delegated" | "interrupted" | "blocked_protocol_error"
 }
 
 /**
@@ -138,17 +138,21 @@ export function createHistoryTrigger(config: HistoryTriggerConfig): Autocomplete
 					? "✓"
 					: item.status === "active"
 						? "●"
-						: item.status === "interrupted"
-							? "⏸"
-							: "○"
+						: item.status === "blocked_protocol_error"
+							? "!"
+							: item.status === "interrupted"
+								? "⏸"
+								: "○"
 			const statusColor =
 				item.status === "completed"
 					? "green"
 					: item.status === "active"
 						? "yellow"
-						: item.status === "interrupted"
-							? "cyan"
-							: "gray"
+						: item.status === "blocked_protocol_error"
+							? "red"
+							: item.status === "interrupted"
+								? "cyan"
+								: "gray"
 
 			// Mode indicator (if available)
 			const modeText = item.mode ? ` [${item.mode}]` : ""
@@ -192,7 +196,7 @@ export function toHistoryResult(item: {
 	totalCost?: number
 	workspace?: string
 	mode?: string
-	status?: "active" | "completed" | "delegated" | "interrupted"
+	status?: "active" | "completed" | "delegated" | "interrupted" | "blocked_protocol_error"
 }): HistoryResult {
 	return {
 		key: item.id, // Use task ID as the unique key

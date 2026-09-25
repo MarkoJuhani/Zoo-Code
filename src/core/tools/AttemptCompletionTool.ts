@@ -119,12 +119,18 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 							// This shows the user the completion result and waits for acceptance
 							// without injecting another tool_result to the parent
 							isStaleHistoryReplay = true
-						} else if (status === "active" || status === "interrupted") {
+						} else if (
+							status === "active" ||
+							status === "interrupted" ||
+							status === "blocked_protocol_error"
+						) {
 							historyLookupTaskId = task.parentTaskId
 							const { historyItem: parentHistory } = await provider.getTaskWithId(task.parentTaskId)
 
 							if (
-								(parentHistory?.status === "delegated" || parentHistory?.status === "active") &&
+								(parentHistory?.status === "delegated" ||
+									parentHistory?.status === "active" ||
+									parentHistory?.status === "blocked_protocol_error") &&
 								parentHistory?.awaitingChildId === task.taskId
 							) {
 								const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
@@ -188,7 +194,7 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 							// "delegated" would mean this child has its own grandchild pending (shouldn't reach attempt_completion)
 							provider.log(
 								`[AttemptCompletionTool] Unexpected child task status "${status}" for task ${task.taskId}. ` +
-									`Expected "active", "interrupted", or "completed". Skipping delegation to prevent data corruption.`,
+									`Expected "active", "interrupted", "blocked_protocol_error", or "completed". Skipping delegation to prevent data corruption.`,
 							)
 							// Fall through to normal completion ask flow
 						}

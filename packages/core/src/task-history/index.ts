@@ -42,7 +42,11 @@ function extractSessionEntry(value: unknown): TaskSessionEntry | undefined {
 		workspace: typeof workspace === "string" ? workspace : undefined,
 		mode: typeof mode === "string" ? mode : undefined,
 		status:
-			status === "active" || status === "completed" || status === "delegated" || status === "interrupted"
+			status === "active" ||
+			status === "completed" ||
+			status === "delegated" ||
+			status === "interrupted" ||
+			status === "blocked_protocol_error"
 				? status
 				: undefined,
 	}

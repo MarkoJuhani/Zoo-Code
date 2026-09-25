@@ -109,7 +109,7 @@ export interface TaskHistoryItem {
 	totalCost?: number
 	workspace?: string
 	mode?: string
-	status?: "active" | "completed" | "delegated" | "interrupted"
+	status?: "active" | "completed" | "delegated" | "interrupted" | "blocked_protocol_error"
 	tokensIn?: number
 	tokensOut?: number
 }

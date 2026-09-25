@@ -140,6 +140,11 @@ import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
 import { prepareApiConversationMessage } from "./apiConversationHistory"
 import { shouldAddUserMessageToHistory } from "./messageCounting"
 import { type TaskExecutionContext } from "./providerHandoff"
+import {
+	DELEGATED_CHILD_COMPLETION_REPAIR,
+	hasPersistedCompletionRepair,
+	isRecognizableWorkerEnvelope,
+} from "./childCompletionProtocol"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -203,7 +208,7 @@ export interface TaskOptions extends CreateTaskOptions {
 	initialTodos?: TodoItem[]
 	workspacePath?: string
 	/** Initial status for the task's history item (e.g., "active" for child tasks) */
-	initialStatus?: "active" | "delegated" | "completed" | "interrupted"
+	initialStatus?: "active" | "delegated" | "completed" | "interrupted" | "blocked_protocol_error"
 	rateLimitClock?: RateLimitClock
 	diffFuzzyThreshold?: number
 	/** Explicit task-local execution context for a delegated child. */
@@ -519,7 +524,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private cloudSyncedMessageTimestamps: Set<number> = new Set()
 
 	// Initial status for the task's history item (set at creation time to avoid race conditions)
-	private readonly initialStatus?: "active" | "delegated" | "completed" | "interrupted"
+	private readonly initialStatus?: "active" | "delegated" | "completed" | "interrupted" | "blocked_protocol_error"
 	private pendingAction?: PendingTaskAction
 
 	// MessageManager for high-level message operations (lazy initialized)
@@ -3482,6 +3487,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							}
 							case "text": {
 								assistantMessage += chunk.text
+								if (this.parentTaskId) break
 
 								// Native tool calling: text chunks are plain text.
 								// Create or update a text content block directly
@@ -3898,6 +3904,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				const hasToolUses = this.assistantMessageContent.some(
 					(block) => block.type === "tool_use" || block.type === "mcp_tool_use",
 				)
+				const hasValidAttemptCompletion = this.assistantMessageContent.some(
+					(block) =>
+						block.type === "tool_use" &&
+						block.name === "attempt_completion" &&
+						typeof block.id === "string" &&
+						typeof block.params.result === "string" &&
+						block.params.result.trim().length > 0,
+				)
+				const hasWorkerEnvelope = !!this.parentTaskId && isRecognizableWorkerEnvelope(assistantMessage)
+				const suppressDelegatedText = !!this.parentTaskId && (hasWorkerEnvelope || hasValidAttemptCompletion)
+				if (this.parentTaskId && hasTextContent && !suppressDelegatedText) {
+					await this.say("text", assistantMessage, undefined, false)
+				}
+				if (this.parentTaskId && !hasToolUses) {
+					this.userMessageContentReady = true
+				}
 
 				if (hasTextContent || hasToolUses) {
 					// Reset counter when we get a successful response with content
@@ -4081,7 +4103,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						(block) => block.type === "tool_use" || block.type === "mcp_tool_use",
 					)
 
-					if (!didToolUse) {
+					if (hasWorkerEnvelope && !hasValidAttemptCompletion) {
+						if (!hasPersistedCompletionRepair(this.apiConversationHistory)) {
+							this.userMessageContent.push({ type: "text", text: DELEGATED_CHILD_COMPLETION_REPAIR })
+						} else {
+							const provider = this.providerRef.deref()
+							if (!provider || !this.parentTaskId) {
+								throw new Error("Delegated child completion protocol has no provider or parent")
+							}
+							await provider.markDelegatedChildProtocolBlocked({
+								parentTaskId: this.parentTaskId,
+								childTaskId: this.taskId,
+							})
+							return true
+						}
+					} else if (!didToolUse) {
 						// Increment consecutive no-tool-use counter
 						this.consecutiveNoToolUseCount++
 

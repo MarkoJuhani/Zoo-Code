@@ -2,6 +2,7 @@ import type { HistoryItem } from "@roo-code/types"
 
 import {
 	abandonDelegatedChild,
+	blockDelegatedChildProtocol,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
@@ -54,6 +55,45 @@ describe("task lifecycle transitions", () => {
 			status: "delegated",
 			awaitingChildId: "new-child",
 			childIds: ["old-child", "new-child"],
+		})
+	})
+
+	it("blocks a correlated child protocol error while retaining the parent delegation", () => {
+		const parent = item("parent", { status: "delegated", awaitingChildId: "child", delegatedToId: "child" })
+		const child = item("child", { status: "active", parentTaskId: "parent" })
+		const blocked = blockDelegatedChildProtocol(parent, child)
+
+		expect(blocked.child).toMatchObject({
+			status: "blocked_protocol_error",
+			protocolErrorCode: "missing_attempt_completion",
+		})
+		expect(blocked.parent).toMatchObject({
+			status: "blocked_protocol_error",
+			awaitingChildId: "child",
+			protocolErrorCode: "missing_attempt_completion",
+			protocolErrorChildId: "child",
+		})
+	})
+
+	it("allows a blocked child to recover through native completion", () => {
+		const parent = item("parent", {
+			status: "delegated",
+			awaitingChildId: "child",
+			protocolErrorCode: "missing_attempt_completion",
+			protocolErrorChildId: "child",
+		})
+		const child = item("child", {
+			status: "blocked_protocol_error",
+			parentTaskId: "parent",
+			protocolErrorCode: "missing_attempt_completion",
+		})
+		const completed = completeDelegatedChild(parent, child, "handoff")
+
+		expect(completed.child).toMatchObject({ status: "completed", protocolErrorCode: undefined })
+		expect(completed.parent).toMatchObject({
+			status: "active",
+			protocolErrorCode: undefined,
+			protocolErrorChildId: undefined,
 		})
 	})
 

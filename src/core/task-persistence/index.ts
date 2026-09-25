@@ -17,6 +17,7 @@ export { TaskHistoryStore } from "./TaskHistoryStore"
 export {
 	abandonDelegatedChild,
 	assertValidTransition,
+	blockDelegatedChildProtocol,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,

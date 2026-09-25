@@ -440,6 +440,61 @@ describe("Cline", () => {
 		baseProviderState = await mockProvider.getState()
 	})
 
+	describe("delegated child completion protocol", () => {
+		function stream(text: string): AsyncGenerator<ApiStreamChunk> {
+			return (async function* () {
+				yield { type: "text", text }
+			})()
+		}
+
+		it("repairs one recognizable plain-text handoff, then blocks without surfacing it", async () => {
+			const parent = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "parent task",
+				startTask: false,
+			})
+			const child = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "child task",
+				parentTask: parent,
+				rootTask: parent,
+				startTask: false,
+				initialStatus: "active",
+			})
+			vi.spyOn(child.diffViewProvider, "reset").mockResolvedValue(undefined)
+			vi.spyOn(getTaskTestAccess(child), "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
+			vi.spyOn(child, "attemptApiRequest")
+				.mockImplementationOnce(() => stream("STATUS=SUCCESS\nFACTS=first handoff"))
+				.mockImplementationOnce(() => stream("STATUS=SUCCESS\nFACTS=second handoff"))
+			const blockSpy = vi.spyOn(mockProvider, "markDelegatedChildProtocolBlocked").mockResolvedValue(true)
+
+			await expect(child.recursivelyMakeClineRequests([{ type: "text", text: "delegated work" }])).resolves.toBe(
+				true,
+			)
+
+			const repairBlocks = child.apiConversationHistory.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.filter(
+							(block) =>
+								block.type === "text" &&
+								block.text ===
+									"You are a delegated child. Call attempt_completion now with the handoff. Do not address the end user.",
+						)
+					: [],
+			)
+			expect(repairBlocks).toHaveLength(1)
+			expect(blockSpy).toHaveBeenCalledOnce()
+			expect(blockSpy).toHaveBeenCalledWith({ parentTaskId: parent.taskId, childTaskId: child.taskId })
+			expect(child.clineMessages).not.toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ say: "text", text: expect.stringContaining("STATUS=SUCCESS") }),
+				]),
+			)
+		})
+	})
+
 	describe("empty-response retries", () => {
 		function stream(chunks: ApiStreamChunk[]): AsyncGenerator<ApiStreamChunk> {
 			return (async function* () {
