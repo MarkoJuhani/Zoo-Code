@@ -144,6 +144,7 @@ import {
 	DELEGATED_CHILD_COMPLETION_REPAIR,
 	hasPersistedCompletionRepair,
 	isRecognizableWorkerEnvelope,
+	normalizeDelegationHandoffOutcome,
 } from "./childCompletionProtocol"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
@@ -2612,14 +2613,23 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				return
 			}
 
-			const didReopen = await provider.reopenParentFromDelegation({
-				parentTaskId: action.parentTaskId,
-				childTaskId: this.taskId,
-				completionResultSummary: action.result,
-				pendingActionId: action.actionId,
-			})
-			if (didReopen) {
+			const outcome = normalizeDelegationHandoffOutcome(
+				await provider.reopenParentFromDelegation({
+					parentTaskId: action.parentTaskId,
+					childTaskId: this.taskId,
+					completionResultSummary: action.result,
+					pendingActionId: action.actionId,
+				}),
+			)
+			if (outcome.kind === "committed" || outcome.kind === "pending") {
 				return
+			}
+			if (outcome.kind === "recoverable_failure") {
+				await provider.markDelegatedChildProtocolBlocked?.({
+					parentTaskId: action.parentTaskId,
+					childTaskId: this.taskId,
+				})
+				throw new Error(`[Task#resumePendingTaskAction] Delegated completion handoff failed: ${outcome.reason}`)
 			}
 
 			await this.clearPendingActionAfterDurableResult(action.actionId)

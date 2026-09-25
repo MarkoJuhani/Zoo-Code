@@ -7,10 +7,16 @@ describe("TaskScheduler", () => {
 	it("runs a task immediately when a permit is available", async () => {
 		const scheduler = new TaskScheduler(1)
 		let ran = false
-		await scheduler.schedule(stubTask(), async () => {
-			ran = true
-		})
+		const stages: string[] = []
+		await scheduler.schedule(
+			stubTask(),
+			async () => {
+				ran = true
+			},
+			(stage) => stages.push(stage),
+		)
 		expect(ran).toBe(true)
+		expect(stages).toEqual(["admitted", "started", "settled"])
 	})
 
 	it("queues a second task at maxConcurrency=1 until the first completes", async () => {
@@ -63,11 +69,17 @@ describe("TaskScheduler", () => {
 
 	it("releases the permit even when the run function throws", async () => {
 		const scheduler = new TaskScheduler(1)
+		const stages: string[] = []
 		await expect(
-			scheduler.schedule(stubTask(), async () => {
-				throw new Error("boom")
-			}),
+			scheduler.schedule(
+				stubTask(),
+				async () => {
+					throw new Error("boom")
+				},
+				(stage) => stages.push(stage),
+			),
 		).rejects.toThrow("boom")
+		expect(stages).toEqual(["admitted", "started", "failed"])
 
 		// Permit must have been released — next task should run immediately.
 		let ran = false
@@ -85,7 +97,14 @@ describe("TaskScheduler", () => {
 		await Promise.resolve()
 
 		const errors: unknown[] = []
-		const queued = scheduler.schedule(stubTask(), async () => {}).catch((e) => errors.push(e))
+		const stages: string[] = []
+		const queued = scheduler
+			.schedule(
+				stubTask(),
+				async () => {},
+				(stage) => stages.push(stage),
+			)
+			.catch((e) => errors.push(e))
 		await Promise.resolve()
 
 		expect(scheduler.waiting).toBe(1)
@@ -94,6 +113,7 @@ describe("TaskScheduler", () => {
 
 		await queued
 		expect(errors).toHaveLength(1)
+		expect(stages).toEqual(["cancelled"])
 
 		// Running task is unaffected.
 		resolveRunning()
@@ -108,9 +128,14 @@ describe("TaskScheduler", () => {
 
 		const abortedTask = { abort: true, abandoned: false } as unknown as Task
 		let ran = false
-		const queued = scheduler.schedule(abortedTask, async () => {
-			ran = true
-		})
+		const stages: string[] = []
+		const queued = scheduler.schedule(
+			abortedTask,
+			async () => {
+				ran = true
+			},
+			(stage) => stages.push(stage),
+		)
 		await Promise.resolve()
 		expect(scheduler.waiting).toBe(1)
 
@@ -118,6 +143,7 @@ describe("TaskScheduler", () => {
 		await Promise.all([first, queued])
 
 		expect(ran).toBe(false)
+		expect(stages).toEqual(["admitted", "cancelled"])
 		// Permit must be released — a subsequent task can run immediately.
 		let next = false
 		await scheduler.schedule(stubTask(), async () => {

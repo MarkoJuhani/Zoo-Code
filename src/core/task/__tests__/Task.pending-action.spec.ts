@@ -73,7 +73,7 @@ describe("Task pending action replay", () => {
 
 	it("falls back to a fresh completion ask when approved finish delegation is stale", async () => {
 		const provider = {
-			reopenParentFromDelegation: vi.fn().mockResolvedValue(false),
+			reopenParentFromDelegation: vi.fn().mockResolvedValue({ kind: "detached", reason: "ownership_moved" }),
 			clearPendingTaskAction: vi.fn().mockResolvedValue(true),
 		}
 		const task = createTask(provider)
@@ -88,6 +88,30 @@ describe("Task pending action replay", () => {
 		expect(provider.clearPendingTaskAction).toHaveBeenCalledWith("task-1", "finish-action")
 		expect(task.ask).toHaveBeenNthCalledWith(2, "completion_result", "", false)
 		expect(initiateTaskLoop).not.toHaveBeenCalled()
+	})
+
+	it("keeps a recoverable approved finish handoff pending and retryable", async () => {
+		const provider = {
+			reopenParentFromDelegation: vi
+				.fn()
+				.mockResolvedValue({ kind: "recoverable_failure", reason: "history_write_failed" }),
+			clearPendingTaskAction: vi.fn(),
+			markDelegatedChildProtocolBlocked: vi.fn().mockResolvedValue(true),
+		}
+		const task = createTask(provider)
+		task.ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+
+		await expect(getPendingActionAccess(task).resumePendingTaskAction(finishAction)).rejects.toThrow(
+			"history_write_failed",
+		)
+
+		expect(provider.markDelegatedChildProtocolBlocked).toHaveBeenCalledWith({
+			parentTaskId: "parent-1",
+			childTaskId: "task-1",
+		})
+		expect(provider.clearPendingTaskAction).not.toHaveBeenCalled()
+		expect(task.ask).toHaveBeenCalledTimes(1)
+		expect(task.ask).not.toHaveBeenCalledWith("completion_result", "", false)
 	})
 
 	it("adopts and resumes a newer persisted action at the stale-action recursion boundary", async () => {

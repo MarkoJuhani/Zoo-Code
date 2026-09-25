@@ -3,6 +3,7 @@ import * as vscode from "vscode"
 import { RooCodeEventName, type HistoryItem, type PendingTaskAction } from "@roo-code/types"
 
 import { Task } from "../task/Task"
+import { type DelegationHandoffOutcome, normalizeDelegationHandoffOutcome } from "../task/childCompletionProtocol"
 import { formatResponse } from "../prompts/responses"
 import { Package } from "../../shared/package"
 import type { ToolUse } from "../../shared/tools"
@@ -29,6 +30,7 @@ interface DelegationProvider {
 	getTaskWithId(id: string): Promise<{ historyItem: HistoryItem }>
 	setPendingTaskAction(taskId: string, pendingAction: PendingTaskAction): Promise<void>
 	clearPendingTaskAction(taskId: string, actionId: string): Promise<boolean>
+	markDelegatedChildProtocolBlocked?(params: { parentTaskId: string; childTaskId: string }): Promise<boolean>
 	emitDelegatedTaskCompleted(
 		taskId: string,
 		tokenUsage: ReturnType<Task["getTokenUsage"]>,
@@ -39,7 +41,7 @@ interface DelegationProvider {
 		childTaskId: string
 		completionResultSummary: string
 		pendingActionId?: string
-	}): Promise<boolean>
+	}): Promise<DelegationHandoffOutcome | boolean>
 }
 
 export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
@@ -131,7 +133,8 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 								(parentHistory?.status === "delegated" ||
 									parentHistory?.status === "active" ||
 									parentHistory?.status === "blocked_protocol_error") &&
-								parentHistory?.awaitingChildId === task.taskId
+								parentHistory?.awaitingChildId === task.taskId &&
+								historyItem.parentTaskId === task.parentTaskId
 							) {
 								const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
 								if (pendingActionId) {
@@ -178,7 +181,7 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 									)
 								}
 								if (delegation !== "continue") return
-							} else {
+							} else if (historyItem.parentTaskId !== task.parentTaskId) {
 								// Parent already detached, such as when the user cancelled this child.
 								// Fall through to the normal completion ask flow.
 								const msg =
@@ -187,6 +190,14 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 									`Diagnostic: { childStatus: "${status}", parentStatus: "${parentHistory?.status}", awaitingChildId: "${parentHistory?.awaitingChildId}" }`
 								provider.log(msg)
 								console.warn(msg)
+							} else {
+								await this.blockDelegatedCompletion(
+									task,
+									provider,
+									pushToolResult,
+									"history_lookup_failed",
+								)
+								return
 							}
 						} else {
 							// Unexpected status (undefined or "delegated") - log error and skip delegation
@@ -196,7 +207,13 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 								`[AttemptCompletionTool] Unexpected child task status "${status}" for task ${task.taskId}. ` +
 									`Expected "active", "interrupted", "blocked_protocol_error", or "completed". Skipping delegation to prevent data corruption.`,
 							)
-							// Fall through to normal completion ask flow
+							await this.blockDelegatedCompletion(
+								task,
+								provider,
+								pushToolResult,
+								"unexpected_child_status",
+							)
+							return
 						}
 					} catch (err) {
 						// If we can't get the history, log error and skip delegation
@@ -204,8 +221,14 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 							`[AttemptCompletionTool] Failed to get history for task ${historyLookupTaskId}: ${(err as Error)?.message ?? String(err)}. ` +
 								`Skipping delegation.`,
 						)
-						// Fall through to normal completion ask flow
+						await this.blockDelegatedCompletion(task, provider, pushToolResult, "history_lookup_failed")
+						return
 					}
+				} else {
+					pushToolResult(
+						formatResponse.toolError("Delegated completion handoff failed: provider_unavailable"),
+					)
+					return
 				}
 			}
 
@@ -257,6 +280,25 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		}
 	}
 
+	private async blockDelegatedCompletion(
+		task: Task,
+		provider: DelegationProvider,
+		pushToolResult: (result: string) => void,
+		reason: "history_lookup_failed" | "unexpected_child_status",
+	): Promise<void> {
+		try {
+			await provider.markDelegatedChildProtocolBlocked?.({
+				parentTaskId: task.parentTaskId!,
+				childTaskId: task.taskId,
+			})
+		} catch (error) {
+			provider.log(
+				`[AttemptCompletionTool] Failed to persist blocked handoff for child ${task.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+		pushToolResult(formatResponse.toolError(`Delegated completion handoff failed: ${reason}`))
+	}
+
 	/**
 	 * Handles the common delegation flow when a subtask completes.
 	 * Returns:
@@ -272,7 +314,7 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		pendingActionId: string | undefined,
 		askFinishSubTaskApproval: () => Promise<boolean>,
 		pushToolResult: (result: string) => void,
-	): Promise<"delegated" | "denied" | "continue" | undefined> {
+	): Promise<"delegated" | "denied" | "continue" | "blocked" | undefined> {
 		const didApprove = await askFinishSubTaskApproval()
 
 		if (!didApprove) {
@@ -283,18 +325,29 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			return
 		}
 
-		const didReopen = await provider.reopenParentFromDelegation({
-			parentTaskId: task.parentTaskId!,
-			childTaskId: task.taskId,
-			completionResultSummary: result,
-			...(pendingActionId && { pendingActionId }),
-		})
+		const outcome = normalizeDelegationHandoffOutcome(
+			await provider.reopenParentFromDelegation({
+				parentTaskId: task.parentTaskId!,
+				childTaskId: task.taskId,
+				completionResultSummary: result,
+				...(pendingActionId && { pendingActionId }),
+			}),
+		)
 
-		if (didReopen === false) {
+		if (outcome.kind === "detached") {
 			if (pendingActionId) {
 				await provider.clearPendingTaskAction(task.taskId, pendingActionId)
 			}
 			return "continue"
+		}
+		if (outcome.kind === "pending") return
+		if (outcome.kind === "recoverable_failure") {
+			await provider.markDelegatedChildProtocolBlocked?.({
+				parentTaskId: task.parentTaskId!,
+				childTaskId: task.taskId,
+			})
+			pushToolResult(formatResponse.toolError(`Delegated completion handoff failed: ${outcome.reason}`))
+			return "blocked"
 		}
 
 		pushToolResult("")

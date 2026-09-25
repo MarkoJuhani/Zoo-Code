@@ -46,6 +46,13 @@ const makeParentTask = () =>
 		retrySaveApiConversationHistory: vi.fn(),
 	}) as any
 
+type DelegationTransitionRunner = {
+	runDelegationTransition: <T>(parentTaskId: string, fn: () => Promise<T>) => Promise<T>
+}
+
+const runDelegationTransition = (ClineProvider.prototype as unknown as DelegationTransitionRunner)
+	.runDelegationTransition
+
 describe("ClineProvider.delegateParentAndOpenChild()", () => {
 	it("rejects a stale restored action before delegation side effects", async () => {
 		const parentTask = makeParentTask()
@@ -262,7 +269,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		// Provider-level event
 		expect(providerEmit).toHaveBeenCalledWith(RooCodeEventName.TaskDelegated, "parent-1", "child-1", 1)
 
-		expect(handleModeSwitch).not.toHaveBeenCalled()
+		expect(handleModeSwitch).toHaveBeenCalledWith("code")
 	})
 
 	it("uses an explicitly saved different-mode profile without reading shared current identity", async () => {
@@ -664,6 +671,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 				taskScheduler: new TaskScheduler(),
 				emit: vi.fn(),
 				getCurrentTask: vi.fn(() => parent),
+				runDelegationTransition,
 				removeClineFromStack,
 				createTask: vi.fn().mockResolvedValue(child),
 				log: vi.fn(),

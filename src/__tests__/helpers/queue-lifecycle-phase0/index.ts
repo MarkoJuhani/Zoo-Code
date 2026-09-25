@@ -11,6 +11,7 @@ export type LifecycleTask = EventEmitter & {
 	taskId: string
 	instanceId: string
 	parentTaskId?: string
+	apiConfiguration: Record<string, unknown>
 	abort?: boolean
 	abandoned?: boolean
 	abortReason?: string
@@ -26,6 +27,9 @@ export type LifecycleTask = EventEmitter & {
 	run: () => Promise<void>
 	flushPendingToolResultsToHistory: () => Promise<boolean>
 	retrySaveApiConversationHistory: () => Promise<boolean>
+	cancelAssistantMessagePersistence: () => void
+	getTaskMode: () => Promise<string>
+	getTaskApiConfigName: () => Promise<string | undefined>
 }
 
 export function makeLifecycleTask(
@@ -38,6 +42,7 @@ export function makeLifecycleTask(
 		taskId,
 		instanceId: `${taskId}:instance:1`,
 		parentTaskId,
+		apiConfiguration: {},
 		_isHistoryTask: true,
 		clineMessages: [],
 		diffReversionPromise: Promise.resolve(),
@@ -48,6 +53,9 @@ export function makeLifecycleTask(
 		run,
 		flushPendingToolResultsToHistory: async () => true,
 		retrySaveApiConversationHistory: async () => true,
+		cancelAssistantMessagePersistence: () => {},
+		getTaskMode: async () => "code",
+		getTaskApiConfigName: async () => undefined,
 	})
 	task.abortTask = Task.prototype.abortTask.bind(task as unknown as Task)
 	;(task as LifecycleTask & { abortTaskOnce: () => Promise<void> }).abortTaskOnce = (
@@ -60,6 +68,7 @@ type History = {
 	id: string
 	status: "active" | "delegated" | "completed"
 	awaitingChildId?: string
+	parentTaskId?: string
 }
 
 export class ComposedProvider extends EventEmitter {
@@ -80,6 +89,7 @@ export class ComposedProvider extends EventEmitter {
 	public recentTasksCache: unknown
 	public readonly contextProxy = this.context
 	public taskHistoryStore = {
+		invalidate: async (_id: string) => {},
 		get: (id: string) => this.history.get(id),
 		atomicReadAndUpdate: async (id: string, update: (history: History) => History) => {
 			const history = this.history.get(id)
@@ -143,7 +153,7 @@ export class ComposedProvider extends EventEmitter {
 			this.scheduled.push(taskId)
 		})
 		this.taskRegistry.push(child as unknown as Task)
-		this.history.set(taskId, { id: taskId, status: "active" })
+		this.history.set(taskId, { id: taskId, status: "active", parentTaskId: parent.taskId })
 		this.emit(RooCodeEventName.TaskCreated, child)
 		if (options.startTask) await child.run()
 		return child as unknown as Task

@@ -67,8 +67,11 @@ function makeTaskHistoryStoreStub(
 	parentItem: Record<string, any>,
 	overrides: { atomicUpdatePair?: ReturnType<typeof vi.fn> } = {},
 ) {
+	const correlatedChild = Object.hasOwn(childItem, "parentTaskId")
+		? childItem
+		: { ...childItem, parentTaskId: parentItem.id }
 	const itemMap = new Map<string, Partial<HistoryItem>>([
-		[childItem.id!, childItem],
+		[correlatedChild.id!, correlatedChild],
 		[parentItem.id!, parentItem],
 	])
 
@@ -168,7 +171,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			pendingActionId: "stale-action",
 		})
 
-		expect(result).toBe(false)
+		expect(result).toEqual({ kind: "recoverable_failure", reason: "pending_action_mismatch" })
 		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
 		expect(removeClineFromStack).not.toHaveBeenCalled()
 	})
@@ -191,17 +194,32 @@ describe("History resume delegation - parent metadata transitions", () => {
 			parentTaskId: "parent-1",
 			result: "Done",
 		}
-		const childHistoryItem = { id: "child-1", status: "active", pendingAction: expectedAction }
+		const childHistoryItem = {
+			id: "child-1",
+			status: "active",
+			parentTaskId: "parent-1",
+			pendingAction: expectedAction,
+		}
+		let ownershipMoved = false
 		const atomicUpdatePair = vi.fn(
 			async (_firstId: string, _secondId: string, firstUpdater: (item: HistoryItem) => HistoryItem) => {
+				ownershipMoved = true
 				firstUpdater({
 					...childHistoryItem,
-					pendingAction: { ...expectedAction, actionId: "replacement-action" },
+					parentTaskId: "replacement-parent",
 				} as unknown as HistoryItem)
 				return []
 			},
 		)
 		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem, { atomicUpdatePair })
+		taskHistoryStore.get.mockImplementation(
+			(id: string) =>
+				(id === childHistoryItem.id && ownershipMoved
+					? { ...childHistoryItem, parentTaskId: "replacement-parent" }
+					: id === childHistoryItem.id
+						? childHistoryItem
+						: parentHistoryItem) as Partial<HistoryItem>,
+		)
 		const createTaskWithHistoryItem = vi.fn()
 		const provider = makeProviderStub({
 			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
@@ -220,7 +238,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				completionResultSummary: "Done",
 				pendingActionId: "finish-action",
 			}),
-		).rejects.toThrow("Pending action mismatch for child child-1")
+		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
 
 		expect(atomicUpdatePair).toHaveBeenCalledTimes(1)
 		expect(createTaskWithHistoryItem).not.toHaveBeenCalled()
@@ -296,6 +314,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		const updatedChild = firstUpdater({
 			id: "child-1",
 			status: "active",
+			parentTaskId: "parent-1",
 			pendingAction: {
 				kind: "finish_subtask",
 				actionId: "finish-action",
@@ -525,7 +544,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			completionResultSummary: "Child done",
 		})
 
-		expect(result).toBe(false)
+		expect(result).toEqual({ kind: "recoverable_failure", reason: "history_read_failed" })
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("history unavailable"))
 		expect(readApiMessages).not.toHaveBeenCalled()
 		expect(saveTaskMessages).not.toHaveBeenCalled()
@@ -566,7 +585,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			completionResultSummary: "Child done",
 		})
 
-		expect(result).toBe(false)
+		expect(result).toEqual({ kind: "recoverable_failure", reason: "history_read_failed" })
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("api history unavailable"))
 		expect(saveTaskMessages).not.toHaveBeenCalled()
 		expect(saveApiMessages).not.toHaveBeenCalled()
@@ -872,7 +891,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-rpd06",
 				completionResultSummary: "Subtask finished despite overwrite failures",
 			}),
-		).resolves.toBe(true)
+		).resolves.toMatchObject({ kind: "committed" })
 		await vi.waitFor(() => expect(parentInstance.resumeAfterDelegation).toHaveBeenCalledTimes(1))
 
 		expect(parentInstance.overwriteClineMessages).toHaveBeenCalledTimes(1)
@@ -943,14 +962,14 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-resume-failure",
 				completionResultSummary: "Child completed",
 			}),
-		).resolves.toBe(true)
+		).resolves.toMatchObject({ kind: "committed" })
 		await expect(scheduled).rejects.toThrow(resumeError)
 
-		expect(log).toHaveBeenCalledWith(expect.stringContaining("provider stream failed"))
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("stage=failed reason=Error"))
 		expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
 			expect.stringContaining("Open the task from history to retry"),
 		)
-		expect(emitSpy).not.toHaveBeenCalledWith(
+		expect(emitSpy).toHaveBeenCalledWith(
 			RooCodeEventName.TaskDelegationResumed,
 			"parent-resume-failure",
 			"child-resume-failure",
@@ -1006,7 +1025,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-scheduler-rejection",
 				completionResultSummary: "Child completed",
 			}),
-		).resolves.toBe(true)
+		).resolves.toMatchObject({ kind: "committed" })
 		await (
 			ClineProvider.prototype as unknown as {
 				runDelegationTransition: (
@@ -1124,7 +1143,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 		const [firstId, secondId, firstUpdater, secondUpdater] = taskHistoryStore.atomicUpdatePair.mock.calls[0]
 		expect(firstId).toBe("child-rpd02")
 		expect(secondId).toBe("parent-rpd02")
-		const updatedChild = firstUpdater({ id: "child-rpd02", status: "active" } as HistoryItem)
+		const updatedChild = firstUpdater({
+			id: "child-rpd02",
+			status: "active",
+			parentTaskId: "parent-rpd02",
+		} as HistoryItem)
 		expect(updatedChild.status).toBe("completed")
 		const updatedParent = secondUpdater(parentItem as HistoryItem)
 		expect(updatedParent).toMatchObject({ id: "parent-rpd02", status: "active", completedByChildId: "child-rpd02" })
@@ -1281,7 +1304,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		})
 		await vi.waitFor(() => expect(childC2.run).toHaveBeenCalledTimes(1))
 		expect(parentInstanceA.resumeAfterDelegation).toHaveBeenCalledTimes(1)
-		expect(emitA).not.toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, parentItem.id, "child-c1")
+		expect(emitA).toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, parentItem.id, "child-c1")
 
 		releaseChildRun()
 		await childRun
@@ -1290,6 +1313,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		settleScheduledContinuation()
 		await scheduledContinuationSettled
 		expect(emitA).toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, parentItem.id, "child-c1")
+		expect(emitA.mock.calls.filter(([event]) => event === RooCodeEventName.TaskDelegationResumed)).toHaveLength(1)
 	})
 
 	it("allows resumed work to re-enter the same parent transition queue", async () => {
@@ -1457,9 +1481,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		const persistError = new Error("atomic pair write failed")
 		const atomicUpdatePair = vi.fn().mockRejectedValue(persistError)
-		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "child-rpd04", status: "active" }, parentItem, {
-			atomicUpdatePair,
-		})
+		const taskHistoryStore = makeTaskHistoryStoreStub(
+			{ id: "child-rpd04", status: "active", parentTaskId: "parent-rpd04" },
+			parentItem,
+			{ atomicUpdatePair },
+		)
 		const createTaskWithHistoryItem = vi.fn()
 
 		const provider = makeProviderStub({
@@ -1482,7 +1508,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-rpd04",
 				completionResultSummary: "Child completion with persistence failure",
 			}),
-		).rejects.toThrow(persistError)
+		).resolves.toEqual({ kind: "recoverable_failure", reason: "lifecycle_commit_failed" })
 
 		expect(createTaskWithHistoryItem).not.toHaveBeenCalled()
 	})
@@ -1504,9 +1530,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		// atomicUpdatePair failure aborts the reopen flow.
 		const atomicUpdatePair = vi.fn().mockRejectedValue(persistError)
-		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "child-rpd05", status: "active" }, parentItem, {
-			atomicUpdatePair,
-		})
+		const taskHistoryStore = makeTaskHistoryStoreStub(
+			{ id: "child-rpd05", status: "active", parentTaskId: "parent-rpd05" },
+			parentItem,
+			{ atomicUpdatePair },
+		)
 
 		const provider = makeProviderStub({
 			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
@@ -1529,7 +1557,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-rpd05",
 				completionResultSummary: "Child completion",
 			}),
-		).rejects.toThrow(persistError)
+		).resolves.toEqual({ kind: "recoverable_failure", reason: "lifecycle_commit_failed" })
 
 		// Child is closed before the atomic write (new ordering) — child closed, parent not reopened
 		expect(removeClineFromStack).toHaveBeenCalledTimes(1)
@@ -1573,7 +1601,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "c5",
 				completionResultSummary: "Result",
 			}),
-		).resolves.toBe(true)
+		).resolves.toMatchObject({ kind: "committed" })
 
 		// Verify saves still occurred with just the injected message
 		expect(saveTaskMessages).toHaveBeenCalledWith(
@@ -1627,7 +1655,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toBe(false)
+		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
 		expect(atomicUpdatePair).not.toHaveBeenCalled()
@@ -1663,7 +1691,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toBe(false)
+		).resolves.toEqual({ kind: "detached", reason: "cancelled" })
 
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
@@ -1700,7 +1728,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toBe(false)
+		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
 		expect(atomicUpdatePair).not.toHaveBeenCalled()
@@ -1733,7 +1761,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 	})
 
 	it("reopenParentFromDelegation posts taskHistoryItemUpdated for both records when view is launched", async () => {
-		const childItem = { id: "c-webview", status: "active" }
+		const childItem = { id: "c-webview", status: "active", parentTaskId: "p-webview" }
 		const parentItem = {
 			id: "p-webview",
 			status: "delegated",
@@ -1871,7 +1899,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				tokensOut: 0,
 				totalCost: 0,
 			}
-			const childItem = { id: "c-handoff", status: "active" }
+			const childItem = { id: "c-handoff", status: "active", parentTaskId: "p-handoff" }
 
 			let capturedChildResult: HistoryItem | undefined
 			let capturedParentResult: HistoryItem | undefined

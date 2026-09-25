@@ -104,6 +104,17 @@ describe("task lifecycle transitions", () => {
 		expect(interruptDelegatedChild(parent, child)).toMatchObject({ status: "interrupted", parentTaskId: "parent" })
 	})
 
+	it("interrupts a blocked child without clearing the parent's ownership", () => {
+		const parent = item("parent", {
+			status: "blocked_protocol_error",
+			awaitingChildId: "child",
+			delegatedToId: "child",
+		})
+		const child = item("child", { status: "blocked_protocol_error", parentTaskId: "parent" })
+
+		expect(interruptDelegatedChild(parent, child)).toMatchObject({ status: "interrupted", parentTaskId: "parent" })
+	})
+
 	it("completes only the child the parent still awaits", () => {
 		const parent = item("parent", { status: "delegated", awaitingChildId: "new-child", delegatedToId: "new-child" })
 		const staleChild = item("old-child", { status: "interrupted", parentTaskId: "parent" })

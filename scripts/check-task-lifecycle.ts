@@ -4,6 +4,7 @@ import type { HistoryItem } from "../packages/types/src/history"
 
 import {
 	abandonDelegatedChild,
+	blockDelegatedChildProtocol,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
@@ -25,18 +26,26 @@ interface TraceStep {
 
 const MAX_DEPTH = 12
 const MAX_STATES = 10_000
-const expectedActions = ["delegate", "interrupt", "complete", "abandon"] as const
+const expectedActions = ["delegate", "interrupt", "block", "complete", "abandon"] as const
 const semanticLandmarks = {
-	"interrupted-child-redelegation": (state: ModelState) =>
+	"interrupted-child-redelegation": (state: ModelState, _trace: TraceStep[]) =>
 		state.parent?.status === "delegated" &&
 		state.parent.awaitingChildId === "child-b" &&
 		state["child-a"]?.status === "interrupted",
-	"nested-delegation": (state: ModelState) =>
+	"nested-delegation": (state: ModelState, _trace: TraceStep[]) =>
 		state.parent?.status === "delegated" &&
 		state.parent.awaitingChildId === "child-a" &&
 		state["child-a"]?.status === "delegated" &&
 		state["child-a"].awaitingChildId === "child-b",
-} satisfies Record<string, (state: ModelState) => boolean>
+	"blocked-child-completion": (_state: ModelState, trace: TraceStep[]) =>
+		trace.some(
+			(step, index) => step.action.startsWith("block(") && trace[index + 1]?.action.startsWith("complete("),
+		),
+	"blocked-child-interruption": (_state: ModelState, trace: TraceStep[]) =>
+		trace.some(
+			(step, index) => step.action.startsWith("block(") && trace[index + 1]?.action.startsWith("interrupt("),
+		),
+} satisfies Record<string, (state: ModelState, trace: TraceStep[]) => boolean>
 
 function task(id: TaskId, parentTaskId?: TaskId): HistoryItem {
 	return {
@@ -90,15 +99,33 @@ function transitions(state: ModelState): Transition[] {
 		const parent = state[child.parentTaskId as TaskId]
 		if (!parent) continue
 
-		if (parent.status === "delegated" && parent.awaitingChildId === child.id && child.status === "active") {
+		if (
+			(parent.status === "delegated" || parent.status === "blocked_protocol_error") &&
+			parent.awaitingChildId === child.id &&
+			(child.status === "active" ||
+				(child.status === "blocked_protocol_error" && child.protocolErrorChildId === undefined))
+		) {
 			const interrupted = interruptDelegatedChild(parent, child)
 			result.push({ name: `interrupt(${childId})`, next: replace(state, interrupted) })
 		}
 
 		if (
-			(parent.status === "delegated" || parent.status === "active") &&
+			(parent.status === "delegated" || parent.status === "blocked_protocol_error") &&
 			parent.awaitingChildId === child.id &&
-			(child.status === "active" || child.status === "interrupted")
+			(child.status === "active" || child.status === "interrupted" || child.status === "blocked_protocol_error")
+		) {
+			const blocked = blockDelegatedChildProtocol(parent, child)
+			result.push({ name: `block(${childId})`, next: replace(state, blocked.parent, blocked.child) })
+		}
+
+		if (
+			(parent.status === "delegated" ||
+				parent.status === "active" ||
+				parent.status === "blocked_protocol_error") &&
+			parent.awaitingChildId === child.id &&
+			child.awaitingChildId === undefined &&
+			child.delegatedToId === undefined &&
+			(child.status === "active" || child.status === "interrupted" || child.status === "blocked_protocol_error")
 		) {
 			const completed = completeDelegatedChild(parent, child, `${childId} result`)
 			result.push({
@@ -124,9 +151,10 @@ function invariantViolations(state: ModelState): string[] {
 		const current = state[id]
 		if (!current) continue
 
-		if (current.status === "delegated") {
+		const isBlockedOwner = current.status === "blocked_protocol_error" && current.protocolErrorChildId !== undefined
+		if (current.status === "delegated" || isBlockedOwner) {
 			if (!current.awaitingChildId || current.delegatedToId !== current.awaitingChildId) {
-				violations.push(`${id}: delegated task must point to exactly one awaited child`)
+				violations.push(`${id}: delegated or blocked task must point to exactly one awaited child`)
 				continue
 			}
 			const child = state[current.awaitingChildId as TaskId]
@@ -136,14 +164,28 @@ function invariantViolations(state: ModelState): string[] {
 			if (!current.childIds?.includes(current.awaitingChildId)) {
 				violations.push(`${id}: awaited child must be retained in childIds`)
 			}
+			if (
+				isBlockedOwner &&
+				(current.protocolErrorCode !== "missing_attempt_completion" ||
+					current.protocolErrorChildId !== current.awaitingChildId)
+			) {
+				violations.push(`${id}: blocked owner must retain its correlated protocol error`)
+			}
 		} else if (current.awaitingChildId || current.delegatedToId) {
-			violations.push(`${id}: only delegated tasks may retain an awaited-child pointer`)
+			violations.push(`${id}: only delegated or blocked tasks may retain an awaited-child pointer`)
 		}
 
 		if (current.parentTaskId && current.status !== "interrupted") {
 			const parent = state[current.parentTaskId as TaskId]
 			if (current.status !== "completed" && parent?.awaitingChildId !== id) {
 				violations.push(`${id}: active or delegated linked child must be the child its parent awaits`)
+			}
+			if (
+				current.status === "blocked_protocol_error" &&
+				current.protocolErrorChildId === undefined &&
+				(current.protocolErrorCode !== "missing_attempt_completion" || parent?.protocolErrorChildId !== id)
+			) {
+				violations.push(`${id}: blocked child must retain its owning parent's correlated protocol error`)
 			}
 		}
 
@@ -209,7 +251,7 @@ function runModelCheck(): number {
 	for (let index = 0; index < queue.length; index++) {
 		const node = queue[index]!
 		for (const [name, predicate] of Object.entries(semanticLandmarks)) {
-			if (predicate(node.state)) reachedLandmarks.add(name)
+			if (predicate(node.state, node.trace)) reachedLandmarks.add(name)
 		}
 		const violations = invariantViolations(node.state)
 		if (violations.length) throw new Error(formatCounterexample(violations.join("; "), node.trace))
@@ -278,6 +320,16 @@ function runRepresentativeScenarios(): void {
 	const interruptedCompletion = completeDelegatedChild(delegated, interruptedA, "resumed result")
 	assert.equal(interruptedCompletion.child.status, "completed")
 	assert.equal(interruptedCompletion.parent.status, "active")
+
+	const blocked = blockDelegatedChildProtocol(delegated, childA)
+	const blockedCompletion = completeDelegatedChild(blocked.parent, blocked.child, "repaired result")
+	assert.equal(blockedCompletion.child.status, "completed")
+	assert.equal(blockedCompletion.parent.status, "active")
+	assert.equal(interruptDelegatedChild(blocked.parent, blocked.child).status, "interrupted")
+
+	const wrongParentChild = { ...childA, parentTaskId: "child-b" }
+	assert.throws(() => blockDelegatedChildProtocol(delegated, wrongParentChild), /not delegated to child/)
+	assert.throws(() => completeDelegatedChild(delegated, wrongParentChild, "wrong lineage"), /not delegated to child/)
 }
 
 runRepresentativeScenarios()

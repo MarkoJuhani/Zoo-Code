@@ -215,7 +215,8 @@ describe("ClineProvider.markDelegatedChildInterrupted() — live eviction path",
 			updateTaskHistory,
 			postMessageToWebview,
 			taskHistoryStore: {
-				get: (id: string) => (id === childTaskId ? { id: childTaskId, status: "active" } : undefined),
+				get: (id: string) =>
+					id === childTaskId ? { id: childTaskId, status: "active", parentTaskId } : undefined,
 			},
 		})
 

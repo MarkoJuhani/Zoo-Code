@@ -1,6 +1,12 @@
 import { TaskSemaphore } from "../../utils/TaskSemaphore"
 import { type Task } from "./Task"
 
+export type TaskScheduleStage = "admitted" | "cancelled" | "started" | "settled" | "failed"
+
+export interface TaskScheduleObserver {
+	(stage: TaskScheduleStage, error?: unknown): void
+}
+
 /**
  * Semaphore-based concurrency gate for task execution.
  *
@@ -29,14 +35,27 @@ export class TaskScheduler {
 	 * user cancelled it before it started), the permit is released immediately
 	 * without calling `run()`.
 	 */
-	async schedule(task: Task, run: () => Promise<void>): Promise<void> {
-		const release = await this.sem.acquire()
+	async schedule(task: Task, run: () => Promise<void>, observe?: TaskScheduleObserver): Promise<void> {
+		let release: (() => void) | undefined
+		try {
+			release = await this.sem.acquire()
+			observe?.("admitted")
+		} catch (error) {
+			observe?.("cancelled", error)
+			throw error
+		}
 		if (task.abort || task.abandoned) {
+			observe?.("cancelled")
 			release()
 			return
 		}
 		try {
+			observe?.("started")
 			await run()
+			observe?.("settled")
+		} catch (error) {
+			observe?.("failed", error)
+			throw error
 		} finally {
 			release()
 		}

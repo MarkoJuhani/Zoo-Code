@@ -60,7 +60,7 @@ import {
 } from "@roo-code/types"
 import { RateLimitClock, createRateLimitClock } from "../task/RateLimitClock"
 import { TaskRegistry } from "../task/TaskRegistry"
-import { TaskScheduler } from "../task/TaskScheduler"
+import { TaskScheduler, type TaskScheduleObserver } from "../task/TaskScheduler"
 import {
 	getEffectiveTaskApiConfiguration,
 	selectHandoffExecutionContext,
@@ -134,6 +134,7 @@ import { getNonce } from "./getNonce"
 import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
+import type { DelegationHandoffOutcome } from "../task/childCompletionProtocol"
 import { PendingEditOperationStore, type PendingEditOperationInput } from "./PendingEditOperationStore"
 
 /**
@@ -178,16 +179,40 @@ function scheduleTask(
 	task: Task,
 	source: string,
 	runner?: () => Promise<void>,
+	observe?: TaskScheduleObserver,
+	runnerOwnsExecutionStages = false,
 ): boolean {
 	try {
 		const runFn = runner ?? (() => task.run())
 		if (scheduler && typeof scheduler.schedule === "function") {
 			void scheduler
-				.schedule(task, runFn)
+				.schedule(
+					task,
+					runFn,
+					runnerOwnsExecutionStages
+						? (stage, error) => {
+								if (stage === "admitted" || stage === "cancelled") observe?.(stage, error)
+							}
+						: observe,
+				)
 				.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
 		} else {
 			void Promise.resolve()
-				.then(runFn)
+				.then(async () => {
+					observe?.("admitted")
+					if (task.abort || task.abandoned) {
+						observe?.("cancelled")
+						return
+					}
+					if (!runnerOwnsExecutionStages) observe?.("started")
+					try {
+						await runFn()
+						if (!runnerOwnsExecutionStages) observe?.("settled")
+					} catch (error) {
+						if (!runnerOwnsExecutionStages) observe?.("failed", error)
+						throw error
+					}
+				})
 				.catch((error) => console.error(`[${source}] scheduled task run failed:`, error))
 		}
 		return true
@@ -4220,19 +4245,28 @@ export class ClineProvider
 		childTaskId: string
 		completionResultSummary: string
 		pendingActionId?: string
-	}): Promise<boolean> {
+	}): Promise<DelegationHandoffOutcome> {
 		const { parentTaskId, childTaskId, completionResultSummary, pendingActionId } = params
 		return this.runDelegationTransition(parentTaskId, async () => {
 			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
+			const correlationId = `${parentTaskId}:${childTaskId}:${pendingActionId ?? "direct"}`
 
 			// 1) Load parent from history and current persisted messages
-			const { historyItem } = await this.getTaskWithId(parentTaskId)
+			let historyItem: HistoryItem
+			try {
+				;({ historyItem } = await this.getTaskWithId(parentTaskId))
+			} catch (error) {
+				this.log(
+					`[reopenParentFromDelegation] Failed to load parent ${parentTaskId} (${correlationId}): ${error instanceof Error ? error.message : String(error)}`,
+				)
+				return { kind: "recoverable_failure", reason: "history_lookup_failed" }
+			}
 			const childHistory = this.taskHistoryStore.get(childTaskId)
 			if (pendingActionId && childHistory?.pendingAction?.actionId !== pendingActionId) {
 				this.log(
 					`[reopenParentFromDelegation] Aborting: child ${childTaskId} pending action does not match ${pendingActionId}`,
 				)
-				return false
+				return { kind: "recoverable_failure", reason: "pending_action_mismatch" }
 			}
 
 			// Guard: re-validate delegation state after the async approval gap.
@@ -4251,7 +4285,10 @@ export class ClineProvider
 					`[reopenParentFromDelegation] Aborting: parent ${parentTaskId} is no longer delegated to child ${childTaskId} ` +
 						`(status=${historyItem.status}, awaitingChildId=${historyItem.awaitingChildId})`,
 				)
-				return false
+				return {
+					kind: "detached",
+					reason: this.cancelledDelegationChildIds.has(childTaskId) ? "cancelled" : "ownership_moved",
+				}
 			}
 
 			let parentClineMessages: ClineMessage[] = []
@@ -4264,7 +4301,7 @@ export class ClineProvider
 				this.log(
 					`[reopenParentFromDelegation] Failed to read messages for parent ${parentTaskId}: ${error instanceof Error ? error.message : String(error)}`,
 				)
-				return false
+				return { kind: "recoverable_failure", reason: "history_read_failed" }
 			}
 
 			let parentApiMessages: ApiMessage[] = []
@@ -4277,7 +4314,7 @@ export class ClineProvider
 				this.log(
 					`[reopenParentFromDelegation] Failed to read API messages for parent ${parentTaskId}: ${error instanceof Error ? error.message : String(error)}`,
 				)
-				return false
+				return { kind: "recoverable_failure", reason: "history_read_failed" }
 			}
 
 			// 2) Inject synthetic records: UI subtask_result and update API tool_result
@@ -4302,12 +4339,19 @@ export class ClineProvider
 			) {
 				parentClineMessages.push(subtaskUiMessage)
 			}
-			parentClineMessages = await saveTaskMessages({
-				messages: parentClineMessages,
-				taskId: parentTaskId,
-				globalStoragePath,
-				merge: true,
-			})
+			try {
+				parentClineMessages = await saveTaskMessages({
+					messages: parentClineMessages,
+					taskId: parentTaskId,
+					globalStoragePath,
+					merge: true,
+				})
+			} catch (error) {
+				this.log(
+					`[reopenParentFromDelegation] Failed to save parent UI history (${correlationId}): ${error instanceof Error ? error.message : String(error)}`,
+				)
+				return { kind: "recoverable_failure", reason: "history_write_failed" }
+			}
 
 			// Find the tool_use_id from the last assistant message's new_task tool_use
 			let toolUseId: string | undefined
@@ -4394,12 +4438,19 @@ export class ClineProvider
 				}
 			}
 
-			parentApiMessages = await saveApiMessages({
-				messages: parentApiMessages,
-				taskId: parentTaskId,
-				globalStoragePath,
-				merge: true,
-			})
+			try {
+				parentApiMessages = await saveApiMessages({
+					messages: parentApiMessages,
+					taskId: parentTaskId,
+					globalStoragePath,
+					merge: true,
+				})
+			} catch (error) {
+				this.log(
+					`[reopenParentFromDelegation] Failed to save parent API history (${correlationId}): ${error instanceof Error ? error.message : String(error)}`,
+				)
+				return { kind: "recoverable_failure", reason: "history_write_failed" }
+			}
 
 			// 4) Close child instance if still open (single-open-task invariant).
 			//    This MUST happen BEFORE marking the child "completed" because
@@ -4418,27 +4469,49 @@ export class ClineProvider
 			//      is preserved rather than silently overwritten.
 			let updatedHistory!: typeof historyItem
 			let completingChild!: HistoryItem
-			await this.taskHistoryStore.atomicUpdatePair(
-				childTaskId,
-				parentTaskId,
-				(child) => {
-					if (pendingActionId && child.pendingAction?.actionId !== pendingActionId) {
-						throw new Error(`[reopenParentFromDelegation] Pending action mismatch for child ${childTaskId}`)
-					}
-					completingChild = { ...child }
-					const lifecycleUpdate = completeDelegatedChild(historyItem, child, completionResultSummary)
-					return {
-						...lifecycleUpdate.child,
-						pendingAction:
-							child.pendingAction?.actionId === pendingActionId ? undefined : child.pendingAction,
-					}
-				},
-				(parent) => {
-					const lifecycleUpdate = completeDelegatedChild(parent, completingChild, completionResultSummary)
-					updatedHistory = lifecycleUpdate.parent
-					return updatedHistory
-				},
-			)
+			try {
+				await this.taskHistoryStore.atomicUpdatePair(
+					childTaskId,
+					parentTaskId,
+					(child) => {
+						if (pendingActionId && child.pendingAction?.actionId !== pendingActionId) {
+							throw new Error(
+								`[reopenParentFromDelegation] Pending action mismatch for child ${childTaskId}`,
+							)
+						}
+						completingChild = { ...child }
+						const lifecycleUpdate = completeDelegatedChild(historyItem, child, completionResultSummary)
+						return {
+							...lifecycleUpdate.child,
+							pendingAction:
+								child.pendingAction?.actionId === pendingActionId ? undefined : child.pendingAction,
+						}
+					},
+					(parent) => {
+						const lifecycleUpdate = completeDelegatedChild(parent, completingChild, completionResultSummary)
+						updatedHistory = lifecycleUpdate.parent
+						return updatedHistory
+					},
+				)
+			} catch (error) {
+				await Promise.allSettled([
+					this.taskHistoryStore.invalidate(parentTaskId),
+					this.taskHistoryStore.invalidate(childTaskId),
+				])
+				const currentParent = this.taskHistoryStore.get(parentTaskId)
+				const currentChild = this.taskHistoryStore.get(childTaskId)
+				const ownershipMoved = Boolean(
+					currentParent &&
+					currentChild &&
+					(currentParent.awaitingChildId !== childTaskId || currentChild.parentTaskId !== parentTaskId),
+				)
+				this.log(
+					`[reopenParentFromDelegation] Lifecycle commit failed (${correlationId}, ownershipMoved=${ownershipMoved}): ${error instanceof Error ? error.message : String(error)}`,
+				)
+				return ownershipMoved
+					? { kind: "detached", reason: "ownership_moved" }
+					: { kind: "recoverable_failure", reason: "lifecycle_commit_failed" }
+			}
 			this.recentTasksCache = undefined
 
 			// Notify the webview of both updated items so its in-memory history stays current.
@@ -4479,9 +4552,40 @@ export class ClineProvider
 
 			// 7) Reopen the parent from history as the sole active task (restores saved mode)
 			//    IMPORTANT: startTask=false to suppress resume-from-history ask scheduling
-			const parentInstance = await this.createTaskWithHistoryItem(updatedHistory, { startTask: false })
+			let parentInstance: Task | undefined
+			try {
+				parentInstance = await this.createTaskWithHistoryItem(updatedHistory, { startTask: false })
+			} catch (error) {
+				this.log(
+					`[reopenParentFromDelegation] Parent recreation failed after durable handoff (${correlationId}): ${error instanceof Error ? error.message : String(error)}`,
+				)
+				this.cancelledDelegationChildIds.delete(childTaskId)
+				return { kind: "committed", resumeState: "failed", correlationId }
+			}
 
 			let scheduleOk = false
+			let resumeFailed = false
+			const observeResume: TaskScheduleObserver = (stage, error) => {
+				this.log(
+					`[delegationResume] correlation=${correlationId} parent=${parentTaskId} child=${childTaskId} stage=${stage}${error ? ` reason=${error instanceof Error ? error.name : "unknown"}` : ""}`,
+				)
+				if (stage === "failed") {
+					void vscode.window.showErrorMessage(
+						"The parent task could not resume automatically. Open the task from history to retry.",
+					)
+					return
+				}
+				if (stage !== "started") return
+				try {
+					if (transition !== undefined) {
+						this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId, transition)
+					} else {
+						this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
+					}
+				} catch {
+					// non-fatal
+				}
+			}
 
 			// 8) Inject restored histories into the in-memory instance and schedule resume
 			if (parentInstance) {
@@ -4496,15 +4600,67 @@ export class ClineProvider
 					// non-fatal
 				}
 
+				const runAuthorizedResume = async (resume: () => Promise<void>) => {
+					await this.taskHistoryStore.invalidate(parentTaskId)
+					const persistedParent = this.taskHistoryStore.get(parentTaskId)
+					const currentParent = this.getCurrentTask()
+					const staleReason = this.cancelledDelegationChildIds.has(childTaskId)
+						? "cancelled_child"
+						: parentInstance.abort
+							? "aborted_parent"
+							: parentInstance.abandoned
+								? "abandoned_parent"
+								: currentParent?.taskId !== parentTaskId
+									? "parent_instance_mismatch"
+									: !persistedParent
+										? "missing_parent"
+										: persistedParent.status !== "active" ||
+											  persistedParent.completedByChildId !== childTaskId ||
+											  persistedParent.awaitingChildId !== undefined ||
+											  persistedParent.delegatedToId !== undefined
+											? "ownership_changed"
+											: undefined
+					if (staleReason) {
+						this.log(
+							`[delegationResume] Skipping stale parent continuation correlation=${correlationId} reason=${staleReason}`,
+						)
+						observeResume("cancelled")
+						return
+					}
+					observeResume("started")
+					try {
+						await resume()
+						observeResume("settled")
+					} catch (error) {
+						observeResume("failed", error)
+						throw error
+					}
+				}
+
 				// Auto-resume parent asynchronously without blocking the delegation transition lock
 				if (typeof parentInstance.prepareAfterDelegation === "function") {
-					await parentInstance.prepareAfterDelegation()
-					scheduleOk = scheduleTask(this.taskScheduler, parentInstance, "reopenParentFromDelegation", () =>
-						parentInstance.runResumeLoop(),
-					)
+					try {
+						await parentInstance.prepareAfterDelegation()
+						scheduleOk = scheduleTask(
+							this.taskScheduler,
+							parentInstance,
+							"reopenParentFromDelegation",
+							() => runAuthorizedResume(() => parentInstance.runResumeLoop()),
+							observeResume,
+							true,
+						)
+					} catch (error) {
+						resumeFailed = true
+						observeResume("failed", error)
+					}
 				} else if (typeof parentInstance.resumeAfterDelegation === "function") {
-					scheduleOk = scheduleTask(this.taskScheduler, parentInstance, "reopenParentFromDelegation", () =>
-						parentInstance.resumeAfterDelegation(),
+					scheduleOk = scheduleTask(
+						this.taskScheduler,
+						parentInstance,
+						"reopenParentFromDelegation",
+						() => runAuthorizedResume(() => parentInstance.resumeAfterDelegation()),
+						observeResume,
+						true,
 					)
 				}
 			}
@@ -4518,19 +4674,14 @@ export class ClineProvider
 				}
 			} catch {
 				// non-fatal
-				try {
-					if (transition !== undefined) {
-						this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId, transition)
-					} else {
-						this.emit(RooCodeEventName.TaskDelegationResumed, parentTaskId, childTaskId)
-					}
-				} catch {
-					// non-fatal
-				}
 			}
 
 			this.cancelledDelegationChildIds.delete(childTaskId)
-			return true
+			return {
+				kind: "committed",
+				resumeState: scheduleOk ? "queued" : resumeFailed || !parentInstance ? "failed" : "not_queued",
+				correlationId,
+			}
 		})
 	}
 

@@ -58,7 +58,12 @@ export function delegateTaskToChild(
 }
 
 export function interruptDelegatedChild(parent: HistoryItem, child: HistoryItem): HistoryItem {
-	if (parent.status !== "delegated" || parent.awaitingChildId !== child.id) {
+	if (
+		(parent.status !== "delegated" && parent.status !== "blocked_protocol_error") ||
+		parent.awaitingChildId !== child.id ||
+		child.parentTaskId !== parent.id ||
+		(child.status === "blocked_protocol_error" && child.protocolErrorChildId !== undefined)
+	) {
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
 	assertValidTransition(child.status, "interrupted")
@@ -71,7 +76,8 @@ export function blockDelegatedChildProtocol(
 ): { parent: HistoryItem; child: HistoryItem } {
 	if (
 		(parent.status !== "delegated" && parent.status !== "active" && parent.status !== "blocked_protocol_error") ||
-		parent.awaitingChildId !== child.id
+		parent.awaitingChildId !== child.id ||
+		child.parentTaskId !== parent.id
 	) {
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
@@ -98,7 +104,8 @@ export function completeDelegatedChild(
 ): { parent: HistoryItem; child: HistoryItem } {
 	if (
 		(parent.status !== "delegated" && parent.status !== "active" && parent.status !== "blocked_protocol_error") ||
-		parent.awaitingChildId !== child.id
+		parent.awaitingChildId !== child.id ||
+		child.parentTaskId !== parent.id
 	) {
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
@@ -130,7 +137,7 @@ export function abandonDelegatedChild(
 	parent: HistoryItem,
 	child: HistoryItem,
 ): { parent: HistoryItem; child: HistoryItem } {
-	if (parent.status !== "delegated" || parent.awaitingChildId !== child.id) {
+	if (parent.status !== "delegated" || parent.awaitingChildId !== child.id || child.parentTaskId !== parent.id) {
 		throw new LifecycleTransitionError(`Task ${parent.id} is not delegated to child ${child.id}`)
 	}
 	if (child.status !== "interrupted") {

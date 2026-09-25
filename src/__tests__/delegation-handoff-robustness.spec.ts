@@ -3,6 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { RooCodeEventName } from "@roo-code/types"
 import type { HistoryItem } from "@roo-code/types"
+import type { DelegationHandoffOutcome } from "../core/task/childCompletionProtocol"
 
 /* vscode mock */
 vi.mock("vscode", () => {
@@ -52,8 +53,11 @@ import { makeProviderStub } from "./helpers/provider-stub"
 import { TaskScheduler } from "../core/task/TaskScheduler"
 
 function makeTaskHistoryStoreStub(childItem: Partial<HistoryItem>, parentItem: Partial<HistoryItem>) {
+	const correlatedChild = Object.hasOwn(childItem, "parentTaskId")
+		? childItem
+		: { ...childItem, parentTaskId: parentItem.id }
 	const itemMap = new Map<string, Partial<HistoryItem>>([
-		[childItem.id!, childItem],
+		[correlatedChild.id!, correlatedChild],
 		[parentItem.id!, parentItem],
 	])
 
@@ -64,8 +68,8 @@ function makeTaskHistoryStoreStub(childItem: Partial<HistoryItem>, parentItem: P
 			firstUpdater: (h: HistoryItem) => HistoryItem,
 			secondUpdater: (h: HistoryItem) => HistoryItem,
 		) => {
-			firstUpdater(itemMap.get(firstId) as HistoryItem)
-			secondUpdater(itemMap.get(secondId) as HistoryItem)
+			itemMap.set(firstId, firstUpdater(itemMap.get(firstId) as HistoryItem))
+			itemMap.set(secondId, secondUpdater(itemMap.get(secondId) as HistoryItem))
 			return []
 		},
 	)
@@ -73,6 +77,7 @@ function makeTaskHistoryStoreStub(childItem: Partial<HistoryItem>, parentItem: P
 	return {
 		atomicUpdatePair,
 		get: vi.fn((id: string) => itemMap.get(id)),
+		invalidate: vi.fn().mockResolvedValue(undefined),
 	}
 }
 
@@ -114,14 +119,17 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 		}
 
 		const scheduler = new TaskScheduler(1)
+		let currentTask: { taskId: string } | undefined = { taskId: "child-async" }
 
 		const provider = makeProviderStub({
 			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit: emitSpy,
-			getCurrentTask: vi.fn(() => ({ taskId: "child-async" })),
-			removeClineFromStack: vi.fn().mockResolvedValue(undefined),
-			createTaskWithHistoryItem: vi.fn().mockResolvedValue(parentInstance),
+			getCurrentTask: vi.fn(() => currentTask),
+			removeClineFromStack: vi.fn(async () => {
+				currentTask = undefined
+			}),
+			createTaskWithHistoryItem: vi.fn(async () => (currentTask = parentInstance)),
 			taskHistoryStore,
 			taskScheduler: scheduler,
 			delegationTransitions: new Map([["parent-async", 2]]),
@@ -131,7 +139,7 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 		type ReopenMethod = (
 			this: ClineProvider,
 			params: { parentTaskId: string; childTaskId: string; completionResultSummary?: string },
-		) => Promise<boolean>
+		) => Promise<DelegationHandoffOutcome>
 		const reopenPromise = (
 			ClineProvider.prototype as unknown as { reopenParentFromDelegation: ReopenMethod }
 		).reopenParentFromDelegation.call(provider, {
@@ -141,7 +149,11 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 		})
 
 		const result = await reopenPromise
-		expect(result).toBe(true)
+		expect(result).toEqual({
+			kind: "committed",
+			resumeState: "queued",
+			correlationId: "parent-async:child-async:direct",
+		})
 
 		// Verify preparation occurred synchronously
 		expect(parentInstance.prepareAfterDelegation).toHaveBeenCalledTimes(1)
@@ -161,11 +173,53 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 			true,
 			2,
 		)
-		expect(emitSpy).toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, "parent-async", "child-async", 2)
-
 		// Wait a tick to allow the scheduled microtask to begin running
 		await new Promise((resolve) => setTimeout(resolve, 50))
 		expect(parentLoopStarted).toBe(true)
+		expect(emitSpy).toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, "parent-async", "child-async", 2)
+	})
+
+	it("reports parent preparation failure after the handoff is durably committed", async () => {
+		const parentItem = {
+			id: "parent-prepare-failure",
+			status: "delegated",
+			awaitingChildId: "child-prepare-failure",
+			childIds: ["child-prepare-failure"],
+		} as Partial<HistoryItem>
+		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "child-prepare-failure", status: "active" }, parentItem)
+		const emit = vi.fn()
+		const log = vi.fn()
+		const schedule = vi.fn()
+		const provider = makeProviderStub({
+			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
+			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
+			getCurrentTask: vi.fn(() => ({ taskId: "child-prepare-failure" })),
+			removeClineFromStack: vi.fn().mockResolvedValue(undefined),
+			createTaskWithHistoryItem: vi.fn().mockResolvedValue({
+				taskId: "parent-prepare-failure",
+				prepareAfterDelegation: vi.fn().mockRejectedValue(new Error("sensitive failure")),
+			}),
+			taskHistoryStore,
+			taskScheduler: { schedule },
+			emit,
+			log,
+		})
+
+		await expect(
+			ClineProvider.prototype.reopenParentFromDelegation.call(provider, {
+				parentTaskId: "parent-prepare-failure",
+				childTaskId: "child-prepare-failure",
+				completionResultSummary: "Done",
+			}),
+		).resolves.toMatchObject({ kind: "committed", resumeState: "failed" })
+		expect(schedule).not.toHaveBeenCalled()
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("stage=failed reason=Error"))
+		expect(emit).toHaveBeenCalledWith(
+			RooCodeEventName.TaskResumeScheduled,
+			"parent-prepare-failure",
+			"child-prepare-failure",
+			false,
+		)
 	})
 
 	it("releases the delegation transition lock immediately so a subsequent transition can run", async () => {
@@ -204,7 +258,7 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 		type ReopenMethod = (
 			this: ClineProvider,
 			params: { parentTaskId: string; childTaskId: string; completionResultSummary?: string },
-		) => Promise<boolean>
+		) => Promise<DelegationHandoffOutcome>
 		// 1st reopen completes
 		await (
 			ClineProvider.prototype as unknown as { reopenParentFromDelegation: ReopenMethod }

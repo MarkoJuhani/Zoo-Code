@@ -494,7 +494,7 @@ describe("attemptCompletionTool", () => {
 					log: vi.fn(),
 					getTaskWithId: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active" } })
+							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
@@ -574,7 +574,7 @@ describe("attemptCompletionTool", () => {
 						Promise.resolve({
 							historyItem:
 								id === "child-1"
-									? { id, status: "active" }
+									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
 						}),
 					),
@@ -623,7 +623,7 @@ describe("attemptCompletionTool", () => {
 						Promise.resolve({
 							historyItem:
 								id === "child-1"
-									? { id, status: "active" }
+									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
 						}),
 					),
@@ -672,7 +672,7 @@ describe("attemptCompletionTool", () => {
 						Promise.resolve({
 							historyItem:
 								id === "child-1"
-									? { id, status: "active" }
+									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
 						}),
 					),
@@ -710,7 +710,7 @@ describe("attemptCompletionTool", () => {
 				)
 			})
 
-			it("falls through to standalone completion when parent delegation becomes stale after approval", async () => {
+			it("keeps a still-owned child blocked when handoff fails after approval", async () => {
 				const block: AttemptCompletionToolUse = {
 					type: "tool_use",
 					name: "attempt_completion",
@@ -722,7 +722,7 @@ describe("attemptCompletionTool", () => {
 					log: vi.fn(),
 					getTaskWithId: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active" } })
+							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
@@ -733,7 +733,10 @@ describe("attemptCompletionTool", () => {
 					}),
 					setPendingTaskAction: vi.fn().mockResolvedValue(undefined),
 					clearPendingTaskAction: vi.fn().mockResolvedValue(true),
-					reopenParentFromDelegation: vi.fn().mockResolvedValue(false),
+					markDelegatedChildProtocolBlocked: vi.fn().mockResolvedValue(true),
+					reopenParentFromDelegation: vi
+						.fn()
+						.mockResolvedValue({ kind: "recoverable_failure", reason: "history_write_failed" }),
 				}
 
 				Object.assign(mockTask, {
@@ -761,8 +764,15 @@ describe("attemptCompletionTool", () => {
 					completionResultSummary: "9",
 					pendingActionId: "call-stale-completion",
 				})
-				expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "call-stale-completion")
-				expect(mockTask.ask).toHaveBeenCalledWith("completion_result", "", false)
+				expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
+				expect(mockProvider.markDelegatedChildProtocolBlocked).toHaveBeenCalledWith({
+					parentTaskId: "parent-1",
+					childTaskId: "child-1",
+				})
+				expect(mockTask.ask).not.toHaveBeenCalledWith("completion_result", "", false)
+				expect(mockPushToolResult).toHaveBeenCalledWith(
+					"Error: Delegated completion handoff failed: history_write_failed",
+				)
 				expect(mockPushToolResult).not.toHaveBeenCalledWith("")
 				// Flush once per validated attempt_completion call, before delegation is
 				// attempted, independent of whether delegation succeeds.
@@ -782,7 +792,7 @@ describe("attemptCompletionTool", () => {
 					log: vi.fn(),
 					getTaskWithId: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active" } })
+							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: undefined } })
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
@@ -813,7 +823,6 @@ describe("attemptCompletionTool", () => {
 
 				expect(mockAskFinishSubTaskApproval).not.toHaveBeenCalled()
 				expect(mockProvider.reopenParentFromDelegation).not.toHaveBeenCalled()
-				expect(mockProvider.log).toHaveBeenCalledWith(expect.stringContaining("Skipping delegation"))
 				expect(mockTask.ask).toHaveBeenCalledWith("completion_result", "", false)
 				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledTimes(1)
 				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledWith("attempt_completion")
@@ -831,7 +840,9 @@ describe("attemptCompletionTool", () => {
 					log: vi.fn(),
 					getTaskWithId: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "interrupted" } })
+							return Promise.resolve({
+								historyItem: { id, status: "interrupted", parentTaskId: "parent-1" },
+							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
@@ -884,7 +895,7 @@ describe("attemptCompletionTool", () => {
 					log: vi.fn(),
 					getTaskWithId: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active" } })
+							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
@@ -915,10 +926,11 @@ describe("attemptCompletionTool", () => {
 
 				expect(mockAskFinishSubTaskApproval).not.toHaveBeenCalled()
 				expect(mockProvider.reopenParentFromDelegation).not.toHaveBeenCalled()
-				expect(mockProvider.log).toHaveBeenCalledWith(expect.stringContaining("Skipping delegation"))
-				expect(mockTask.ask).toHaveBeenCalledWith("completion_result", "", false)
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledTimes(1)
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledWith("attempt_completion")
+				expect(mockTask.ask).not.toHaveBeenCalledWith("completion_result", "", false)
+				expect(mockPushToolResult).toHaveBeenCalledWith(
+					"Error: Delegated completion handoff failed: history_lookup_failed",
+				)
+				expect(mockTask.flushTelemetryInstallment).not.toHaveBeenCalled()
 			})
 
 			it("emits TaskCompleted only when completion is accepted", async () => {
@@ -1154,13 +1166,15 @@ describe("attemptCompletionTool", () => {
 						Promise.resolve({
 							historyItem:
 								id === "child-1"
-									? { id, status: "active" }
+									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "delegated", awaitingChildId: "child-1" },
 						}),
 					),
 					setPendingTaskAction: vi.fn(),
 					clearPendingTaskAction: vi.fn(),
-					reopenParentFromDelegation: vi.fn().mockResolvedValue(false),
+					reopenParentFromDelegation: vi
+						.fn()
+						.mockResolvedValue({ kind: "detached", reason: "ownership_moved" }),
 				}
 				Object.assign(mockTask, {
 					taskId: "child-1",
