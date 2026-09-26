@@ -2220,8 +2220,48 @@ describe("Provider authoritative completion lifecycle regressions", () => {
 				pendingActionId: action.actionId,
 				completionResultSummary: "Replacement must not overwrite saved result",
 			})
-		return { parent, child, action, store, provider, complete, parentInstance, run: () => continuation!() }
+		return {
+			parent,
+			child,
+			action,
+			store,
+			provider,
+			complete,
+			parentInstance,
+			run: () => continuation!(),
+			setCurrentParent: (task: typeof parentInstance) => {
+				current = task
+			},
+		}
 	}
+
+	it.each([false, true])("requires the captured parent instance at resume (replacement=%s)", async (replace) => {
+		const f = fixture()
+		await expect(f.complete()).resolves.toMatchObject({ kind: "committed", resumeState: "queued" })
+		const replacement = { ...f.parentInstance, runResumeLoop: vi.fn() }
+		expect(replacement.taskId).toBe(f.parentInstance.taskId)
+		expect(replacement).not.toBe(f.parentInstance)
+		f.setCurrentParent(replace ? replacement : f.parentInstance)
+
+		await f.run()
+
+		expect(f.parentInstance.runResumeLoop).toHaveBeenCalledTimes(replace ? 0 : 1)
+		expect(replacement.runResumeLoop).not.toHaveBeenCalled()
+		if (replace) {
+			expect(f.provider.emit).not.toHaveBeenCalledWith(
+				RooCodeEventName.TaskDelegationResumed,
+				f.parent.id,
+				f.child.id,
+			)
+			expect(f.provider.log).toHaveBeenCalledWith(expect.stringContaining("reason=parent_instance_mismatch"))
+		} else {
+			expect(f.provider.emit).toHaveBeenCalledWith(
+				RooCodeEventName.TaskDelegationResumed,
+				f.parent.id,
+				f.child.id,
+			)
+		}
+	})
 
 	it.each(["child", "parent"])(
 		"does not resurrect missing %s metadata from stale cache/global history",

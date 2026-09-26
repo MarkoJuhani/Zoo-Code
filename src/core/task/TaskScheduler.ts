@@ -36,25 +36,31 @@ export class TaskScheduler {
 	 * without calling `run()`.
 	 */
 	async schedule(task: Task, run: () => Promise<void>, observe?: TaskScheduleObserver): Promise<void> {
-		let release: (() => void) | undefined
+		const notify: TaskScheduleObserver = (stage, error) => {
+			try {
+				observe?.(stage, error)
+			} catch {
+				// Observation must not affect execution, its outcome, or permit ownership.
+			}
+		}
+		let release: () => void
 		try {
 			release = await this.sem.acquire()
-			observe?.("admitted")
 		} catch (error) {
-			observe?.("cancelled", error)
+			notify("cancelled", error)
 			throw error
 		}
-		if (task.abort || task.abandoned) {
-			observe?.("cancelled")
-			release()
-			return
-		}
 		try {
-			observe?.("started")
+			notify("admitted")
+			if (task.abort || task.abandoned) {
+				notify("cancelled")
+				return
+			}
+			notify("started")
 			await run()
-			observe?.("settled")
+			notify("settled")
 		} catch (error) {
-			observe?.("failed", error)
+			notify("failed", error)
 			throw error
 		} finally {
 			release()

@@ -1,3 +1,4 @@
+import { E_CANCELED } from "async-mutex"
 import { TaskScheduler } from "../TaskScheduler"
 import { type Task } from "../Task"
 
@@ -183,5 +184,123 @@ describe("TaskScheduler", () => {
 
 		resolveFirst()
 		await Promise.all([first, second])
+	})
+
+	it.each(["admitted", "started", "settled"])("isolates a throwing %s observer on success", async (throwAt) => {
+		const scheduler = new TaskScheduler(1)
+		const run = vi.fn().mockResolvedValue(undefined)
+		const nextRun = vi.fn().mockResolvedValue(undefined)
+		const stages: string[] = []
+		const first = scheduler.schedule(stubTask(), run, (stage) => {
+			stages.push(stage)
+			if (stage === throwAt) throw new Error("observer failure")
+		})
+		const next = scheduler.schedule(stubTask(), nextRun)
+		expect(scheduler.waiting).toBe(1)
+		await expect(first).resolves.toBeUndefined()
+		await expect(next).resolves.toBeUndefined()
+		expect(run).toHaveBeenCalledOnce()
+		expect(nextRun).toHaveBeenCalledOnce()
+		expect(stages).toEqual(["admitted", "started", "settled"])
+		expect(scheduler.waiting).toBe(0)
+		expect(scheduler["sem"].available).toBe(1)
+	})
+
+	it.each(["admitted", "started", "failed"])(
+		"preserves the run error when the %s observer throws",
+		async (throwAt) => {
+			const scheduler = new TaskScheduler(1)
+			const runError = new Error("original run failure")
+			const run = vi.fn().mockRejectedValue(runError)
+			const nextRun = vi.fn().mockResolvedValue(undefined)
+			const observe = vi.fn((stage: string) => {
+				if (stage === throwAt) throw new Error("observer failure")
+			})
+			const first = scheduler.schedule(stubTask(), run, observe)
+			const next = scheduler.schedule(stubTask(), nextRun)
+			expect(scheduler.waiting).toBe(1)
+			await expect(first).rejects.toBe(runError)
+			await next
+			expect(run).toHaveBeenCalledOnce()
+			expect(observe.mock.calls.map(([stage]) => stage)).toEqual(["admitted", "started", "failed"])
+			expect(observe).toHaveBeenLastCalledWith("failed", runError)
+			expect(nextRun).toHaveBeenCalledOnce()
+			expect(scheduler["sem"].available).toBe(1)
+		},
+	)
+
+	it.each([
+		{ flag: "abort" as const, throwAt: "admitted" },
+		{ flag: "abort" as const, throwAt: "cancelled" },
+		{ flag: "abandoned" as const, throwAt: "admitted" },
+		{ flag: "abandoned" as const, throwAt: "cancelled" },
+	])("releases a queued $flag task when its $throwAt observer throws", async ({ flag, throwAt }) => {
+		const scheduler = new TaskScheduler(1)
+		let finish!: () => void
+		const running = scheduler.schedule(stubTask(), () => new Promise<void>((resolve) => (finish = resolve)))
+		await vi.waitFor(() => expect(finish).toBeDefined())
+		const task = stubTask()
+		const run = vi.fn().mockResolvedValue(undefined)
+		const nextRun = vi.fn().mockResolvedValue(undefined)
+		const stages: string[] = []
+		const cancelled = scheduler.schedule(task, run, (stage) => {
+			stages.push(stage)
+			if (stage === throwAt) throw new Error("observer failure")
+		})
+		const next = scheduler.schedule(stubTask(), nextRun)
+		expect(scheduler.waiting).toBe(2)
+		task[flag] = true
+		finish()
+		await expect(cancelled).resolves.toBeUndefined()
+		await Promise.all([running, next])
+		expect(run).not.toHaveBeenCalled()
+		expect(stages).toEqual(["admitted", "cancelled"])
+		expect(nextRun).toHaveBeenCalledOnce()
+		expect(scheduler.waiting).toBe(0)
+		expect(scheduler["sem"].available).toBe(1)
+	})
+
+	it("preserves acquisition rejection when the cancellation observer throws", async () => {
+		const scheduler = new TaskScheduler(1)
+		const acquireError = new Error("acquisition failed")
+		vi.spyOn(scheduler["sem"], "acquire").mockRejectedValueOnce(acquireError)
+		const run = vi.fn().mockResolvedValue(undefined)
+		const observe = vi.fn(() => {
+			throw new Error("observer failure")
+		})
+		await expect(scheduler.schedule(stubTask(), run, observe)).rejects.toBe(acquireError)
+		expect(observe).toHaveBeenCalledExactlyOnceWith("cancelled", acquireError)
+		expect(run).not.toHaveBeenCalled()
+		await scheduler.schedule(stubTask(), run)
+		expect(run).toHaveBeenCalledOnce()
+		expect(scheduler["sem"].available).toBe(1)
+	})
+
+	it("preserves queue cancellation and held permits when observers throw", async () => {
+		const scheduler = new TaskScheduler(1)
+		let finish!: () => void
+		const running = scheduler.schedule(stubTask(), () => new Promise<void>((resolve) => (finish = resolve)))
+		await vi.waitFor(() => expect(finish).toBeDefined())
+		const cancelledRun = vi.fn().mockResolvedValue(undefined)
+		const observe = vi.fn(() => {
+			throw new Error("observer failure")
+		})
+		const queued = scheduler.schedule(stubTask(), cancelledRun, observe)
+		const rejected = expect(queued).rejects.toBe(E_CANCELED)
+		expect(scheduler.waiting).toBe(1)
+		scheduler.cancelQueued()
+		await rejected
+		expect(observe).toHaveBeenCalledExactlyOnceWith("cancelled", E_CANCELED)
+		expect(cancelledRun).not.toHaveBeenCalled()
+		expect(scheduler.waiting).toBe(0)
+		expect(scheduler["sem"].available).toBe(0)
+		const nextRun = vi.fn().mockResolvedValue(undefined)
+		const next = scheduler.schedule(stubTask(), nextRun)
+		expect(scheduler.waiting).toBe(1)
+		expect(nextRun).not.toHaveBeenCalled()
+		finish()
+		await Promise.all([running, next])
+		expect(nextRun).toHaveBeenCalledOnce()
+		expect(scheduler["sem"].available).toBe(1)
 	})
 })
