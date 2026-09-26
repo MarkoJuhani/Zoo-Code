@@ -3398,6 +3398,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										id: chunk.id,
 										name: chunk.name,
 										arguments: chunk.arguments,
+										replaceArguments: chunk.replaceArguments,
 									},
 									nativeToolCallParserScope,
 								)
@@ -3876,24 +3877,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
 							this.presentAssistantMessageSafe()
 						} else if (toolUseIndex !== undefined) {
-							// finalizeStreamingToolCall returned null (malformed JSON or missing args).
-							// existingToolUse is the same object the streaming phase was mutating in
-							// place, so it still carries nativeArgs AND params built from the incomplete
-							// partial parse (e.g. a truncated write_to_file `content` string) - both were
-							// only ever meant for live progress display, never for execution or for
-							// ending up in conversation history. Mark the tool as non-partial so it's
-							// presented as complete, and clear both so presentAssistantMessage's
-							// `!block.nativeArgs` guard short-circuits with a structured tool_result
-							// instead of executing the truncated value, and so the toolUse.nativeArgs ||
-							// toolUse.params fallback used when recording history doesn't fall through to
-							// the same truncated data under a different name.
+							// Reject explicitly: missing args alone cannot distinguish a failed native
+							// call from a legitimate legacy/custom call. Clear provisional values
+							// so they cannot reach execution or conversation history.
 							const existingToolUse = this.assistantMessageContent[toolUseIndex]
-							if (existingToolUse && existingToolUse.type === "tool_use") {
+							if (existingToolUse?.type === "tool_use" || existingToolUse?.type === "mcp_tool_use") {
 								existingToolUse.partial = false
-								existingToolUse.nativeArgs = undefined
-								existingToolUse.params = {}
-								// Ensure it has the ID for native protocol
-								;(existingToolUse as any).id = event.id
+								existingToolUse.finalizationFailed = true
+								if (existingToolUse.type === "tool_use") {
+									existingToolUse.nativeArgs = undefined
+									existingToolUse.params = {}
+								} else {
+									existingToolUse.arguments = {}
+								}
+								existingToolUse.id = event.id
 							}
 
 							// Clean up tracking
@@ -3902,7 +3899,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							// Mark that we have new content to process
 							this.userMessageContentReady = false
 
-							// Present the tool call - validation will handle missing params
+							// Present the rejected call as a single error result
 							/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
 							this.presentAssistantMessageSafe()
 						}

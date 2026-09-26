@@ -137,6 +137,8 @@ export interface ToolUse<TName extends ToolName = ToolName> {
 	// params is a partial record, allowing only some or none of the possible parameters to be used
 	params: Partial<Record<ToolParamName, string>>
 	partial: boolean
+	/** Native stream finalization failed; never dispatch this call, even if empty args are valid. */
+	finalizationFailed?: boolean
 	// nativeArgs is properly typed based on TName if it's in NativeToolArgs, otherwise never
 	nativeArgs?: TName extends keyof NativeToolArgs ? NativeToolArgs[TName] : never
 	/**
@@ -164,6 +166,8 @@ export interface McpToolUse {
 	/** Arguments passed to the MCP tool */
 	arguments: Record<string, unknown>
 	partial: boolean
+	/** Native stream finalization failed; never dispatch this call, even if empty args are valid. */
+	finalizationFailed?: boolean
 }
 
 export interface ExecuteCommandToolUse extends ToolUse<"execute_command"> {

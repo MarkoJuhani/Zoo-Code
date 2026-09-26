@@ -451,3 +451,57 @@ describe("NativeToolCallParser", () => {
 		})
 	})
 })
+
+describe("authoritative raw argument replacement", () => {
+	it("replaces buffered deltas before a tool name arrives", () => {
+		const scope = NativeToolCallParser.createScope()
+		expect(NativeToolCallParser.processRawChunk({ index: 0, id: "a", arguments: '{"path":"old' }, scope)).toEqual(
+			[],
+		)
+		const events = NativeToolCallParser.processRawChunk(
+			{ index: 0, id: "a", name: "read_file", arguments: '{"path":"new"}', replaceArguments: true },
+			scope,
+		)
+		expect(events).toEqual([
+			{ type: "tool_call_start", id: "a", name: "read_file" },
+			{ type: "tool_call_delta", id: "a", delta: '{"path":"new"}' },
+		])
+	})
+	it("isolates malformed completion state and clears it on cancellation", () => {
+		const first = NativeToolCallParser.createScope()
+		const second = NativeToolCallParser.createScope()
+		for (const scope of [first, second]) {
+			NativeToolCallParser.processRawChunk({ index: 0, id: "a", name: "read_file" }, scope)
+			NativeToolCallParser.startStreamingToolCall("a", "read_file", scope)
+			NativeToolCallParser.processStreamingChunk("a", '{"path":"ok"}', scope)
+		}
+		NativeToolCallParser.processRawChunk({ index: 0, arguments: "", replaceArguments: true }, first)
+		expect(NativeToolCallParser.finalizeStreamingToolCall("a", second)).toMatchObject({
+			nativeArgs: { path: "ok" },
+		})
+		NativeToolCallParser.clearRawChunkState(first)
+		NativeToolCallParser.clearAllStreamingToolCalls(first)
+		NativeToolCallParser.startStreamingToolCall("a", "read_file", first)
+		NativeToolCallParser.processStreamingChunk("a", '{"path":"fresh"}', first)
+		expect(NativeToolCallParser.finalizeStreamingToolCall("a", first)).toMatchObject({
+			nativeArgs: { path: "fresh" },
+		})
+	})
+	it("rejects malformed MCP completion without logging argument values", () => {
+		const scope = NativeToolCallParser.createScope()
+		NativeToolCallParser.processRawChunk({ index: 0, id: "a", name: "mcp--server--tool" }, scope)
+		NativeToolCallParser.startStreamingToolCall("a", "mcp--server--tool", scope)
+		NativeToolCallParser.processStreamingChunk("a", '{"secret":"prior"}', scope)
+		const log = vi.spyOn(console, "error").mockImplementation(() => {})
+		try {
+			NativeToolCallParser.processRawChunk(
+				{ index: 0, arguments: '{"secret":"broken', replaceArguments: true },
+				scope,
+			)
+			expect(NativeToolCallParser.finalizeStreamingToolCall("a", scope)).toBeNull()
+			expect(log).not.toHaveBeenCalled()
+		} finally {
+			log.mockRestore()
+		}
+	})
+})

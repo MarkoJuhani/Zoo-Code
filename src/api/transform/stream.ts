@@ -100,6 +100,8 @@ export interface ApiStreamToolCallEndChunk {
  * (tracking, buffering, emitting start/delta/end events).
  */
 export interface ApiStreamToolCallPartialChunk {
+	/** Authoritative completed arguments replace, rather than append to, streamed JSON. */
+	replaceArguments?: boolean
 	type: "tool_call_partial"
 	index: number
 	id?: string

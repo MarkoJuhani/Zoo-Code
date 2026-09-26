@@ -6,6 +6,8 @@ import * as path from "path"
 import * as vscode from "vscode"
 import { Anthropic } from "@anthropic-ai/sdk"
 import type { Mock } from "vitest"
+import { z } from "zod/v4"
+import { customToolRegistry } from "@roo-code/core"
 
 import {
 	providerIdentifiers,
@@ -34,6 +36,7 @@ import { asyncStreamFrom } from "../../../test-utils/stream"
 import { McpHub } from "../../../services/mcp/McpHub"
 import { McpServerManager } from "../../../services/mcp/McpServerManager"
 import { writeToFileTool } from "../../tools/WriteToFileTool"
+import { useMcpToolTool } from "../../tools/UseMcpToolTool"
 
 type TaskTestAccess = {
 	getSystemPrompt: (requestState: ProviderState | undefined, requestModelInfo?: ModelInfo) => Promise<string>
@@ -807,6 +810,84 @@ describe("Cline", () => {
 			])
 		})
 
+		it.each(["no schema", "empty-accepting schema", "built-in", "MCP"])(
+			"rejects malformed authoritative completion before dispatch (%s)",
+			async (schema) => {
+				const name =
+					schema === "built-in"
+						? "write_to_file"
+						: schema === "MCP"
+							? "mcp--server--tool"
+							: "finalization_regression_tool"
+				const execute = vi.fn().mockResolvedValue("must not execute")
+				const writeHandle = vi.spyOn(writeToFileTool, "handle").mockResolvedValue(undefined)
+				const mcpHandle = vi.spyOn(useMcpToolTool, "handle").mockResolvedValue(undefined)
+				if (schema !== "built-in" && schema !== "MCP")
+					customToolRegistry.register({
+						name,
+						description: "Finalization regression",
+						...(schema === "empty-accepting schema" ? { parameters: z.object({}) } : {}),
+						execute,
+					})
+				try {
+					const state = await mockProvider.getState()
+					vi.spyOn(mockProvider, "getState").mockResolvedValue({
+						...state,
+						experiments: { ...state.experiments, customTools: true },
+					})
+					const task = new Task({
+						provider: mockProvider,
+						apiConfiguration: mockApiConfig,
+						task: "invalid completion test",
+						startTask: false,
+					})
+					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+					vi.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
+					const pushResult = vi.spyOn(task, "pushToolResultToUserContent")
+					vi.spyOn(task, "attemptApiRequest")
+						.mockImplementationOnce(() =>
+							asyncStreamFrom<ApiStreamChunk>([
+								{ type: "tool_call_partial", index: 0, id: "call_invalid_completion", name },
+								{
+									type: "tool_call_partial",
+									index: 0,
+									arguments:
+										'{"path":"docs/config.md","content":"provisional","secret":"provisional"}',
+								},
+								{
+									type: "tool_call_partial",
+									index: 0,
+									arguments: '{"secret":"malformed',
+									replaceArguments: true,
+								},
+							]),
+						)
+						.mockImplementation(() => asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "" }]))
+
+					await task.recursivelyMakeClineRequests([{ type: "text", text: "invalid completion test" }])
+
+					expect(execute).not.toHaveBeenCalled()
+					for (const handle of [writeHandle, mcpHandle]) {
+						expect(handle.mock.calls.filter(([, block]) => !block.partial)).toHaveLength(0)
+					}
+					const results = pushResult.mock.calls.filter(
+						([result]) => result.tool_use_id === "call_invalid_completion",
+					)
+					expect(results).toHaveLength(1)
+					expect(results[0][0]).toMatchObject({ type: "tool_result", is_error: true })
+					expect(JSON.stringify(results)).toContain("could not be finalized")
+					const assistantEntries = task.apiConversationHistory.filter(
+						(message) => message.role === "assistant",
+					)
+					expect(JSON.stringify(assistantEntries)).not.toMatch(/provisional|malformed/)
+				} finally {
+					customToolRegistry.unregister(name)
+					writeHandle.mockRestore()
+					mcpHandle.mockRestore()
+				}
+			},
+		)
+
 		it("blocks a truncated write_to_file call instead of executing it (issue #1221)", async () => {
 			// Regression test for #1221: if the model's stream is cut off mid-way
 			// through a write_to_file tool call's `content` argument (e.g. it hits
@@ -901,7 +982,7 @@ describe("Cline", () => {
 				tool_use_id: "call_truncated",
 				is_error: true,
 			})
-			expect(JSON.stringify(truncatedCallResult)).toContain("missing nativeArgs")
+			expect(JSON.stringify(truncatedCallResult)).toContain("could not be finalized")
 		})
 	})
 

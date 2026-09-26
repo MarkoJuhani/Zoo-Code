@@ -226,7 +226,7 @@ describe("OpenAiCodexHandler native tool calls", () => {
 		expect(textChunks.map((c) => c.text).join("")).toContain("done-event text only")
 	})
 
-	it("yields tool_call when Codex emits function_call only in response.output_item.done", async () => {
+	it("yields a replaceable partial when Codex emits function_call only in response.output_item.done", async () => {
 		vi.spyOn(openAiCodexOAuthManager, "getAccessToken").mockResolvedValue("test-token")
 		vi.spyOn(openAiCodexOAuthManager, "getAccountId").mockResolvedValue("acct_test")
 		;(handler as any).client = {
@@ -264,10 +264,11 @@ describe("OpenAiCodexHandler native tool calls", () => {
 
 		const chunks = await collectStream(stream)
 
-		const toolCalls = chunks.filter((c) => c.type === "tool_call")
+		const toolCalls = chunks.filter((c) => c.type === "tool_call_partial")
 		expect(toolCalls.length).toBeGreaterThan(0)
 		expect(toolCalls[0]).toMatchObject({
-			type: "tool_call",
+			type: "tool_call_partial",
+			replaceArguments: true,
 			id: "call_done_only",
 			name: "attempt_completion",
 		})
@@ -525,5 +526,146 @@ describe("OpenAiCodexHandler native tool calls", () => {
 				}),
 			}),
 		)
+	})
+})
+
+// Exercise the provider/parser contract used by Task, without executing any tools.
+describe("Codex authoritative tool arguments", () => {
+	const added = (id = "a", output_index = 2) => ({
+		type: "response.output_item.added",
+		output_index,
+		item: { type: "function_call", id: `fc_${id}`, call_id: id, name: "read_file", arguments: "" },
+	})
+	const delta = (value: string, id = "a") => ({
+		type: "response.function_call_arguments.delta",
+		item_id: `fc_${id}`,
+		delta: value,
+	})
+	const done = (value: unknown, id = "a") => ({
+		type: "response.function_call_arguments.done",
+		item_id: `fc_${id}`,
+		arguments: value,
+	})
+	const itemDone = (value: unknown, id = "a", output_index = 2) => ({
+		...added(id, output_index),
+		type: "response.output_item.done",
+		item: { ...added(id, output_index).item, arguments: value },
+	})
+	async function consume(events: object[]) {
+		const handler = new OpenAiCodexHandler({})
+		const scope = NativeToolCallParser.createScope()
+		const starts: string[] = []
+		const chunks: ApiStreamChunk[] = []
+		for (const input of events) {
+			for await (const chunk of handler["processEvent"](input, handler.getModel())) {
+				chunks.push(chunk)
+				expect(chunk.type).toBe("tool_call_partial")
+				if (chunk.type !== "tool_call_partial") continue
+				for (const event of NativeToolCallParser.processRawChunk(chunk, scope)) {
+					if (event.type === "tool_call_start") {
+						starts.push(event.id)
+						NativeToolCallParser.startStreamingToolCall(event.id, event.name, scope)
+					} else if (event.type === "tool_call_delta") {
+						const partial = NativeToolCallParser.processStreamingChunk(event.id, event.delta, scope)
+						if (partial) expect(partial.partial).toBe(true)
+					}
+				}
+			}
+		}
+		const ends = NativeToolCallParser.finalizeRawChunks(scope)
+		const results = ends.map((event) => NativeToolCallParser.finalizeStreamingToolCall(event.id, scope))
+		expect(NativeToolCallParser.finalizeRawChunks(scope)).toEqual([])
+		for (const event of ends) expect(NativeToolCallParser.finalizeStreamingToolCall(event.id, scope)).toBeNull()
+		return { starts, ends, results, chunks }
+	}
+	it.each(["arguments", "item", "both"])("repairs incomplete deltas using %s completion", async (kind) => {
+		const events: object[] = [added(), delta('{"path":"old')]
+		if (kind !== "item") events.push(done('{"path":"fixed"}'))
+		if (kind !== "arguments") events.push(itemDone('{"path":"fixed"}'))
+		const result = await consume(events)
+		expect(result.starts).toEqual(["a"])
+		expect(result.ends).toHaveLength(1)
+		expect(result.results).toEqual([expect.objectContaining({ nativeArgs: { path: "fixed" }, partial: false })])
+	})
+	it("keeps valid streaming and both done events exactly once, ignoring late deltas", async () => {
+		const result = await consume([
+			added(),
+			delta('{"path":"ok"}'),
+			done('{"path":"ok"}'),
+			itemDone('{"path":"ok"}'),
+			delta("garbage"),
+			itemDone('{"path":"ok"}'),
+		])
+		expect(result.starts).toEqual(["a"])
+		expect(result.results).toHaveLength(1)
+		expect(result.results[0]).toMatchObject({ nativeArgs: { path: "ok" } })
+	})
+	it.each(["arguments", "item"])("supports %s done-only fallback", async (kind) => {
+		const event =
+			kind === "item"
+				? itemDone({ path: "ok" })
+				: {
+						type: "response.tool_call_arguments.done",
+						call_id: "a",
+						name: "read_file",
+						arguments: '{"path":"ok"}',
+					}
+		const result = await consume([event, event])
+		expect(result.starts).toEqual(["a"])
+		expect(result.results).toEqual([expect.objectContaining({ nativeArgs: { path: "ok" } })])
+	})
+	it.each(['{"path":"broken', "", "null", "[]", "42", undefined])(
+		"rejects malformed completed payload %j",
+		async (value) => {
+			const result = await consume([added(), delta('{"path":"previous-valid"}'), done(value)])
+			expect(result.results).toEqual([null])
+		},
+	)
+	it("allows a later authoritative item to repair malformed argument-done", async () => {
+		const result = await consume([added(), done("{"), itemDone('{"path":"fixed"}')])
+		expect(result.results[0]).toMatchObject({ nativeArgs: { path: "fixed" } })
+	})
+	it("preserves truncation rejection when no completion arrives", async () => {
+		const result = await consume([added(), delta('{"path":"cut')])
+		expect(result.results).toEqual([null])
+	})
+	it("routes interleaved item IDs and output indexes independently", async () => {
+		const result = await consume([
+			added("a", 7),
+			added("b", 3),
+			delta('{"path":"a', "a"),
+			delta('{"path":"b', "b"),
+			done('{"path":"A"}', "a"),
+			{ type: "response.tool_call_arguments.done", output_index: 3, arguments: '{"path":"B"}' },
+			itemDone('{"path":"A"}', "a", 7),
+			itemDone('{"path":"B"}', "b", 3),
+		])
+		expect(result.starts).toEqual(["a", "b"])
+		expect(result.results).toEqual([
+			expect.objectContaining({ nativeArgs: { path: "A" } }),
+			expect.objectContaining({ nativeArgs: { path: "B" } }),
+		])
+	})
+	it("normalizes item aliases and supports explicit IDs without output indexes", async () => {
+		const result = await consume([
+			added(),
+			{ type: "response.function_call_arguments.delta", id: "fc_a", delta: '{"path":"old' },
+			{ type: "response.function_call_arguments.done", call_id: "a", arguments: '{"path":"fixed"}' },
+			{ type: "response.tool_call_arguments.done", call_id: "b", name: "read_file", arguments: '{"path":"B"}' },
+		])
+		expect(result.starts).toEqual(["a", "b"])
+		expect(result.results).toEqual([
+			expect.objectContaining({ nativeArgs: { path: "fixed" } }),
+			expect.objectContaining({ nativeArgs: { path: "B" } }),
+		])
+	})
+	it("does not assign unknown or ambiguous events to the last call", async () => {
+		const result = await consume([
+			added(),
+			added("b", 3),
+			{ type: "response.function_call_arguments.done", arguments: '{"path":"wrong"}' },
+			done('{"path":"wrong"}', "unknown"),
+		])
+		expect(result.starts).toEqual([])
 	})
 })

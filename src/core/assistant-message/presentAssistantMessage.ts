@@ -127,7 +127,23 @@ export async function presentAssistantMessage(cline: Task) {
 		return
 	}
 
-	switch (block.type) {
+	// Finalization failure takes precedence over every tool dispatch path, including
+	// custom tools that legitimately accept absent/empty arguments in legacy calls.
+	const finalizationFailed = (block.type === "tool_use" || block.type === "mcp_tool_use") && block.finalizationFailed
+	switch (finalizationFailed ? "finalization_failed" : block.type) {
+		case "finalization_failed": {
+			if (block.partial) break
+			const errorMessage = `Invalid tool call for '${block.name}': arguments could not be finalized.`
+			cline.consecutiveMistakeCount++
+			cline.recordToolError("invalid_tool_call", errorMessage)
+			cline.pushToolResultToUserContent({
+				type: "tool_result",
+				tool_use_id: sanitizeToolUseId(block.id),
+				content: formatResponse.toolError(errorMessage),
+				is_error: true,
+			})
+			break
+		}
 		case "mcp_tool_use": {
 			// Handle native MCP tool calls (from mcp_serverName_toolName dynamic tools)
 			// These are converted to the same execution path as use_mcp_tool but preserve

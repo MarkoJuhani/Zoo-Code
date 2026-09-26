@@ -64,6 +64,8 @@ export class NativeToolCallParser {
 		Map<number, { id: string; name: string; hasStarted: boolean; deltaBuffer: string[] }>
 	>()
 
+	private static invalidCompletedCalls = new WeakMap<object, Set<string>>()
+
 	public static createScope(): object {
 		return {}
 	}
@@ -115,6 +117,7 @@ export class NativeToolCallParser {
 			id?: string
 			name?: string
 			arguments?: string
+			replaceArguments?: boolean
 		},
 		scope: object,
 	): ToolCallStreamEvent[] {
@@ -137,6 +140,29 @@ export class NativeToolCallParser {
 
 		if (!tracked) {
 			return events
+		}
+
+		// Completed payloads are authoritative, including empty/malformed payloads.
+		// Keep the same start/end lifecycle and strict stream-end validation.
+		if (chunk.replaceArguments) {
+			let invalid = this.invalidCompletedCalls.get(scope)
+			if (!invalid) {
+				invalid = new Set()
+				this.invalidCompletedCalls.set(scope, invalid)
+			}
+			try {
+				const completed: unknown = JSON.parse(args ?? "")
+				if (!completed || typeof completed !== "object" || Array.isArray(completed)) {
+					invalid.add(tracked.id)
+				} else {
+					invalid.delete(tracked.id)
+				}
+			} catch {
+				invalid.add(tracked.id)
+			}
+			tracked.deltaBuffer = []
+			const streaming = this.streamingToolCallsByScope.get(scope)?.get(tracked.id)
+			if (streaming) streaming.argumentsAccumulator = ""
 		}
 
 		// Update name if present in chunk and not yet set
@@ -230,6 +256,7 @@ export class NativeToolCallParser {
 	 * from interrupted streams.
 	 */
 	public static clearAllStreamingToolCalls(scope: object): void {
+		this.invalidCompletedCalls.delete(scope)
 		this.streamingToolCallsByScope.delete(scope)
 	}
 
@@ -297,6 +324,12 @@ export class NativeToolCallParser {
 		}
 		const toolCall = streamingToolCalls.get(id)
 		if (!toolCall) {
+			return null
+		}
+
+		// Never execute malformed authoritative payloads or log their argument values.
+		if (this.invalidCompletedCalls.get(scope)?.delete(id)) {
+			streamingToolCalls.delete(id)
 			return null
 		}
 
