@@ -151,6 +151,7 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 		const result = await reopenPromise
 		expect(result).toEqual({
 			kind: "committed",
+			phase: "committed",
 			resumeState: "queued",
 			correlationId: "parent-async:child-async:direct",
 		})

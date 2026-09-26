@@ -62,6 +62,7 @@ describe("attemptCompletionTool", () => {
 		mockTask = {
 			consecutiveMistakeCount: 0,
 			recordToolError: vi.fn(),
+			stopDelegatedCompletion: vi.fn().mockResolvedValue(undefined),
 			todoList: undefined,
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked", text: "", images: [] }),
@@ -492,13 +493,17 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) => {
+					getTaskMetadata: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
+							return Promise.resolve({
+								kind: "found",
+								item: { id, status: "active", parentTaskId: "parent-1" },
+							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "active", awaitingChildId: "child-1" },
+								kind: "found",
+								item: { id, status: "active", awaitingChildId: "child-1" },
 							})
 						}
 						throw new Error(`unexpected task id ${id}`)
@@ -570,9 +575,10 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) =>
+					getTaskMetadata: vi.fn().mockImplementation((id: string) =>
 						Promise.resolve({
-							historyItem:
+							kind: "found",
+							item:
 								id === "child-1"
 									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
@@ -598,7 +604,8 @@ describe("attemptCompletionTool", () => {
 					toolCallId: "call-attempt-completion",
 				})
 
-				expect(mockHandleError).toHaveBeenCalledWith("persisting task completion", persistenceError)
+				expect(mockHandleError).not.toHaveBeenCalled()
+				expect(mockPushToolResult).toHaveBeenCalledWith(expect.stringContaining("preapproval_durability"))
 				expect(mockAskFinishSubTaskApproval).not.toHaveBeenCalled()
 				expect(mockProvider.reopenParentFromDelegation).not.toHaveBeenCalled()
 				expect(mockTask.emit).not.toHaveBeenCalledWith(
@@ -619,9 +626,10 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) =>
+					getTaskMetadata: vi.fn().mockImplementation((id: string) =>
 						Promise.resolve({
-							historyItem:
+							kind: "found",
+							item:
 								id === "child-1"
 									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
@@ -668,9 +676,10 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) =>
+					getTaskMetadata: vi.fn().mockImplementation((id: string) =>
 						Promise.resolve({
-							historyItem:
+							kind: "found",
+							item:
 								id === "child-1"
 									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "active", awaitingChildId: "child-1" },
@@ -720,13 +729,17 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) => {
+					getTaskMetadata: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
+							return Promise.resolve({
+								kind: "found",
+								item: { id, status: "active", parentTaskId: "parent-1" },
+							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "delegated", awaitingChildId: "child-1" },
+								kind: "found",
+								item: { id, status: "delegated", awaitingChildId: "child-1" },
 							})
 						}
 						throw new Error(`unexpected task id ${id}`)
@@ -734,9 +747,11 @@ describe("attemptCompletionTool", () => {
 					setPendingTaskAction: vi.fn().mockResolvedValue(undefined),
 					clearPendingTaskAction: vi.fn().mockResolvedValue(true),
 					markDelegatedChildProtocolBlocked: vi.fn().mockResolvedValue(true),
-					reopenParentFromDelegation: vi
-						.fn()
-						.mockResolvedValue({ kind: "recoverable_failure", reason: "history_write_failed" }),
+					reopenParentFromDelegation: vi.fn().mockResolvedValue({
+						kind: "recoverable_failure",
+						phase: "precommit",
+						reason: "history_write_failed",
+					}),
 				}
 
 				Object.assign(mockTask, {
@@ -771,13 +786,10 @@ describe("attemptCompletionTool", () => {
 				})
 				expect(mockTask.ask).not.toHaveBeenCalledWith("completion_result", "", false)
 				expect(mockPushToolResult).toHaveBeenCalledWith(
-					"Error: Delegated completion handoff failed: history_write_failed",
+					expect.stringContaining('"reason":"history_write_failed"'),
 				)
 				expect(mockPushToolResult).not.toHaveBeenCalledWith("")
-				// Flush once per validated attempt_completion call, before delegation is
-				// attempted, independent of whether delegation succeeds.
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledTimes(1)
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledWith("attempt_completion")
+				expect(mockTask.flushTelemetryInstallment).not.toHaveBeenCalled()
 			})
 
 			it("does not resume the parent when the parent is no longer awaiting this child", async () => {
@@ -790,13 +802,17 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) => {
+					getTaskMetadata: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: undefined } })
+							return Promise.resolve({
+								kind: "found",
+								item: { id, status: "active", parentTaskId: undefined },
+							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "active", awaitingChildId: undefined },
+								kind: "found",
+								item: { id, status: "active", awaitingChildId: undefined },
 							})
 						}
 						throw new Error(`unexpected task id ${id}`)
@@ -824,8 +840,7 @@ describe("attemptCompletionTool", () => {
 				expect(mockAskFinishSubTaskApproval).not.toHaveBeenCalled()
 				expect(mockProvider.reopenParentFromDelegation).not.toHaveBeenCalled()
 				expect(mockTask.ask).toHaveBeenCalledWith("completion_result", "", false)
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledTimes(1)
-				expect(mockTask.flushTelemetryInstallment).toHaveBeenCalledWith("attempt_completion")
+				expect(mockTask.flushTelemetryInstallment).not.toHaveBeenCalled()
 			})
 
 			it("delegates an interrupted subtask completion when the parent is still delegated and awaiting that child", async () => {
@@ -838,15 +853,17 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) => {
+					getTaskMetadata: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "interrupted", parentTaskId: "parent-1" },
+								kind: "found",
+								item: { id, status: "interrupted", parentTaskId: "parent-1" },
 							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "delegated", awaitingChildId: "child-1" },
+								kind: "found",
+								item: { id, status: "delegated", awaitingChildId: "child-1" },
 							})
 						}
 						throw new Error(`unexpected task id ${id}`)
@@ -893,13 +910,17 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) => {
+					getTaskMetadata: vi.fn().mockImplementation((id: string) => {
 						if (id === "child-1") {
-							return Promise.resolve({ historyItem: { id, status: "active", parentTaskId: "parent-1" } })
+							return Promise.resolve({
+								kind: "found",
+								item: { id, status: "active", parentTaskId: "parent-1" },
+							})
 						}
 						if (id === "parent-1") {
 							return Promise.resolve({
-								historyItem: { id, status: "active", awaitingChildId: "different-child" },
+								kind: "found",
+								item: { id, status: "active", awaitingChildId: "different-child" },
 							})
 						}
 						throw new Error(`unexpected task id ${id}`)
@@ -927,9 +948,7 @@ describe("attemptCompletionTool", () => {
 				expect(mockAskFinishSubTaskApproval).not.toHaveBeenCalled()
 				expect(mockProvider.reopenParentFromDelegation).not.toHaveBeenCalled()
 				expect(mockTask.ask).not.toHaveBeenCalledWith("completion_result", "", false)
-				expect(mockPushToolResult).toHaveBeenCalledWith(
-					"Error: Delegated completion handoff failed: history_lookup_failed",
-				)
+				expect(mockPushToolResult).toHaveBeenCalledWith(expect.stringContaining('"reason":"ownership_moved"'))
 				expect(mockTask.flushTelemetryInstallment).not.toHaveBeenCalled()
 			})
 
@@ -1162,9 +1181,10 @@ describe("attemptCompletionTool", () => {
 				}
 				const mockProvider = {
 					log: vi.fn(),
-					getTaskWithId: vi.fn().mockImplementation((id: string) =>
+					getTaskMetadata: vi.fn().mockImplementation((id: string) =>
 						Promise.resolve({
-							historyItem:
+							kind: "found",
+							item:
 								id === "child-1"
 									? { id, status: "active", parentTaskId: "parent-1" }
 									: { id, status: "delegated", awaitingChildId: "child-1" },
@@ -1174,7 +1194,7 @@ describe("attemptCompletionTool", () => {
 					clearPendingTaskAction: vi.fn(),
 					reopenParentFromDelegation: vi
 						.fn()
-						.mockResolvedValue({ kind: "detached", reason: "ownership_moved" }),
+						.mockResolvedValue({ kind: "detached", phase: "precommit", reason: "ownership_moved" }),
 				}
 				Object.assign(mockTask, {
 					taskId: "child-1",
@@ -1208,6 +1228,7 @@ describe("attemptCompletionTool telemetry invariants", () => {
 		return {
 			consecutiveMistakeCount: 0,
 			recordToolError: vi.fn(),
+			stopDelegatedCompletion: vi.fn().mockResolvedValue(undefined),
 			todoList: undefined,
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked", text: "", images: [] }),
@@ -1233,8 +1254,8 @@ describe("attemptCompletionTool telemetry invariants", () => {
 		}
 		const mockProvider = {
 			log: vi.fn(),
-			getTaskWithId: vi.fn().mockImplementation((id: string) => {
-				if (id === "child-1") return Promise.resolve({ historyItem: { id, status: "completed" } })
+			getTaskMetadata: vi.fn().mockImplementation((id: string) => {
+				if (id === "child-1") return Promise.resolve({ kind: "found", item: { id, status: "completed" } })
 				throw new Error(`unexpected task id ${id}`)
 			}),
 			reopenParentFromDelegation: vi.fn(),
@@ -1269,8 +1290,8 @@ describe("attemptCompletionTool telemetry invariants", () => {
 		}
 		const mockProvider = {
 			log: vi.fn(),
-			getTaskWithId: vi.fn().mockImplementation((id: string) => {
-				if (id === "child-1") return Promise.resolve({ historyItem: { id, status: "completed" } })
+			getTaskMetadata: vi.fn().mockImplementation((id: string) => {
+				if (id === "child-1") return Promise.resolve({ kind: "found", item: { id, status: "completed" } })
 				throw new Error(`unexpected task id ${id}`)
 			}),
 			reopenParentFromDelegation: vi.fn(),
@@ -1359,5 +1380,300 @@ describe("attemptCompletionTool telemetry invariants", () => {
 			expect.anything(),
 			expect.anything(),
 		)
+	})
+})
+
+describe("delegated completion stage boundaries", () => {
+	const saved = {
+		kind: "finish_subtask" as const,
+		actionId: "original-action",
+		approvalText: "original approval",
+		parentTaskId: "parent",
+		result: "original result",
+	}
+	function setup() {
+		const child = {
+			id: "child",
+			status: "active",
+			parentTaskId: "parent",
+			pendingAction: undefined as typeof saved | undefined,
+		}
+		const parent = { id: "parent", status: "delegated", awaitingChildId: "child", delegatedToId: "child" }
+		const provider = {
+			log: vi.fn(),
+			getTaskMetadata: vi.fn(
+				async (
+					id: string,
+				): Promise<
+					| { kind: "found"; item: Partial<typeof child & typeof parent> }
+					| { kind: "missing" | "read_error"; error?: Error }
+				> => ({
+					kind: "found",
+					item: id === "child" ? child : parent,
+				}),
+			),
+			setPendingTaskAction: vi.fn().mockResolvedValue(undefined),
+			clearPendingTaskAction: vi.fn(),
+			markDelegatedChildProtocolBlocked: vi.fn().mockResolvedValue(true),
+			reopenParentFromDelegation: vi.fn().mockResolvedValue({
+				kind: "committed",
+				phase: "committed",
+				resumeState: "queued",
+				correlationId: "pair",
+			}),
+			emitDelegatedTaskCompleted: vi.fn(),
+		}
+		const task = {
+			taskId: "child",
+			parentTaskId: "parent",
+			providerRef: { deref: () => provider },
+			consecutiveMistakeCount: 0,
+			recordToolError: vi.fn(),
+			say: vi.fn().mockResolvedValue(undefined),
+			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
+			setPendingTaskAction: vi.fn(),
+			waitForCurrentAssistantMessagePersistence: vi.fn().mockResolvedValue(true),
+			flushTelemetryInstallment: vi.fn(),
+			emitFinalTokenUsageUpdate: vi.fn(),
+			getTokenUsage: vi.fn().mockReturnValue({}),
+			toolUsage: {},
+			isDelegatedCompletionStopped: false,
+			stopDelegatedCompletion: vi.fn(async (_message: string) => {
+				task.isDelegatedCompletionStopped = true
+			}),
+		}
+		const callbacks = {
+			askApproval: vi.fn(),
+			handleError: vi.fn(),
+			pushToolResult: vi.fn(),
+			askFinishSubTaskApproval: vi.fn().mockResolvedValue(true),
+			toolDescription: vi.fn(),
+			toolCallId: "new-action",
+		}
+		const run = () => attemptCompletionTool.execute({ result: "new result" }, task as unknown as Task, callbacks)
+		return { child, parent, provider, task, callbacks, run }
+	}
+
+	it.each([
+		["completion_display", "completion_display_failed"],
+		["child_metadata_read", "metadata_read_failed"],
+		["parent_metadata_read", "metadata_read_failed"],
+		["pending_action_write", "pending_action_write_failed"],
+		["approval", "approval_failed"],
+		["preapproval_durability", "durability_failed"],
+		["postapproval_durability", "durability_failed"],
+		["provider_handoff", "unexpected_provider_rejection"],
+	])("stops once with safe diagnostics for rejected %s", async (stage, reason) => {
+		const { provider, task, callbacks, run } = setup()
+		const error = Object.assign(new Error("SECRET raw message"), { code: "ENOSPC" })
+		if (stage === "completion_display") task.say.mockRejectedValueOnce(error)
+		if (stage === "child_metadata_read") provider.getTaskMetadata.mockRejectedValueOnce(error)
+		if (stage === "parent_metadata_read")
+			provider.getTaskMetadata
+				.mockResolvedValueOnce({ kind: "found", item: { status: "active", parentTaskId: "parent" } })
+				.mockRejectedValueOnce(error)
+		if (stage === "pending_action_write") provider.setPendingTaskAction.mockRejectedValue(error)
+		if (stage === "approval") callbacks.askFinishSubTaskApproval.mockRejectedValue(error)
+		if (stage === "preapproval_durability")
+			task.waitForCurrentAssistantMessagePersistence.mockRejectedValueOnce(error)
+		if (stage === "postapproval_durability")
+			task.waitForCurrentAssistantMessagePersistence.mockResolvedValueOnce(true).mockRejectedValueOnce(error)
+		if (stage === "provider_handoff") provider.reopenParentFromDelegation.mockRejectedValue(error)
+		await run()
+		expect(callbacks.handleError).not.toHaveBeenCalled()
+		expect(task.isDelegatedCompletionStopped).toBe(true)
+		expect(callbacks.pushToolResult).toHaveBeenCalledTimes(1)
+		const message = callbacks.pushToolResult.mock.calls[0][0]
+		for (const field of [
+			`"stage":"${stage}"`,
+			`"reason":"${reason}"`,
+			'"phase":"precommit"',
+			'"parentTaskId":"parent"',
+			'"childTaskId":"child"',
+			'"name":"Error"',
+			'"code":"ENOSPC"',
+		])
+			expect(message).toContain(field)
+		expect(message).not.toContain("SECRET")
+		expect(message).toContain("reopen the child")
+		expect(provider.clearPendingTaskAction).not.toHaveBeenCalled()
+		expect(provider.emitDelegatedTaskCompleted).not.toHaveBeenCalled()
+		await run()
+		expect(callbacks.pushToolResult).toHaveBeenCalledTimes(1)
+	})
+
+	it.each(["child", "parent"])("distinguishes missing and tagged read errors for %s", async (id) => {
+		for (const kind of ["missing", "read_error"] as const) {
+			const { provider, callbacks, run } = setup()
+			const original = provider.getTaskMetadata.getMockImplementation()!
+			provider.getTaskMetadata.mockImplementation(async (key) =>
+				key === id ? { kind, error: new TypeError("SECRET") } : original(key),
+			)
+			await run()
+			expect(callbacks.pushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining(`"stage":"${id}_metadata_read"`),
+			)
+			expect(callbacks.pushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining(
+					`"reason":"${kind === "missing" ? `${id}_metadata_missing` : "metadata_read_failed"}"`,
+				),
+			)
+		}
+	})
+
+	it.each(["awaitingChildId", "delegatedToId", "status"])(
+		"classifies %s mismatch as ownership/state, not history lookup",
+		async (field) => {
+			const { parent, provider, callbacks, run } = setup()
+			parent[field as keyof typeof parent] = "other"
+			await run()
+			expect(callbacks.pushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining(
+					`"reason":"${field === "status" ? "parent_state_mismatch" : "ownership_moved"}"`,
+				),
+			)
+			expect(provider.reopenParentFromDelegation).not.toHaveBeenCalled()
+		},
+	)
+
+	it("does not read a detached child's former parent", async () => {
+		const { child, provider, run } = setup()
+		child.parentTaskId = "other"
+		await run()
+		expect(provider.getTaskMetadata).toHaveBeenCalledTimes(1)
+		expect(provider.reopenParentFromDelegation).not.toHaveBeenCalled()
+	})
+
+	it("retains a saved finish action when ownership already moved", async () => {
+		const { child, provider, task, callbacks, run } = setup()
+		child.parentTaskId = "other"
+		child.pendingAction = { ...saved }
+		await run()
+		expect(provider.getTaskMetadata).toHaveBeenCalledTimes(1)
+		expect(provider.clearPendingTaskAction).not.toHaveBeenCalled()
+		expect(task.ask).not.toHaveBeenCalled()
+		expect(task.isDelegatedCompletionStopped).toBe(true)
+		expect(callbacks.pushToolResult).toHaveBeenCalledWith(expect.stringContaining('"actionId":"original-action"'))
+	})
+
+	it("classifies unexpected child status without parent lookup", async () => {
+		const { child, provider, callbacks, run } = setup()
+		child.status = "delegated"
+		await run()
+		expect(provider.getTaskMetadata).toHaveBeenCalledTimes(1)
+		expect(callbacks.pushToolResult).toHaveBeenCalledWith(
+			expect.stringContaining('"reason":"unexpected_child_status"'),
+		)
+	})
+
+	it("preserves saved action on approval rejection", async () => {
+		const { child, provider, callbacks, run } = setup()
+		child.pendingAction = { ...saved }
+		callbacks.askFinishSubTaskApproval.mockRejectedValue(new Error("SECRET"))
+		await run()
+		expect(child.pendingAction).toEqual(saved)
+		expect(provider.setPendingTaskAction).not.toHaveBeenCalled()
+		expect(provider.clearPendingTaskAction).not.toHaveBeenCalled()
+		expect(provider.reopenParentFromDelegation).not.toHaveBeenCalled()
+	})
+
+	it.each(["telemetry", "final_token_usage", "child_completion_event", "tool_result"])(
+		"cannot undo commit when %s and logger throw",
+		async (stage) => {
+			const { provider, task, callbacks, run } = setup()
+			const fail = () => {
+				throw Object.assign(new Error("SECRET"), { name: "SECRET name", code: "SECRET code" })
+			}
+			provider.log.mockImplementation(fail)
+			if (stage === "telemetry") task.flushTelemetryInstallment.mockImplementation(fail)
+			if (stage === "final_token_usage") task.emitFinalTokenUsageUpdate.mockImplementation(fail)
+			if (stage === "child_completion_event") provider.emitDelegatedTaskCompleted.mockImplementation(fail)
+			if (stage === "tool_result") callbacks.pushToolResult.mockImplementation(fail)
+			await expect(run()).resolves.toBeUndefined()
+			expect(callbacks.handleError).not.toHaveBeenCalled()
+			expect(task.recordToolError).not.toHaveBeenCalled()
+			expect(task.stopDelegatedCompletion).not.toHaveBeenCalled()
+			expect(provider.markDelegatedChildProtocolBlocked).not.toHaveBeenCalled()
+			expect(provider.reopenParentFromDelegation).toHaveBeenCalledTimes(1)
+			expect(provider.emitDelegatedTaskCompleted).toHaveBeenCalledTimes(1)
+			expect(callbacks.pushToolResult).toHaveBeenCalledExactlyOnceWith("")
+			expect(JSON.stringify(provider.log.mock.calls)).not.toContain("SECRET")
+		},
+	)
+
+	it.each([
+		{ name: "SECRET".repeat(1000), code: "SECRET/path/token" },
+		{
+			get name() {
+				throw new Error("SECRET accessor")
+			},
+			get code() {
+				throw new Error("SECRET accessor")
+			},
+		},
+		"SECRET primitive",
+		null,
+	])("omits unsafe exception properties even if blocking and logging reject", async (error) => {
+		const { provider, callbacks, run } = setup()
+		provider.getTaskMetadata.mockRejectedValue(error)
+		provider.markDelegatedChildProtocolBlocked.mockRejectedValue(error)
+		provider.log.mockImplementation(() => {
+			throw error
+		})
+		await run()
+		const message = callbacks.pushToolResult.mock.calls[0][0]
+		expect(message).not.toContain("SECRET")
+		expect(message).not.toContain('"name"')
+		expect(message).not.toContain('"code"')
+		expect(message.length).toBeLessThan(1000)
+		expect(callbacks.handleError).not.toHaveBeenCalled()
+	})
+
+	it.each(["committed", "recoverable_failure", "detached", "pending", "rejected"])(
+		"retains the original saved finish action through %s",
+		async (kind) => {
+			const { child, provider, task, callbacks, run } = setup()
+			child.pendingAction = { ...saved }
+			if (kind === "rejected") provider.reopenParentFromDelegation.mockRejectedValue(new Error("SECRET"))
+			else
+				provider.reopenParentFromDelegation.mockResolvedValue({
+					kind,
+					phase: kind === "committed" ? "committed" : "precommit",
+					reason: kind === "pending" ? "approval" : "ownership_moved",
+					resumeState: "queued",
+					correlationId: "pair",
+				})
+			await run()
+			expect(provider.setPendingTaskAction).not.toHaveBeenCalled()
+			expect(provider.clearPendingTaskAction).not.toHaveBeenCalled()
+			expect(child.pendingAction).toEqual(saved)
+			expect(provider.reopenParentFromDelegation).toHaveBeenCalledExactlyOnceWith({
+				parentTaskId: "parent",
+				childTaskId: "child",
+				completionResultSummary: saved.result,
+				pendingActionId: saved.actionId,
+			})
+			expect(task.ask).not.toHaveBeenCalled()
+			if (kind !== "committed") expect(task.isDelegatedCompletionStopped).toBe(true)
+			expect(callbacks.handleError).not.toHaveBeenCalled()
+		},
+	)
+
+	it.each([1, 2])("does not hand off when durability wait %i is cancelled", async (wait) => {
+		const { task, provider, callbacks, run } = setup()
+		if (wait === 2) task.waitForCurrentAssistantMessagePersistence.mockResolvedValueOnce(true)
+		task.waitForCurrentAssistantMessagePersistence.mockResolvedValueOnce(false)
+		await run()
+		expect(provider.reopenParentFromDelegation).not.toHaveBeenCalled()
+		expect(callbacks.handleError).not.toHaveBeenCalled()
+		expect(callbacks.pushToolResult).not.toHaveBeenCalled()
+	})
+
+	it("stops when provider access is unavailable", async () => {
+		const { task, callbacks, run } = setup()
+		Object.assign(task, { providerRef: { deref: () => undefined } })
+		await run()
+		expect(task.isDelegatedCompletionStopped).toBe(true)
+		expect(callbacks.pushToolResult).toHaveBeenCalledWith(expect.stringContaining('"stage":"provider_access"'))
 	})
 })

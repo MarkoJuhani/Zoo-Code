@@ -7,7 +7,11 @@ type ProviderStubFields = {
 	delegationTransitions?: Map<string, number>
 	cancelledDelegationChildIds?: Set<string>
 	log?: ReturnType<typeof vi.fn>
-	taskHistoryStore?: { get: (id: string) => unknown; invalidate?: (id: string) => Promise<void> }
+	taskHistoryStore?: {
+		get: (id: string) => unknown
+		invalidate?: (id: string) => Promise<void>
+		readAuthoritative?: (id: string) => Promise<unknown>
+	}
 	taskScheduler?: { schedule: (task: Task, run: () => Promise<void>) => Promise<void> }
 	taskRegistry?: TaskRegistry
 	clineStack?: Task[]
@@ -15,12 +19,14 @@ type ProviderStubFields = {
 	runDelegationTransition?: unknown
 	removeClineFromStack?: unknown
 	evictCurrentTask?: unknown
+	getTaskMetadata?: unknown
 }
 
 type PrivateProviderMethods = {
 	runDelegationTransition: (this: unknown, ...args: unknown[]) => unknown
 	removeClineFromStack: (this: unknown, ...args: unknown[]) => unknown
 	evictCurrentTask: (this: unknown, ...args: unknown[]) => unknown
+	getTaskMetadata: (this: unknown, ...args: unknown[]) => unknown
 }
 
 /**
@@ -42,6 +48,10 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	s.log ??= vi.fn()
 	s.taskHistoryStore ??= { get: () => undefined }
 	s.taskHistoryStore.invalidate ??= async () => {}
+	s.taskHistoryStore.readAuthoritative ??= vi.fn(async (id: string) => {
+		const item = s.taskHistoryStore!.get(id)
+		return item ? { kind: "found", item } : { kind: "missing" }
+	})
 	s.taskScheduler ??= { schedule: async (_task, run) => run() }
 
 	// Convert legacy clineStack array into a TaskRegistry
@@ -56,5 +66,6 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	s.runDelegationTransition ??= proto.runDelegationTransition.bind(s)
 	s.removeClineFromStack ??= proto.removeClineFromStack.bind(s)
 	s.evictCurrentTask ??= proto.evictCurrentTask.bind(s)
+	s.getTaskMetadata ??= proto.getTaskMetadata.bind(s)
 	return s as unknown as ClineProvider
 }

@@ -73,7 +73,9 @@ describe("Task pending action replay", () => {
 
 	it("falls back to a fresh completion ask when approved finish delegation is stale", async () => {
 		const provider = {
-			reopenParentFromDelegation: vi.fn().mockResolvedValue({ kind: "detached", reason: "ownership_moved" }),
+			reopenParentFromDelegation: vi
+				.fn()
+				.mockResolvedValue({ kind: "detached", phase: "precommit", reason: "ownership_moved" }),
 			clearPendingTaskAction: vi.fn().mockResolvedValue(true),
 		}
 		const task = createTask(provider)
@@ -94,7 +96,7 @@ describe("Task pending action replay", () => {
 		const provider = {
 			reopenParentFromDelegation: vi
 				.fn()
-				.mockResolvedValue({ kind: "recoverable_failure", reason: "history_write_failed" }),
+				.mockResolvedValue({ kind: "recoverable_failure", phase: "precommit", reason: "history_write_failed" }),
 			clearPendingTaskAction: vi.fn(),
 			markDelegatedChildProtocolBlocked: vi.fn().mockResolvedValue(true),
 		}
@@ -243,4 +245,19 @@ describe("Task pending action replay", () => {
 			"Provider unavailable",
 		)
 	})
+})
+
+describe("delegated completion loop stop", () => {
+	it.each([false, true])(
+		"stops the real request loop while retaining pending action (UI rejects: %s)",
+		async (rejectUI) => {
+			const task = createTask({})
+			if (rejectUI) task.say = vi.fn().mockRejectedValue(new Error("UI unavailable"))
+			await task.stopDelegatedCompletion("Repair storage, then reopen the child or restart from its parent.")
+			expect(task.isDelegatedCompletionStopped).toBe(true)
+			expect((task as unknown as { pendingAction: PendingTaskAction }).pendingAction).toEqual(finishAction)
+			await expect(task.recursivelyMakeClineRequests([])).resolves.toBe(true)
+			expect(task.say).toHaveBeenCalledExactlyOnceWith("error", expect.stringContaining("reopen"))
+		},
+	)
 })

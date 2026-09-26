@@ -1,6 +1,10 @@
 // npx vitest run __tests__/history-resume-delegation.spec.ts
 
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import { TaskHistoryStore } from "../core/task-persistence/TaskHistoryStore"
 import * as vscode from "vscode"
 import { providerIdentifiers, RooCodeEventName } from "@roo-code/types"
 import type { ClineMessage, HistoryItem } from "@roo-code/types"
@@ -82,8 +86,10 @@ function makeTaskHistoryStoreStub(
 			firstUpdater: (h: HistoryItem) => HistoryItem,
 			secondUpdater: (h: HistoryItem) => HistoryItem,
 		) => {
-			itemMap.set(firstId, firstUpdater(itemMap.get(firstId) as HistoryItem))
-			itemMap.set(secondId, secondUpdater(itemMap.get(secondId) as HistoryItem))
+			const first = firstUpdater(itemMap.get(firstId) as HistoryItem)
+			const second = secondUpdater(itemMap.get(secondId) as HistoryItem)
+			itemMap.set(firstId, first)
+			itemMap.set(secondId, second)
 			return []
 		},
 	)
@@ -99,6 +105,10 @@ function makeStatefulTaskHistoryStore(...items: HistoryItem[]) {
 	const itemMap = new Map(items.map((item) => [item.id, item]))
 
 	return {
+		upsert: vi.fn(async (item: HistoryItem) => {
+			itemMap.set(item.id, item)
+			return [...itemMap.values()]
+		}),
 		get: vi.fn((id: string) => itemMap.get(id)),
 		invalidate: vi.fn().mockResolvedValue(undefined),
 		atomicUpdatePair: vi.fn(
@@ -111,8 +121,10 @@ function makeStatefulTaskHistoryStore(...items: HistoryItem[]) {
 				const first = itemMap.get(firstId)
 				const second = itemMap.get(secondId)
 				if (!first || !second) throw new Error(`Missing history item for atomic pair: ${firstId}, ${secondId}`)
-				itemMap.set(firstId, firstUpdater(first))
-				itemMap.set(secondId, secondUpdater(second))
+				const updatedFirst = firstUpdater(first)
+				const updatedSecond = secondUpdater(second)
+				itemMap.set(firstId, updatedFirst)
+				itemMap.set(secondId, updatedSecond)
 				return [itemMap.get(firstId), itemMap.get(secondId)]
 			},
 		),
@@ -171,7 +183,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			pendingActionId: "stale-action",
 		})
 
-		expect(result).toEqual({ kind: "recoverable_failure", reason: "pending_action_mismatch" })
+		expect(result).toEqual({ kind: "recoverable_failure", phase: "precommit", reason: "pending_action_mismatch" })
 		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
 		expect(removeClineFromStack).not.toHaveBeenCalled()
 	})
@@ -238,7 +250,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				completionResultSummary: "Done",
 				pendingActionId: "finish-action",
 			}),
-		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
+		).resolves.toEqual({ kind: "detached", phase: "precommit", reason: "ownership_moved" })
 
 		expect(atomicUpdatePair).toHaveBeenCalledTimes(1)
 		expect(createTaskWithHistoryItem).not.toHaveBeenCalled()
@@ -346,7 +358,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 
 		// Verify child closed and parent reopened with updated metadata
 		expect(removeClineFromStack).toHaveBeenCalledTimes(1)
-		expect(removeClineFromStack).toHaveBeenCalledWith()
+		expect(removeClineFromStack).toHaveBeenCalledWith("delegation_disposal")
 		expect(createTaskWithHistoryItem).toHaveBeenCalledWith(
 			expect.objectContaining({
 				status: "active",
@@ -544,7 +556,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			completionResultSummary: "Child done",
 		})
 
-		expect(result).toEqual({ kind: "recoverable_failure", reason: "history_read_failed" })
+		expect(result).toEqual({ kind: "recoverable_failure", phase: "precommit", reason: "history_read_failed" })
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("history unavailable"))
 		expect(readApiMessages).not.toHaveBeenCalled()
 		expect(saveTaskMessages).not.toHaveBeenCalled()
@@ -585,7 +597,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			completionResultSummary: "Child done",
 		})
 
-		expect(result).toEqual({ kind: "recoverable_failure", reason: "history_read_failed" })
+		expect(result).toEqual({ kind: "recoverable_failure", phase: "precommit", reason: "history_read_failed" })
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("api history unavailable"))
 		expect(saveTaskMessages).not.toHaveBeenCalled()
 		expect(saveApiMessages).not.toHaveBeenCalled()
@@ -1160,7 +1172,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			}),
 			{ startTask: false },
 		)
-		await vi.waitFor(() => expect(taskHistoryStore.invalidate).toHaveBeenCalledWith("parent-rpd02"))
+		await vi.waitFor(() => expect(provider.taskHistoryStore.readAuthoritative).toHaveBeenCalledWith("parent-rpd02"))
 		expect(parentInstance.resumeAfterDelegation).not.toHaveBeenCalled()
 	})
 
@@ -1234,6 +1246,9 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		const childC2 = {
 			taskId: "child-c2",
+			taskNumber: 2,
+			getTaskMode: vi.fn().mockResolvedValue("code"),
+			getTaskApiConfigName: vi.fn().mockResolvedValue("test"),
 			run: vi.fn(async () => {
 				expect(taskHistoryStore.get(parentItem.id)).toMatchObject({
 					status: "delegated",
@@ -1256,6 +1271,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			getCurrentTask: vi.fn(() => currentTaskB),
 			removeClineFromStack: removeParentB,
 			createTask: createChildC2,
+			updateTaskHistory: vi.fn((item: HistoryItem) => taskHistoryStore.upsert(item)),
 			taskScheduler: {
 				schedule: vi.fn((_task, run) => (childRun = run())),
 			},
@@ -1448,12 +1464,15 @@ describe("History resume delegation - parent metadata transitions", () => {
 				completionResultSummary: "C1 done",
 			})
 			const completedParent = taskHistoryStore.get(parentInstance.taskId)
+			const completedChild = taskHistoryStore.get("child-c1")
 			if (cancelled) cancelledDelegationChildIds.add("child-c1")
 			if (currentMismatch) currentTask = { taskId: "other-parent-instance" }
 			taskHistoryStore.get.mockImplementation((id: string) =>
 				id === parentInstance.taskId && !missingPersisted
 					? ({ ...completedParent, ...persisted } as HistoryItem)
-					: undefined,
+					: id === "child-c1"
+						? completedChild
+						: undefined,
 			)
 
 			await runScheduledContinuation()
@@ -1508,7 +1527,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-rpd04",
 				completionResultSummary: "Child completion with persistence failure",
 			}),
-		).resolves.toEqual({ kind: "recoverable_failure", reason: "lifecycle_commit_failed" })
+		).resolves.toEqual({ kind: "recoverable_failure", phase: "precommit", reason: "lifecycle_commit_failed" })
 
 		expect(createTaskWithHistoryItem).not.toHaveBeenCalled()
 	})
@@ -1557,10 +1576,10 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-rpd05",
 				completionResultSummary: "Child completion",
 			}),
-		).resolves.toEqual({ kind: "recoverable_failure", reason: "lifecycle_commit_failed" })
+		).resolves.toEqual({ kind: "recoverable_failure", phase: "precommit", reason: "lifecycle_commit_failed" })
 
-		// Child is closed before the atomic write (new ordering) — child closed, parent not reopened
-		expect(removeClineFromStack).toHaveBeenCalledTimes(1)
+		// Failed pair commit preserves the open child and its pending action.
+		expect(removeClineFromStack).not.toHaveBeenCalled()
 		expect(createTaskWithHistoryItem).not.toHaveBeenCalled()
 	})
 
@@ -1641,7 +1660,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 				getCurrentTask: vi.fn(() => null),
 				removeClineFromStack: vi.fn(),
 				createTaskWithHistoryItem: vi.fn(),
-				taskHistoryStore: { atomicUpdatePair, get: vi.fn() },
+				taskHistoryStore: makeTaskHistoryStoreStub(
+					{ id: "child-guard", status: "active", parentTaskId: "parent-guard" },
+					historyItem,
+					{ atomicUpdatePair },
+				),
 			} as any)
 
 		const providerActive = makeProvider({
@@ -1655,7 +1678,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
+		).resolves.toEqual({ kind: "detached", phase: "precommit", reason: "ownership_moved" })
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
 		expect(atomicUpdatePair).not.toHaveBeenCalled()
@@ -1681,7 +1704,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 			getCurrentTask: vi.fn(() => null),
 			removeClineFromStack: vi.fn(),
 			createTaskWithHistoryItem: vi.fn(),
-			taskHistoryStore: { atomicUpdatePair, get: vi.fn() },
+			taskHistoryStore: makeTaskHistoryStoreStub(
+				{ id: "child-guard", status: "active", parentTaskId: "parent-guard" },
+				{ id: "parent-guard", status: "delegated", awaitingChildId: "child-guard" },
+				{ atomicUpdatePair },
+			),
 			cancelledDelegationChildIds: new Set(["child-guard"]),
 		} as any)
 
@@ -1691,7 +1718,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toEqual({ kind: "detached", reason: "cancelled" })
+		).resolves.toEqual({ kind: "detached", phase: "precommit", reason: "cancelled" })
 
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
@@ -1714,7 +1741,11 @@ describe("History resume delegation - parent metadata transitions", () => {
 				getCurrentTask: vi.fn(() => null),
 				removeClineFromStack: vi.fn(),
 				createTaskWithHistoryItem: vi.fn(),
-				taskHistoryStore: { atomicUpdatePair, get: vi.fn() },
+				taskHistoryStore: makeTaskHistoryStoreStub(
+					{ id: "child-guard", status: "active", parentTaskId: "parent-guard" },
+					historyItem,
+					{ atomicUpdatePair },
+				),
 			} as any)
 
 		const providerWrongChild = makeProvider({
@@ -1728,7 +1759,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 				childTaskId: "child-guard",
 				completionResultSummary: "should be ignored",
 			}),
-		).resolves.toEqual({ kind: "detached", reason: "ownership_moved" })
+		).resolves.toEqual({ kind: "detached", phase: "precommit", reason: "ownership_moved" })
 		expect(saveTaskMessagesMock).not.toHaveBeenCalled()
 		expect(saveApiMessagesMock).not.toHaveBeenCalled()
 		expect(atomicUpdatePair).not.toHaveBeenCalled()
@@ -1783,13 +1814,13 @@ describe("History resume delegation - parent metadata transitions", () => {
 			completedByChildId: "c-webview",
 		}
 		const itemMap = new Map<string, any>([
-			["c-webview", updatedChild],
-			["p-webview", updatedParent],
+			["c-webview", childItem],
+			["p-webview", parentItem],
 		])
 		const taskHistoryStore = {
 			atomicUpdatePair: vi.fn(async (_fId: string, _sId: string, fU: (h: any) => any, sU: (h: any) => any) => {
-				fU(childItem)
-				sU(parentItem)
+				itemMap.set("c-webview", fU(childItem))
+				itemMap.set("p-webview", sU(parentItem))
 				return []
 			}),
 			get: vi.fn((id: string) => itemMap.get(id)),
@@ -1917,7 +1948,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 					return []
 				},
 			)
-			const taskHistoryStore = { atomicUpdatePair, get: vi.fn() }
+			const taskHistoryStore = makeTaskHistoryStoreStub(childItem, parentItem, { atomicUpdatePair })
 
 			const provider = makeProviderStub({
 				contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
@@ -2014,6 +2045,13 @@ describe("History resume delegation - parent metadata transitions", () => {
 				return { historyItem: item }
 			})
 			const taskHistoryStore = {
+				atomicReadAndUpdate: vi.fn(
+					async (id: string, updater: (item: typeof childItem) => typeof childItem) => {
+						const item = id === childItem.id ? childItem : parentItem
+						Object.assign(item, updater(item))
+						return [item]
+					},
+				),
 				atomicUpdatePair: vi.fn(
 					async (
 						firstId: string,
@@ -2098,5 +2136,333 @@ describe("History resume delegation - parent metadata transitions", () => {
 			expect(eventNames).toContain(RooCodeEventName.TaskDelegationCompleted)
 			expect(eventNames).toContain(RooCodeEventName.TaskDelegationResumed)
 		})
+	})
+})
+
+describe("Provider authoritative completion lifecycle regressions", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.mocked(readTaskMessages).mockResolvedValue([])
+		vi.mocked(readApiMessages).mockResolvedValue([])
+		vi.mocked(saveTaskMessages).mockImplementation(async ({ messages }) => messages)
+		vi.mocked(saveApiMessages).mockImplementation(async ({ messages }) => messages)
+	})
+
+	function fixture() {
+		const parent = {
+			id: "lifecycle-parent",
+			ts: 1,
+			task: "Parent",
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+			status: "delegated",
+			awaitingChildId: "lifecycle-child",
+			delegatedToId: "lifecycle-child",
+		} as HistoryItem
+		const action = {
+			kind: "finish_subtask" as const,
+			actionId: "saved-finish",
+			parentTaskId: parent.id,
+			approvalText: "Finish",
+			result: "Original approved result",
+		}
+		const child = {
+			...parent,
+			id: "lifecycle-child",
+			task: "Child",
+			status: "interrupted",
+			parentTaskId: parent.id,
+			awaitingChildId: undefined,
+			delegatedToId: undefined,
+			pendingAction: action,
+		} as HistoryItem
+		const store = makeStatefulTaskHistoryStore(parent, child)
+		const currentChild = { taskId: child.id, dispose: vi.fn().mockResolvedValue(undefined) }
+		let current: { taskId: string } | undefined = currentChild
+		const parentInstance = {
+			taskId: parent.id,
+			overwriteClineMessages: vi.fn(),
+			overwriteApiConversationHistory: vi.fn(),
+			prepareAfterDelegation: vi.fn(),
+			runResumeLoop: vi.fn(),
+		}
+		let continuation: (() => Promise<void>) | undefined
+		const provider = makeProviderStub({
+			taskHistoryStore: store,
+			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
+			getCurrentTask: vi.fn(() => current),
+			removeClineFromStack: vi.fn(async () => {
+				current = undefined
+			}),
+			createTaskWithHistoryItem: vi.fn(async () => {
+				current = parentInstance
+				return parentInstance
+			}),
+			getTaskWithId: vi.fn(() => {
+				throw new Error("Transcript lookup forbidden")
+			}),
+			emit: vi.fn(),
+			log: vi.fn(),
+			isViewLaunched: true,
+			postMessageToWebview: vi.fn(),
+			taskScheduler: {
+				schedule: vi.fn((_task, run) => {
+					continuation = run
+					return new Promise<void>(() => {})
+				}),
+			},
+		})
+		const complete = () =>
+			ClineProvider.prototype.reopenParentFromDelegation.call(provider, {
+				parentTaskId: parent.id,
+				childTaskId: child.id,
+				pendingActionId: action.actionId,
+				completionResultSummary: "Replacement must not overwrite saved result",
+			})
+		return { parent, child, action, store, provider, complete, parentInstance, run: () => continuation!() }
+	}
+
+	it.each(["child", "parent"])(
+		"does not resurrect missing %s metadata from stale cache/global history",
+		async (missing) => {
+			const f = fixture()
+			vi.mocked(f.provider.taskHistoryStore.readAuthoritative).mockImplementation(async (id) =>
+				id === (missing === "child" ? f.child.id : f.parent.id)
+					? { kind: "missing" }
+					: { kind: "found", item: f.store.get(id)! },
+			)
+			expect(await f.complete()).toEqual({
+				kind: "recoverable_failure",
+				phase: "precommit",
+				reason: `${missing}_metadata_missing`,
+			})
+			expect(f.store.get(f.child.id)).toBeDefined()
+			expect(f.store.atomicUpdatePair).not.toHaveBeenCalled()
+			expect(readTaskMessages).not.toHaveBeenCalled()
+			expect(f.provider.getTaskWithId).not.toHaveBeenCalled()
+		},
+	)
+
+	it.each(["cancelled", "detached", "sibling"])("rejects %s ownership before transcript writes", async (change) => {
+		const f = fixture()
+		if (change === "cancelled") f.provider["cancelledDelegationChildIds"].add(f.child.id)
+		if (change === "detached") await f.store.upsert({ ...f.child, parentTaskId: undefined })
+		if (change === "sibling")
+			await f.store.upsert({ ...f.parent, awaitingChildId: "sibling", delegatedToId: "sibling" })
+		expect(await f.complete()).toMatchObject({
+			kind: "detached",
+			phase: "precommit",
+			reason: change === "cancelled" ? "cancelled" : "ownership_moved",
+		})
+		expect(saveTaskMessages).not.toHaveBeenCalled()
+		expect(f.store.get(f.child.id)?.pendingAction).toEqual(f.action)
+	})
+
+	it.each([false, true])(
+		"treats completed replay as historical before consumed action mismatch (new sibling=%s)",
+		async (sibling) => {
+			const f = fixture()
+			expect(await f.complete()).toMatchObject({ kind: "committed", phase: "committed" })
+			if (sibling)
+				await f.store.upsert({
+					...f.store.get(f.parent.id)!,
+					status: "delegated",
+					awaitingChildId: "sibling",
+					delegatedToId: "sibling",
+				})
+			vi.clearAllMocks()
+			expect(await f.complete()).toEqual({ kind: "detached", phase: "precommit", reason: "historical_replay" })
+			expect(saveTaskMessages).not.toHaveBeenCalled()
+			expect(f.provider.createTaskWithHistoryItem).not.toHaveBeenCalled()
+			expect(f.store.atomicUpdatePair).not.toHaveBeenCalled()
+		},
+	)
+
+	it("preserves the original pending finish result until the pair commits", async () => {
+		const f = fixture()
+		vi.mocked(saveApiMessages).mockImplementationOnce(async ({ messages }) => {
+			expect(f.store.get(f.child.id)?.pendingAction).toEqual(f.action)
+			return messages
+		})
+		f.store.atomicUpdatePair.mockRejectedValueOnce(new Error("disk unavailable"))
+		expect(await f.complete()).toMatchObject({ kind: "recoverable_failure", reason: "lifecycle_commit_failed" })
+		expect(f.store.get(f.child.id)?.pendingAction).toEqual(f.action)
+		expect(f.provider.removeClineFromStack).not.toHaveBeenCalled()
+		expect(await f.complete()).toMatchObject({ kind: "committed" })
+		expect(f.store.get(f.child.id)?.pendingAction).toBeUndefined()
+		expect(f.store.get(f.parent.id)?.completionResultSummary).toBe(f.action.result)
+		expect(saveTaskMessages).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				messages: expect.arrayContaining([expect.objectContaining({ text: f.action.result })]),
+			}),
+		)
+	})
+
+	it.each(["child owner", "parent owner", "parent state", "child state", "pending action", "cancelled"])(
+		"revalidates %s inside atomic callbacks without partially committing",
+		async (change) => {
+			const f = fixture()
+			const actual = f.store.atomicUpdatePair.getMockImplementation()!
+			f.store.atomicUpdatePair.mockImplementationOnce(async (...args) => {
+				if (change === "child owner") await f.store.upsert({ ...f.child, parentTaskId: "replacement" })
+				if (change === "parent owner") await f.store.upsert({ ...f.parent, awaitingChildId: "sibling" })
+				if (change === "parent state") await f.store.upsert({ ...f.parent, status: "completed" })
+				if (change === "child state") await f.store.upsert({ ...f.child, status: "delegated" })
+				if (change === "pending action")
+					await f.store.upsert({ ...f.child, pendingAction: { ...f.action, actionId: "replacement" } })
+				if (change === "cancelled") f.provider["cancelledDelegationChildIds"].add(f.child.id)
+				return actual(...args)
+			})
+			const result = await f.complete()
+			expect(result).toMatchObject({
+				phase: "precommit",
+				reason: change.includes("owner")
+					? "ownership_moved"
+					: change === "parent state"
+						? "parent_state_mismatch"
+						: change === "child state"
+							? "unexpected_child_status"
+							: change === "pending action"
+								? "pending_action_mismatch"
+								: "cancelled",
+			})
+			expect(f.store.get(f.child.id)?.status).not.toBe("completed")
+			expect(f.provider.createTaskWithHistoryItem).not.toHaveBeenCalled()
+		},
+	)
+
+	it.each(["close", "dispose", "webview", "event", "recreate", "prepare", "diagnostics", "scheduler"])(
+		"never rejects or redelivers after postcommit %s failure",
+		async (failure) => {
+			const f = fixture()
+			const fail = () => {
+				throw new Error(failure)
+			}
+			if (failure === "close") vi.mocked(f.provider.removeClineFromStack).mockImplementation(fail)
+			if (failure === "dispose") vi.mocked(f.provider.getCurrentTask()!.dispose).mockImplementation(fail)
+			if (failure === "webview") vi.mocked(f.provider.postMessageToWebview).mockRejectedValue(new Error(failure))
+			if (failure === "event") vi.mocked(f.provider.emit).mockImplementation(fail)
+			if (failure === "recreate") vi.mocked(f.provider.createTaskWithHistoryItem).mockImplementation(fail)
+			if (failure === "prepare") f.parentInstance.prepareAfterDelegation.mockImplementation(fail)
+			if (failure === "diagnostics") vi.mocked(f.provider.log).mockImplementation(fail)
+			if (failure === "scheduler") vi.mocked(f.provider["taskScheduler"].schedule).mockImplementation(fail)
+			expect(await f.complete()).toMatchObject({ kind: "committed", phase: "committed" })
+			expect(f.store.get(f.child.id)).toMatchObject({ status: "completed", pendingAction: undefined })
+			expect(f.store.get(f.parent.id)).toMatchObject({ status: "active", completedByChildId: f.child.id })
+			const writes = vi.mocked(saveTaskMessages).mock.calls.length
+			expect(await f.complete()).toMatchObject({ kind: "detached", reason: "historical_replay" })
+			expect(saveTaskMessages).toHaveBeenCalledTimes(writes)
+		},
+	)
+
+	it.each(["deleted child", "detached child", "deleted parent"])(
+		"does not run queued continuation after %s",
+		async (change) => {
+			const f = fixture()
+			expect(await f.complete()).toMatchObject({ kind: "committed", resumeState: "queued" })
+			vi.mocked(f.provider.taskHistoryStore.readAuthoritative).mockImplementation(async (id) => {
+				if (id === (change === "deleted parent" ? f.parent.id : f.child.id))
+					return change === "detached child"
+						? { kind: "found", item: { ...f.store.get(id)!, parentTaskId: undefined } }
+						: { kind: "missing" }
+				const item = f.store.get(id)
+				return item ? { kind: "found", item } : { kind: "missing" }
+			})
+			await f.run()
+			expect(f.parentInstance.runResumeLoop).not.toHaveBeenCalled()
+		},
+	)
+
+	it("consumes the authoritative finish action on a direct provider completion", async () => {
+		const f = fixture()
+		expect(
+			await ClineProvider.prototype.reopenParentFromDelegation.call(f.provider, {
+				parentTaskId: f.parent.id,
+				childTaskId: f.child.id,
+				completionResultSummary: "Replacement",
+			}),
+		).toMatchObject({ kind: "committed" })
+		expect(f.store.get(f.child.id)?.pendingAction).toBeUndefined()
+		expect(f.store.get(f.parent.id)?.completionResultSummary).toBe(f.action.result)
+	})
+
+	it.each(["child owner", "parent owner", "child completed", "cancelled"])(
+		"protocol block revalidates %s inside the pair",
+		async (change) => {
+			const f = fixture()
+			const actual = f.store.atomicUpdatePair.getMockImplementation()!
+			f.store.atomicUpdatePair.mockImplementationOnce(async (...args) => {
+				if (change === "child owner") await f.store.upsert({ ...f.child, parentTaskId: undefined })
+				if (change === "parent owner") await f.store.upsert({ ...f.parent, awaitingChildId: "sibling" })
+				if (change === "child completed") await f.store.upsert({ ...f.child, status: "completed" })
+				if (change === "cancelled") f.provider["cancelledDelegationChildIds"].add(f.child.id)
+				return actual(...args)
+			})
+			await expect(
+				ClineProvider.prototype.markDelegatedChildProtocolBlocked.call(f.provider, {
+					parentTaskId: f.parent.id,
+					childTaskId: f.child.id,
+				}),
+			).rejects.toThrow("ownership/state changed")
+			expect(f.store.get(f.child.id)?.status).not.toBe("blocked_protocol_error")
+			expect(f.store.get(f.parent.id)?.status).not.toBe("blocked_protocol_error")
+		},
+	)
+
+	it("uses real temporary metadata across restart and refuses deleted cached records", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "provider-lifecycle-"))
+		const f = fixture()
+		const realUi = await vi.importActual<typeof import("../core/task-persistence/taskMessages")>(
+			"../core/task-persistence/taskMessages",
+		)
+		const realApi = await vi.importActual<typeof import("../core/task-persistence/apiMessages")>(
+			"../core/task-persistence/apiMessages",
+		)
+		vi.mocked(readTaskMessages).mockImplementation(realUi.readTaskMessages)
+		vi.mocked(saveTaskMessages).mockImplementation(realUi.saveTaskMessages)
+		vi.mocked(readApiMessages).mockImplementation(realApi.readApiMessages)
+		vi.mocked(saveApiMessages).mockImplementation(realApi.saveApiMessages)
+		Object.defineProperty(f.provider, "contextProxy", { value: { globalStorageUri: { fsPath: directory } } })
+		const location = { taskId: f.parent.id, globalStoragePath: directory }
+		let store = new TaskHistoryStore(directory)
+		try {
+			await realUi.saveTaskMessages({ ...location, messages: [] })
+			await realApi.saveApiMessages({ ...location, messages: [] })
+			await store.initialize()
+			await store.upsert({ ...f.parent, status: "active", awaitingChildId: undefined, delegatedToId: undefined })
+			await store.upsert({ ...f.child, status: "active" })
+			await store.upsert(f.parent)
+			Object.defineProperty(f.provider, "taskHistoryStore", { value: store, configurable: true })
+			expect(await f.complete()).toMatchObject({ kind: "committed", phase: "committed" })
+			await f.run()
+			expect(f.parentInstance.runResumeLoop).toHaveBeenCalledOnce()
+			const uiBeforeRestart = await realUi.readTaskMessages(location)
+			const apiBeforeRestart = await realApi.readApiMessages(location)
+			expect(uiBeforeRestart.filter((message) => message.say === "subtask_result")).toHaveLength(1)
+			expect(JSON.stringify(apiBeforeRestart)).toContain(f.action.result)
+			store.dispose()
+			store = new TaskHistoryStore(directory)
+			await store.initialize()
+			Object.defineProperty(f.provider, "taskHistoryStore", { value: store, configurable: true })
+			expect(await f.complete()).toMatchObject({ kind: "detached", reason: "historical_replay" })
+			expect(await realUi.readTaskMessages(location)).toEqual(uiBeforeRestart)
+			expect(await realApi.readApiMessages(location)).toEqual(apiBeforeRestart)
+			expect(f.parentInstance.runResumeLoop).toHaveBeenCalledOnce()
+			expect(store.get(f.child.id)?.pendingAction).toBeUndefined()
+			expect(await store.readAuthoritative(f.child.id)).toMatchObject({
+				kind: "found",
+				item: { status: "completed" },
+			})
+			await fs.rm(path.join(directory, "tasks", f.child.id), { recursive: true, force: true })
+			expect(await f.complete()).toEqual({
+				kind: "recoverable_failure",
+				phase: "precommit",
+				reason: "child_metadata_missing",
+			})
+		} finally {
+			store.dispose()
+			await fs.rm(directory, { recursive: true, force: true })
+		}
 	})
 })

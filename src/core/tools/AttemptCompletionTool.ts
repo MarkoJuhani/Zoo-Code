@@ -3,7 +3,14 @@ import * as vscode from "vscode"
 import { RooCodeEventName, type HistoryItem, type PendingTaskAction } from "@roo-code/types"
 
 import { Task } from "../task/Task"
-import { type DelegationHandoffOutcome, normalizeDelegationHandoffOutcome } from "../task/childCompletionProtocol"
+import {
+	type DelegationHandoffFailureReason,
+	type DelegationFailureStage,
+	type DelegationFailureDiagnostic,
+	DELEGATED_COMPLETION_RECOVERY,
+	type DelegationHandoffOutcome,
+	normalizeDelegationHandoffOutcome,
+} from "../task/childCompletionProtocol"
 import { formatResponse } from "../prompts/responses"
 import { Package } from "../../shared/package"
 import type { ToolUse } from "../../shared/tools"
@@ -27,7 +34,9 @@ export interface AttemptCompletionCallbacks extends ToolCallbacks {
  */
 interface DelegationProvider {
 	log(message: string): void
-	getTaskWithId(id: string): Promise<{ historyItem: HistoryItem }>
+	getTaskMetadata(
+		id: string,
+	): Promise<{ kind: "found"; item: HistoryItem } | { kind: "missing" } | { kind: "read_error"; error: unknown }>
 	setPendingTaskAction(taskId: string, pendingAction: PendingTaskAction): Promise<void>
 	clearPendingTaskAction(taskId: string, actionId: string): Promise<boolean>
 	markDelegatedChildProtocolBlocked?(params: { parentTaskId: string; childTaskId: string }): Promise<boolean>
@@ -48,6 +57,7 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 	readonly name = "attempt_completion" as const
 
 	async execute(params: AttemptCompletionParams, task: Task, callbacks: AttemptCompletionCallbacks): Promise<void> {
+		if (task.isDelegatedCompletionStopped) return
 		const { result } = params
 		const { handleError, pushToolResult, askFinishSubTaskApproval, toolCallId } = callbacks
 
@@ -89,7 +99,20 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 
 			task.consecutiveMistakeCount = 0
 
-			await task.say("completion_result", result, undefined, false)
+			try {
+				await task.say("completion_result", result, undefined, false)
+			} catch (error) {
+				if (!task.parentTaskId) throw error
+				await this.pushDelegationFailure(
+					task,
+					undefined,
+					pushToolResult,
+					"completion_display_failed",
+					"completion_display",
+					error,
+				)
+				return
+			}
 
 			// Whether this attempt_completion call is a stale replay of an already-completed
 			// subtask (user revisiting it from history) rather than a live model-initiated
@@ -98,135 +121,190 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			// -- doesn't produce a duplicate "attempt_completion" installment for work that
 			// was already reported when the subtask first completed.
 			let isStaleHistoryReplay = false
-			// Whether the delegation branch below already flushed telemetry (it needs to
-			// flush before delegateToParent, which may return early) -- prevents the shared
-			// fallthrough flush from double-reporting when delegation falls through to
-			// "continue" instead of returning.
-			let hasFlushedTelemetry = false
 
-			// Check for subtask using parentTaskId (metadata-driven delegation)
+			// Check for subtask using authoritative metadata-only delegation reads.
 			if (task.parentTaskId) {
-				// Check if this subtask has already completed and returned to parent
-				// to prevent duplicate tool_results when user revisits from history
 				const provider = task.providerRef.deref() as DelegationProvider | undefined
-				if (provider) {
-					let historyLookupTaskId = task.taskId
-					try {
-						const { historyItem } = await provider.getTaskWithId(task.taskId)
-						const status = historyItem?.status
+				if (!provider) {
+					await this.pushDelegationFailure(
+						task,
+						undefined,
+						pushToolResult,
+						"provider_unavailable",
+						"provider_access",
+					)
+					return
+				}
 
-						if (status === "completed") {
-							// Subtask already completed - skip delegation flow entirely
-							// Fall through to normal completion ask flow below (outside this if block)
-							// This shows the user the completion result and waits for acceptance
-							// without injecting another tool_result to the parent
-							isStaleHistoryReplay = true
-						} else if (
-							status === "active" ||
-							status === "interrupted" ||
-							status === "blocked_protocol_error"
+				const childRead = await this.readMetadata(provider, task.taskId)
+				if (childRead.kind !== "found") {
+					await this.blockDelegatedCompletion(
+						task,
+						provider,
+						pushToolResult,
+						childRead.kind === "missing" ? "child_metadata_missing" : "metadata_read_failed",
+						"child_metadata_read",
+						childRead.kind === "read_error" ? childRead.error : undefined,
+					)
+					return
+				}
+				const historyItem = childRead.item
+				const status = historyItem.status
+
+				if (status === "completed") {
+					isStaleHistoryReplay = true
+				} else if (historyItem.parentTaskId !== task.parentTaskId) {
+					// A detached child does not require a parent lookup or consume a saved action.
+					if (historyItem.pendingAction) {
+						await this.pushDelegationFailure(
+							task,
+							provider,
+							pushToolResult,
+							"ownership_moved",
+							"ownership_validation",
+							undefined,
+							historyItem.pendingAction.actionId,
+						)
+						return
+					}
+					isStaleHistoryReplay = true
+				} else if (status === "active" || status === "interrupted" || status === "blocked_protocol_error") {
+					const parentRead = await this.readMetadata(provider, task.parentTaskId)
+					if (parentRead.kind !== "found") {
+						await this.blockDelegatedCompletion(
+							task,
+							provider,
+							pushToolResult,
+							parentRead.kind === "missing" ? "parent_metadata_missing" : "metadata_read_failed",
+							"parent_metadata_read",
+							parentRead.kind === "read_error" ? parentRead.error : undefined,
+						)
+						return
+					}
+					const parentHistory = parentRead.item
+					const parentOwns =
+						parentHistory.awaitingChildId === task.taskId &&
+						(parentHistory.delegatedToId === undefined || parentHistory.delegatedToId === task.taskId)
+					const parentStateValid =
+						parentHistory.status === "delegated" ||
+						parentHistory.status === "active" ||
+						parentHistory.status === "blocked_protocol_error"
+
+					if (!parentOwns || !parentStateValid) {
+						await this.blockDelegatedCompletion(
+							task,
+							provider,
+							pushToolResult,
+							parentOwns ? "parent_state_mismatch" : "ownership_moved",
+							"ownership_validation",
+						)
+						return
+					} else {
+						const savedAction = historyItem.pendingAction
+						if (
+							savedAction &&
+							(savedAction.kind !== "finish_subtask" || savedAction.parentTaskId !== task.parentTaskId)
 						) {
-							historyLookupTaskId = task.parentTaskId
-							const { historyItem: parentHistory } = await provider.getTaskWithId(task.parentTaskId)
-
-							if (
-								(parentHistory?.status === "delegated" ||
-									parentHistory?.status === "active" ||
-									parentHistory?.status === "blocked_protocol_error") &&
-								parentHistory?.awaitingChildId === task.taskId &&
-								historyItem.parentTaskId === task.parentTaskId
-							) {
-								const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
-								if (pendingActionId) {
-									const pendingAction: PendingTaskAction = {
-										kind: "finish_subtask",
-										actionId: pendingActionId,
-										approvalText: JSON.stringify({ tool: "finishTask" }),
-										parentTaskId: task.parentTaskId,
-										result,
-									}
-									await provider.setPendingTaskAction(task.taskId, pendingAction)
-									task.setPendingTaskAction(pendingAction)
-								}
-								// Known not to be a stale history replay (status was "active", not
-								// "completed"), so flush telemetry before the delegation call, which
-								// may return early below. hasFlushedTelemetry prevents the shared
-								// fallthrough flush further down from double-reporting if delegation
-								// falls through to "continue" instead of returning.
-								task.flushTelemetryInstallment("attempt_completion")
-								hasFlushedTelemetry = true
-
-								try {
-									const persistenceReady = await task.waitForCurrentAssistantMessagePersistence()
-									if (!persistenceReady) return
-								} catch (error) {
-									await handleError("persisting task completion", error as Error)
-									return
-								}
-
-								const delegation = await this.delegateToParent(
-									task,
-									result,
-									provider,
-									pendingActionId,
-									askFinishSubTaskApproval,
-									pushToolResult,
-								)
-								if (delegation === "delegated") {
-									task.emitFinalTokenUsageUpdate()
-									provider.emitDelegatedTaskCompleted(
-										task.taskId,
-										task.getTokenUsage(),
-										task.toolUsage,
-									)
-								}
-								if (delegation !== "continue") return
-							} else if (historyItem.parentTaskId !== task.parentTaskId) {
-								// Parent already detached, such as when the user cancelled this child.
-								// Fall through to the normal completion ask flow.
-								const msg =
-									`[AttemptCompletionTool] Skipping delegation for child ${task.taskId}: ` +
-									`parent ${task.parentTaskId} is not awaiting this child. ` +
-									`Diagnostic: { childStatus: "${status}", parentStatus: "${parentHistory?.status}", awaitingChildId: "${parentHistory?.awaitingChildId}" }`
-								provider.log(msg)
-								console.warn(msg)
-							} else {
-								await this.blockDelegatedCompletion(
-									task,
-									provider,
-									pushToolResult,
-									"history_lookup_failed",
-								)
-								return
-							}
-						} else {
-							// Unexpected status (undefined or "delegated") - log error and skip delegation
-							// undefined indicates a bug in status persistence during child creation
-							// "delegated" would mean this child has its own grandchild pending (shouldn't reach attempt_completion)
-							provider.log(
-								`[AttemptCompletionTool] Unexpected child task status "${status}" for task ${task.taskId}. ` +
-									`Expected "active", "interrupted", "blocked_protocol_error", or "completed". Skipping delegation to prevent data corruption.`,
-							)
 							await this.blockDelegatedCompletion(
 								task,
 								provider,
 								pushToolResult,
-								"unexpected_child_status",
+								"pending_action_mismatch",
+								"pending_action_write",
+								undefined,
+								savedAction.actionId,
 							)
 							return
 						}
-					} catch (err) {
-						// If we can't get the history, log error and skip delegation
-						provider.log(
-							`[AttemptCompletionTool] Failed to get history for task ${historyLookupTaskId}: ${(err as Error)?.message ?? String(err)}. ` +
-								`Skipping delegation.`,
+						const pendingActionId =
+							savedAction?.actionId ?? (toolCallId ? sanitizeToolUseId(toolCallId) : undefined)
+						const completionResult = savedAction?.kind === "finish_subtask" ? savedAction.result : result
+						if (pendingActionId && !savedAction) {
+							const pendingAction: PendingTaskAction = {
+								kind: "finish_subtask",
+								actionId: pendingActionId,
+								approvalText: JSON.stringify({ tool: "finishTask" }),
+								parentTaskId: task.parentTaskId,
+								result,
+							}
+							try {
+								await provider.setPendingTaskAction(task.taskId, pendingAction)
+								task.setPendingTaskAction(pendingAction)
+							} catch (error) {
+								await this.pushDelegationFailure(
+									task,
+									provider,
+									pushToolResult,
+									"pending_action_write_failed",
+									"pending_action_write",
+									error,
+									pendingActionId,
+								)
+								return
+							}
+						}
+
+						// Telemetry is best-effort only after the pair commit.
+						try {
+							if (!(await task.waitForCurrentAssistantMessagePersistence())) return
+						} catch (error) {
+							await this.pushDelegationFailure(
+								task,
+								provider,
+								pushToolResult,
+								"durability_failed",
+								"preapproval_durability",
+								error,
+								pendingActionId,
+							)
+							return
+						}
+
+						const delegation = await this.delegateToParent(
+							task,
+							completionResult,
+							provider,
+							pendingActionId,
+							askFinishSubTaskApproval,
+							pushToolResult,
 						)
-						await this.blockDelegatedCompletion(task, provider, pushToolResult, "history_lookup_failed")
-						return
+						if (delegation === "delegated") {
+							this.postcommit(
+								provider,
+								task,
+								"telemetry",
+								() => task.flushTelemetryInstallment("attempt_completion"),
+								pendingActionId,
+							)
+							this.postcommit(
+								provider,
+								task,
+								"final_token_usage",
+								() => task.emitFinalTokenUsageUpdate(),
+								pendingActionId,
+							)
+							this.postcommit(
+								provider,
+								task,
+								"child_completion_event",
+								() =>
+									provider.emitDelegatedTaskCompleted(
+										task.taskId,
+										task.getTokenUsage(),
+										task.toolUsage,
+									),
+								pendingActionId,
+							)
+						}
+						if (delegation !== "continue") return
 					}
 				} else {
-					pushToolResult(
-						formatResponse.toolError("Delegated completion handoff failed: provider_unavailable"),
+					await this.blockDelegatedCompletion(
+						task,
+						provider,
+						pushToolResult,
+						"unexpected_child_status",
+						"child_status_validation",
 					)
 					return
 				}
@@ -240,9 +318,8 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			// only fires once the task is genuinely finished. Skipped for a stale history
 			// replay (revisiting an already-completed subtask) since that reruns this handler
 			// on a fresh Task instance and would otherwise double-report work already flushed
-			// when the subtask first completed, and skipped if the delegation branch above
-			// already flushed.
-			if (!isStaleHistoryReplay && !hasFlushedTelemetry) {
+			// when the subtask first completed. Committed delegation returns above.
+			if (!isStaleHistoryReplay) {
 				task.emitFinalTokenUsageUpdate()
 				task.flushTelemetryInstallment("attempt_completion")
 			}
@@ -280,33 +357,127 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		}
 	}
 
+	private async readMetadata(
+		provider: DelegationProvider,
+		id: string,
+	): ReturnType<DelegationProvider["getTaskMetadata"]> {
+		try {
+			return await provider.getTaskMetadata(id)
+		} catch (error) {
+			return { kind: "read_error", error }
+		}
+	}
+
+	private normalizeError(error: unknown): { name?: string; code?: string } {
+		// Never stringify arbitrary exceptions or trust accessor properties.
+		const diagnostic: { name?: string; code?: string } = {}
+		try {
+			const value = error as { name?: unknown; code?: unknown }
+			const name = value?.name
+			if (
+				typeof name === "string" &&
+				["Error", "TypeError", "RangeError", "SyntaxError", "AbortError", "TimeoutError"].includes(name)
+			)
+				diagnostic.name = name
+		} catch {}
+		try {
+			const code = (error as { code?: unknown })?.code
+			if (
+				typeof code === "string" &&
+				["ENOENT", "EACCES", "EPERM", "EIO", "ENOSPC", "ETIMEDOUT", "ECONNRESET", "ABORT_ERR"].includes(code)
+			)
+				diagnostic.code = code
+		} catch {}
+		return diagnostic
+	}
+
+	private safeLog(provider: DelegationProvider | undefined, message: string): void {
+		try {
+			provider?.log(message)
+		} catch {
+			/* Diagnostic sinks cannot change lifecycle outcomes. */
+		}
+	}
+
+	private async pushDelegationFailure(
+		task: Task,
+		provider: DelegationProvider | undefined,
+		pushToolResult: (result: string) => void,
+		reason: DelegationHandoffFailureReason,
+		stage: DelegationFailureStage,
+		error?: unknown,
+		actionId?: string,
+	): Promise<void> {
+		const diagnostic: DelegationFailureDiagnostic = {
+			phase: "precommit",
+			stage,
+			reason,
+			parentTaskId: task.parentTaskId!,
+			childTaskId: task.taskId,
+			...(actionId && { actionId }),
+			...this.normalizeError(error),
+		}
+		const message = `Delegated completion handoff failed: ${JSON.stringify(diagnostic)}. ${DELEGATED_COMPLETION_RECOVERY}`
+		// Set the loop gate before any fallible sink, including persistence of the UI message.
+		await task.stopDelegatedCompletion(message)
+		this.safeLog(provider, `[AttemptCompletionTool] ${message}`)
+		task.recordToolError("attempt_completion")
+		pushToolResult(formatResponse.toolError(message))
+	}
+
+	private postcommit(
+		provider: DelegationProvider,
+		task: Task,
+		stage: string,
+		notify: () => void,
+		actionId?: string,
+	): void {
+		try {
+			notify()
+		} catch (error) {
+			this.safeLog(
+				provider,
+				`[AttemptCompletionTool] Postcommit diagnostic ${JSON.stringify({
+					phase: "committed",
+					stage,
+					parentTaskId: task.parentTaskId,
+					childTaskId: task.taskId,
+					...(actionId && { actionId }),
+					...this.normalizeError(error),
+				})}`,
+			)
+		}
+	}
+
 	private async blockDelegatedCompletion(
 		task: Task,
 		provider: DelegationProvider,
 		pushToolResult: (result: string) => void,
-		reason: "history_lookup_failed" | "unexpected_child_status",
+		reason: DelegationHandoffFailureReason,
+		stage: DelegationFailureStage,
+		error?: unknown,
+		actionId?: string,
 	): Promise<void> {
 		try {
 			await provider.markDelegatedChildProtocolBlocked?.({
 				parentTaskId: task.parentTaskId!,
 				childTaskId: task.taskId,
 			})
-		} catch (error) {
-			provider.log(
-				`[AttemptCompletionTool] Failed to persist blocked handoff for child ${task.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+		} catch (blockError) {
+			this.safeLog(
+				provider,
+				`[AttemptCompletionTool] Block persistence failed ${JSON.stringify({
+					phase: "precommit",
+					stage: "block_persistence",
+					parentTaskId: task.parentTaskId,
+					childTaskId: task.taskId,
+					...this.normalizeError(blockError),
+				})}`,
 			)
 		}
-		pushToolResult(formatResponse.toolError(`Delegated completion handoff failed: ${reason}`))
+		await this.pushDelegationFailure(task, provider, pushToolResult, reason, stage, error, actionId)
 	}
 
-	/**
-	 * Handles the common delegation flow when a subtask completes.
-	 * Returns:
-	 * - "delegated" when completion was approved and parent resumed
-	 * - "denied" when user denied finishing the subtask
-	 * - undefined when the persistence generation ended during approval
-	 * - "continue" when caller should fall through to normal completion ask flow
-	 */
 	private async delegateToParent(
 		task: Task,
 		result: string,
@@ -315,42 +486,100 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		askFinishSubTaskApproval: () => Promise<boolean>,
 		pushToolResult: (result: string) => void,
 	): Promise<"delegated" | "denied" | "continue" | "blocked" | undefined> {
-		const didApprove = await askFinishSubTaskApproval()
-
+		let didApprove: boolean
+		try {
+			didApprove = await askFinishSubTaskApproval()
+		} catch (error) {
+			await this.pushDelegationFailure(
+				task,
+				provider,
+				pushToolResult,
+				"approval_failed",
+				"approval",
+				error,
+				pendingActionId,
+			)
+			return "blocked"
+		}
 		if (!didApprove) {
 			pushToolResult(formatResponse.toolDenied())
 			return "denied"
 		}
-		if (!(await task.waitForCurrentAssistantMessagePersistence())) {
-			return
-		}
 
-		const outcome = normalizeDelegationHandoffOutcome(
-			await provider.reopenParentFromDelegation({
-				parentTaskId: task.parentTaskId!,
-				childTaskId: task.taskId,
-				completionResultSummary: result,
-				...(pendingActionId && { pendingActionId }),
-			}),
-		)
-
-		if (outcome.kind === "detached") {
-			if (pendingActionId) {
-				await provider.clearPendingTaskAction(task.taskId, pendingActionId)
-			}
-			return "continue"
-		}
-		if (outcome.kind === "pending") return
-		if (outcome.kind === "recoverable_failure") {
-			await provider.markDelegatedChildProtocolBlocked?.({
-				parentTaskId: task.parentTaskId!,
-				childTaskId: task.taskId,
-			})
-			pushToolResult(formatResponse.toolError(`Delegated completion handoff failed: ${outcome.reason}`))
+		try {
+			if (!(await task.waitForCurrentAssistantMessagePersistence())) return
+		} catch (error) {
+			await this.pushDelegationFailure(
+				task,
+				provider,
+				pushToolResult,
+				"durability_failed",
+				"postapproval_durability",
+				error,
+				pendingActionId,
+			)
 			return "blocked"
 		}
 
-		pushToolResult("")
+		let outcome: DelegationHandoffOutcome
+		try {
+			outcome = normalizeDelegationHandoffOutcome(
+				await provider.reopenParentFromDelegation({
+					parentTaskId: task.parentTaskId!,
+					childTaskId: task.taskId,
+					completionResultSummary: result,
+					...(pendingActionId && { pendingActionId }),
+				}),
+			)
+		} catch (error) {
+			await this.pushDelegationFailure(
+				task,
+				provider,
+				pushToolResult,
+				"unexpected_provider_rejection",
+				"provider_handoff",
+				error,
+				pendingActionId,
+			)
+			return "blocked"
+		}
+
+		if (outcome.kind === "detached") {
+			// Do not let normal feedback persistence consume an uncommitted saved action.
+			if (pendingActionId) {
+				await this.pushDelegationFailure(
+					task,
+					provider,
+					pushToolResult,
+					"ownership_moved",
+					"provider_outcome",
+					undefined,
+					pendingActionId,
+				)
+				return "blocked"
+			}
+			return "continue"
+		}
+		if (outcome.kind === "pending") {
+			await task.stopDelegatedCompletion(
+				`Delegated completion is pending ${outcome.reason}. ${DELEGATED_COMPLETION_RECOVERY}`,
+			)
+			return
+		}
+		if (outcome.kind === "recoverable_failure") {
+			await this.blockDelegatedCompletion(
+				task,
+				provider,
+				pushToolResult,
+				outcome.reason,
+				"provider_outcome",
+				undefined,
+				pendingActionId,
+			)
+			return "blocked"
+		}
+
+		this.postcommit(provider, task, "tool_result", () => pushToolResult(""), pendingActionId)
 		return "delegated"
 	}
 

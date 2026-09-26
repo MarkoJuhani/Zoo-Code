@@ -943,6 +943,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this._taskApiConfigName = apiConfigName
 	}
 
+	// A protocol stop is not cancellation: preserve the saved finish action for reopen.
+	public isDelegatedCompletionStopped = false
+
+	public async stopDelegatedCompletion(message: string): Promise<void> {
+		this.isDelegatedCompletionStopped = true
+		try {
+			await this.say("error", message)
+		} catch {
+			// A broken UI/persistence sink must not restart the model loop.
+		}
+	}
+
 	public setPendingTaskAction(pendingAction: PendingTaskAction): void {
 		this.pendingAction = pendingAction
 	}
@@ -2986,7 +2998,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		this.emit(RooCodeEventName.TaskStarted)
 
-		while (!this.abort) {
+		while (!this.abort && !this.isDelegatedCompletionStopped) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
 			includeFileDetails = false // We only need file details the first time.
 
@@ -3025,6 +3037,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const stack: StackItem[] = [{ userContent, includeFileDetails, retryAttempt: 0 }]
 
 		while (stack.length > 0) {
+			if (this.isDelegatedCompletionStopped) return true
 			const currentItem = stack.pop()!
 			const currentUserContent = currentItem.userContent
 			const currentIncludeFileDetails = currentItem.includeFileDetails
@@ -4099,7 +4112,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// 	this.userMessageContentReady = true
 					// }
 
-					await pWaitFor(() => this.userMessageContentReady || this.abort || this.abandoned)
+					await pWaitFor(
+						() =>
+							this.userMessageContentReady ||
+							this.abort ||
+							this.abandoned ||
+							this.isDelegatedCompletionStopped,
+					)
+
+					if (this.isDelegatedCompletionStopped) return true
 
 					if (this.abort || this.abandoned) {
 						throw new Error(

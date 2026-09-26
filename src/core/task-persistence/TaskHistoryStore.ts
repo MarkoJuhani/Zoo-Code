@@ -77,6 +77,11 @@ export interface TaskHistoryStoreOptions {
 	onWrite?: (items: HistoryItem[]) => Promise<void>
 }
 
+export type AuthoritativeTaskHistoryRead =
+	| { kind: "found"; item: HistoryItem }
+	| { kind: "missing" }
+	| { kind: "read_error"; error: unknown }
+
 export class TaskHistoryStore {
 	private readonly globalStoragePath: string
 	private readonly onWrite?: (items: HistoryItem[]) => Promise<void>
@@ -167,6 +172,20 @@ export class TaskHistoryStore {
 	 */
 	get(taskId: string): HistoryItem | undefined {
 		return this.cache.get(taskId)
+	}
+
+	/** Read one metadata record from disk under the store lock without legacy fallback. */
+	async readAuthoritative(taskId: string): Promise<AuthoritativeTaskHistoryRead> {
+		await this.initialized
+		return this.withLock(async () => {
+			const result = await this.readTaskFileAuthoritative(taskId)
+			if (result.kind === "found") {
+				this.cache.set(taskId, result.item)
+			} else if (result.kind === "missing") {
+				this.cache.delete(taskId)
+			}
+			return result
+		})
 	}
 
 	/**
@@ -872,14 +891,20 @@ export class TaskHistoryStore {
 	 * Read a HistoryItem from its per-task `history_item.json` file.
 	 */
 	private async readTaskFile(taskId: string): Promise<HistoryItem | null> {
-		const filePath = await this.getTaskFilePath(taskId)
+		const result = await this.readTaskFileAuthoritative(taskId)
+		return result.kind === "found" ? result.item : null
+	}
 
+	private async readTaskFileAuthoritative(taskId: string): Promise<AuthoritativeTaskHistoryRead> {
 		try {
-			const raw = await fs.readFile(filePath, "utf8")
+			const raw = await fs.readFile(await this.getTaskFilePath(taskId), "utf8")
 			const item: HistoryItem = JSON.parse(raw)
-			return item.id ? item : null
-		} catch {
-			return null
+			if (!item.id || item.id !== taskId) {
+				return { kind: "read_error", error: new Error("Invalid task metadata identity") }
+			}
+			return { kind: "found", item }
+		} catch (error) {
+			return this.isFileNotFoundError(error) ? { kind: "missing" } : { kind: "read_error", error }
 		}
 	}
 
@@ -986,25 +1011,43 @@ export class TaskHistoryStore {
 	}
 
 	/**
-	 * Update two related HistoryItems within a single in-process lock acquisition.
-	 * Both updaters run synchronously (no I/O, no lock re-entry). Both writes
-	 * complete before the lock releases, so no in-process reader can observe an
-	 * intermediate state. Cross-process atomicity is NOT guaranteed — each
-	 * writeTaskFile call acquires and releases its own advisory file lock.
+	 * Update two distinct HistoryItems under this store instance's lock.
+	 * Waits for startup repair, then reads both records fresh before running either
+	 * synchronous updater. Locked reads on this instance cannot interleave, but
+	 * cache reads and other stores/processes are not protected by this lock.
+	 * Each file write has its own advisory lock: a second-write failure leaves the
+	 * first committed. This is NOT a cross-record transaction or cross-host CAS;
+	 * callers must handle partial commits and coordinate competing lifecycle work.
 	 *
-	 * @throws If either task ID is not present in the cache.
+	 * @throws If either record is missing/unreadable or validation/writing fails.
 	 */
-	public atomicUpdatePair(
+	public async atomicUpdatePair(
 		firstId: string,
 		secondId: string,
 		firstUpdater: (current: HistoryItem) => HistoryItem,
 		secondUpdater: (current: HistoryItem) => HistoryItem,
 	): Promise<HistoryItem[]> {
+		await this.initialized
+		if (firstId === secondId) {
+			throw new Error("[TaskHistoryStore] atomicUpdatePair requires distinct task ids")
+		}
 		return this.withLock(async () => {
-			const first = this.cache.get(firstId)
-			if (!first) throw new Error(`[TaskHistoryStore] atomicUpdatePair: ${firstId} not found`)
-			const second = this.cache.get(secondId)
-			if (!second) throw new Error(`[TaskHistoryStore] atomicUpdatePair: ${secondId} not found`)
+			const firstRead = await this.readTaskFileAuthoritative(firstId)
+			const secondRead = await this.readTaskFileAuthoritative(secondId)
+			if (firstRead.kind !== "found") {
+				throw firstRead.kind === "missing"
+					? new Error(`[TaskHistoryStore] atomicUpdatePair: ${firstId} not found`)
+					: firstRead.error
+			}
+			if (secondRead.kind !== "found") {
+				throw secondRead.kind === "missing"
+					? new Error(`[TaskHistoryStore] atomicUpdatePair: ${secondId} not found`)
+					: secondRead.error
+			}
+			const first = firstRead.item
+			const second = secondRead.item
+			this.cache.set(firstId, first)
+			this.cache.set(secondId, second)
 
 			const updatedFirst = firstUpdater(structuredClone(first))
 			const updatedSecond = secondUpdater(structuredClone(second))
@@ -1063,8 +1106,7 @@ export class TaskHistoryStore {
 	// ────────────────────────────── Private: Write lock ──────────────────────────────
 
 	/**
-	 * Serializes all read-modify-write operations within a single extension
-	 * host process to prevent concurrent interleaving.
+	 * Serializes operations on this store instance, not peer stores or hosts.
 	 */
 	private withLock<T>(fn: () => Promise<T>): Promise<T> {
 		const result = this.writeLock.then(fn, fn)
