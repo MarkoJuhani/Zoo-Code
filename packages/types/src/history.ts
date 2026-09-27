@@ -26,6 +26,15 @@ export const pendingTaskActionSchema = z.discriminatedUnion("kind", [
 
 export type PendingTaskAction = z.infer<typeof pendingTaskActionSchema>
 
+export const pendingQuestionSchema = z.object({
+	id: z.string(),
+	taskId: z.string(),
+	toolCallId: z.string(),
+	text: z.string(),
+	answer: z.object({ text: z.string(), images: z.array(z.string()).optional() }).optional(),
+})
+export type PendingQuestion = z.infer<typeof pendingQuestionSchema>
+
 export const historyItemSchema = z.object({
 	id: z.string(),
 	rootTaskId: z.string().optional(),
@@ -51,6 +60,7 @@ export const historyItemSchema = z.object({
 	completedByChildId: z.string().optional(), // Child that completed and resumed this parent
 	completionResultSummary: z.string().optional(), // Summary from completed child
 	pendingAction: pendingTaskActionSchema.optional(),
+	pendingQuestion: pendingQuestionSchema.optional(),
 })
 
 export type HistoryItem = z.infer<typeof historyItemSchema>

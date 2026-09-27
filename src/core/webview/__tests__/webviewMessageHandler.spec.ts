@@ -356,9 +356,52 @@ describe("webviewMessageHandler - image mentions", () => {
 		})
 
 		expect(vi.mocked(resolveImageMentions)).toHaveBeenCalled()
-		expect(mockHandleWebviewAskResponse).toHaveBeenCalledWith("messageResponse", "See @/img.png", [
-			"data:image/png;base64,from-mention",
-		])
+		expect(mockHandleWebviewAskResponse).toHaveBeenCalledWith(
+			"messageResponse",
+			"See @/img.png",
+			["data:image/png;base64,from-mention"],
+			{ taskId: undefined, questionId: undefined, explicitAnswer: undefined },
+		)
+	})
+})
+
+describe("webviewMessageHandler - question ownership", () => {
+	it("does not route an answer to a task switched during asynchronous image resolution", async () => {
+		const oldTask = { taskId: "old", cwd: "/mock/workspace", handleWebviewAskResponse: vi.fn() }
+		const newTask = { taskId: "new", cwd: "/mock/workspace", handleWebviewAskResponse: vi.fn() }
+		// These are intentionally minimal provider-facing Task doubles.
+		vi.mocked(mockClineProvider.getCurrentTask).mockReturnValue(
+			oldTask as unknown as ReturnType<ClineProvider["getCurrentTask"]>,
+		)
+		vi.mocked(resolveImageMentions).mockImplementationOnce(async () => {
+			vi.mocked(mockClineProvider.getCurrentTask).mockReturnValue(
+				newTask as unknown as ReturnType<ClineProvider["getCurrentTask"]>,
+			)
+			return { text: "answer", images: [] }
+		})
+		await webviewMessageHandler(mockClineProvider, {
+			type: "askResponse",
+			taskId: "old",
+			questionId: "q1",
+			explicitAnswer: true,
+			askResponse: "messageResponse",
+			text: "@/img.png",
+		})
+		expect(oldTask.handleWebviewAskResponse).not.toHaveBeenCalled()
+		expect(newTask.handleWebviewAskResponse).not.toHaveBeenCalled()
+	})
+
+	it("rejects a stale task before image work", async () => {
+		vi.mocked(resolveImageMentions).mockClear()
+		await webviewMessageHandler(mockClineProvider, {
+			type: "askResponse",
+			taskId: "not-current",
+			questionId: "q1",
+			explicitAnswer: true,
+			askResponse: "messageResponse",
+			text: "",
+		})
+		expect(resolveImageMentions).not.toHaveBeenCalled()
 	})
 })
 

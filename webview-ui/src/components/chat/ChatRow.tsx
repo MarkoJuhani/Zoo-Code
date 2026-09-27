@@ -120,7 +120,7 @@ interface ChatRowProps {
 	isStreaming: boolean
 	onToggleExpand: (ts: number) => void
 	onHeightChange: (isTaller: boolean) => void
-	onSuggestionClick?: (suggestion: SuggestionItem, event?: React.MouseEvent) => void
+	onSuggestionClick?: (suggestion: SuggestionItem, event?: React.MouseEvent, questionId?: string) => void
 	onBatchFileResponse?: (response: { [key: string]: boolean }) => void
 	onFollowUpUnmount?: () => void
 	isFollowUpAnswered?: boolean
@@ -1714,7 +1714,9 @@ export const ChatRowContent = ({
 								/>
 								<FollowUpSuggest
 									suggestions={followUpData?.suggest}
-									onSuggestionClick={onSuggestionClick}
+									onSuggestionClick={(suggestion, event) =>
+										onSuggestionClick?.(suggestion, event, message.questionId)
+									}
 									ts={message?.ts}
 									onCancelAutoApproval={onFollowUpUnmount}
 									isAnswered={isFollowUpAnswered}

@@ -57,7 +57,7 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 	readonly name = "attempt_completion" as const
 
 	async execute(params: AttemptCompletionParams, task: Task, callbacks: AttemptCompletionCallbacks): Promise<void> {
-		if (task.isDelegatedCompletionStopped) return
+		if (task.isDelegatedCompletionStopped || task.pendingQuestion) return
 		const { result } = params
 		const { handleError, pushToolResult, askFinishSubTaskApproval, toolCallId } = callbacks
 

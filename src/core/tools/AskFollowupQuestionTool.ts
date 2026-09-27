@@ -22,6 +22,7 @@ export class AskFollowupQuestionTool extends BaseTool<"ask_followup_question"> {
 	readonly name = "ask_followup_question" as const
 
 	async execute(params: AskFollowupQuestionParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
+		if (task.hasPendingQuestion) return
 		const { question, follow_up } = params
 		const { handleError, pushToolResult } = callbacks
 
@@ -41,7 +42,7 @@ export class AskFollowupQuestionTool extends BaseTool<"ask_followup_question"> {
 		}
 
 		try {
-			if (!question) {
+			if (typeof question !== "string" || !question.trim()) {
 				await recordMissingParamError("question")
 				return
 			}
@@ -63,6 +64,10 @@ export class AskFollowupQuestionTool extends BaseTool<"ask_followup_question"> {
 				return
 			}
 
+			if (follow_up.some((suggestion) => !suggestion || typeof suggestion.text !== "string")) {
+				await recordValidationError("Each follow-up suggestion must contain string text.")
+				return
+			}
 			// Transform follow_up suggestions to the format expected by task.ask
 			const follow_up_json = {
 				question,
@@ -70,11 +75,13 @@ export class AskFollowupQuestionTool extends BaseTool<"ask_followup_question"> {
 			}
 
 			task.consecutiveMistakeCount = 0
-			const { text, images } = await task.ask("followup", JSON.stringify(follow_up_json), false)
-			const safeText = text ?? ""
-			await task.say("user_feedback", safeText, images)
-			pushToolResult(formatResponse.toolResult(`<user_message>\n${safeText}\n</user_message>`, images))
+			const questionText = JSON.stringify(follow_up_json)
+			if (!callbacks.toolCallId || !(await task.registerQuestion(questionText, callbacks.toolCallId))) return
+			const { response } = await task.ask("followup", questionText, false)
+			if (response !== "messageResponse" || !task.pendingQuestion?.answer || task.abort || task.abandoned) return
+			pushToolResult(await task.deliverQuestionResult())
 		} catch (error) {
+			if (task.pendingQuestion) return
 			await handleError("asking question", error as Error)
 		}
 	}

@@ -5,6 +5,7 @@ import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
 
+import { registerPendingQuestion, answerPendingQuestion, clearPendingQuestion } from "../task-persistence/taskLifecycle"
 import { AskIgnoredError } from "./AskIgnoredError"
 import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
 
@@ -33,6 +34,7 @@ import {
 	type ToolProgressStatus,
 	type HistoryItem,
 	type PendingTaskAction,
+	type PendingQuestion,
 	type CreateTaskOptions,
 	type ModelInfo,
 	type TaskAbortReason,
@@ -527,6 +529,131 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	// Initial status for the task's history item (set at creation time to avoid race conditions)
 	private readonly initialStatus?: "active" | "delegated" | "completed" | "interrupted" | "blocked_protocol_error"
+	public pendingQuestion?: PendingQuestion
+	private questionResultDelivered = false
+	private acceptingQuestionAnswer = false
+	private questionQueuedMessageId?: string
+	private activeQuestionWaitId?: string
+
+	public get hasPendingQuestion(): boolean {
+		return !!this.pendingQuestion && !this.questionResultDelivered
+	}
+
+	private async mutatePendingQuestion(update: (item: HistoryItem) => HistoryItem): Promise<void> {
+		const provider = this.providerRef.deref()
+		if (!provider) throw new Error("Question persistence requires a task provider")
+		const written = await provider.taskHistoryStore.updateQuestion(this.taskId, update)
+		this.pendingQuestion = written.pendingQuestion
+	}
+
+	public async registerQuestion(text: string, toolCallId: string): Promise<boolean> {
+		if (this.pendingQuestion || this.abort || this.abandoned) return false
+		const question: PendingQuestion = {
+			id: uuidv7(),
+			taskId: this.taskId,
+			toolCallId: sanitizeToolUseId(toolCallId),
+			text,
+		}
+		// Install the local gate before the first asynchronous persistence boundary.
+		this.pendingQuestion = question
+		this.questionResultDelivered = false
+		if (!(await this.waitForCurrentAssistantMessagePersistence())) return false
+		await this.mutatePendingQuestion((item) => registerPendingQuestion(item, question))
+		return !this.abort && !this.abandoned
+	}
+
+	/** Explicit abandonment is separate from abortTask, which only interrupts a request. */
+	public async abandonQuestion(questionId: string, reason: "abandon" | "replace"): Promise<void> {
+		if (this.pendingQuestion?.id !== questionId || this.abort || this.abandoned) return
+		this.cancelAutoApprovalTimeout()
+		await this.mutatePendingQuestion((item) => clearPendingQuestion(item, questionId, reason))
+		await this.abortTask()
+	}
+
+	public async deliverQuestionResult(): Promise<ReturnType<typeof formatResponse.toolResult>> {
+		const question = this.pendingQuestion
+		if (!question?.answer) throw new Error("Question has no owned answer")
+		if (
+			!this.clineMessages.some((message) => message.say === "user_feedback" && message.questionId === question.id)
+		) {
+			await this.addToClineMessages({
+				messageId: `question-feedback:${question.id}`,
+				ts: Date.now(),
+				type: "say",
+				say: "user_feedback",
+				text: question.answer.text,
+				images: question.answer.images,
+				questionId: question.id,
+			})
+		}
+		if (!(await this.saveClineMessages())) throw new Error("Question feedback could not be persisted")
+		this.questionResultDelivered = true
+		return formatResponse.toolResult(
+			`<user_message>\n${question.answer.text}\n</user_message>`,
+			question.answer.images,
+		)
+	}
+
+	private async resumePendingQuestion(): Promise<void> {
+		const question = this.pendingQuestion
+		if (!question) return
+		this.isInitialized = true
+		const existingResult = this.apiConversationHistory.some(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some(
+					(block) =>
+						block.type === "tool_result" && block.tool_use_id === question.toolCallId && !block.is_error,
+				),
+		)
+		if (question.answer && existingResult) {
+			await this.mutatePendingQuestion((item) => clearPendingQuestion(item, question.id, "durable_result"))
+			await this.initiateTaskLoop([{ type: "text", text: "Continue from the recorded answer." }])
+			return
+		}
+		// Only explicit runtime state is restored; old unanswered chat rows are not evidence.
+		if (!question.answer) await this.ask("followup", question.text, false)
+		if (this.abort || this.abandoned || !this.pendingQuestion?.answer) return
+		const content = await this.deliverQuestionResult()
+		const last = this.apiConversationHistory.at(-1)
+		const previous = last?.role === "user" ? this.apiConversationHistory.at(-2) : last
+		if (
+			previous?.role !== "assistant" ||
+			!Array.isArray(previous.content) ||
+			!previous.content.some((block) => block.type === "tool_use" && block.id === question.toolCallId)
+		) {
+			// Fail closed when an interrupted stream never durably recorded its tool call.
+			this.questionResultDelivered = false
+			return
+		}
+		const results: Anthropic.Messages.ContentBlockParam[] =
+			last?.role === "user" && Array.isArray(last.content)
+				? last.content.filter(
+						(block) => block.type !== "tool_result" || block.tool_use_id !== question.toolCallId,
+					)
+				: []
+		for (const block of previous.content) {
+			if (
+				block.type !== "tool_use" ||
+				results.some((result) => result.type === "tool_result" && result.tool_use_id === block.id)
+			)
+				continue
+			results.push(
+				block.id === question.toolCallId
+					? { type: "tool_result", tool_use_id: block.id, content }
+					: {
+							type: "tool_result",
+							tool_use_id: block.id,
+							content: "Task was interrupted before this tool call could be completed.",
+							is_error: true,
+						},
+			)
+		}
+		if (last?.role === "user") await this.overwriteApiConversationHistory(this.apiConversationHistory.slice(0, -1))
+		await this.initiateTaskLoop(results)
+	}
+
 	private pendingAction?: PendingTaskAction
 
 	// MessageManager for high-level message operations (lazy initialized)
@@ -619,6 +746,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.taskNumber = taskNumber
 		this.initialStatus = initialStatus
 		this.pendingAction = historyItem?.pendingAction
+		this.pendingQuestion = historyItem?.pendingQuestion
 
 		// Store the task's mode and API config name when it's created.
 		// For history items, use the stored values; for new tasks, we'll set them
@@ -1015,8 +1143,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private handleQueuedAskResponse(message: QueuedMessage, resolution: QueuedAskResolution): string | undefined {
-		this.handleWebviewAskResponse(resolution.response, message.text, message.images)
-		if (resolution.requiresDurableAck) {
+		if (this.pendingQuestion) this.questionQueuedMessageId = message.id
+		this.handleWebviewAskResponse(
+			resolution.response,
+			message.text,
+			message.images,
+			this.pendingQuestion
+				? { taskId: this.taskId, questionId: this.pendingQuestion.id, explicitAnswer: true }
+				: undefined,
+		)
+		if (this.pendingQuestion || resolution.requiresDurableAck) {
 			return message.id
 		}
 		this.messageQueueService.removeMessage(message.id)
@@ -1083,6 +1219,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					error,
 				)
 			}
+		}
+		const question = this.pendingQuestion
+		if (
+			question?.answer &&
+			this.questionResultDelivered &&
+			message.role === "user" &&
+			Array.isArray(message.content) &&
+			message.content.some(
+				(block) => block.type === "tool_result" && block.tool_use_id === question.toolCallId && !block.is_error,
+			)
+		) {
+			if (!saved) saved = await this.retrySaveApiConversationHistory()
+			if (!saved) throw new Error("Question result could not be persisted")
+			await this.mutatePendingQuestion((item) => clearPendingQuestion(item, question.id, "durable_result"))
 		}
 		if (message.role === "assistant") {
 			this.assistantMessageSavedToHistory = saved
@@ -1468,6 +1618,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			throw new Error(`[RooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
 		}
 
+		if (
+			this.hasPendingQuestion &&
+			(type !== "followup" || partial === true || text !== this.pendingQuestion?.text)
+		) {
+			throw new AskIgnoredError("superseded")
+		}
+		const ownedQuestion = type === "followup" ? this.pendingQuestion : undefined
+		if (ownedQuestion && this.activeQuestionWaitId === ownedQuestion.id) throw new AskIgnoredError("superseded")
 		let askTs: number
 
 		// Resolve auto-approval before adding the message so the state snapshot
@@ -1502,6 +1660,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// Existing partial message, so update it.
 					lastMessage.text = text
 					lastMessage.partial = partial
+					lastMessage.questionId = ownedQuestion?.id
 					lastMessage.progressStatus = progressStatus
 					lastMessage.isProtected = isProtected
 					// TODO: Be more efficient about saving and posting only new
@@ -1549,6 +1708,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					this.lastMessageTs = askTs
 					lastMessage.text = text
 					lastMessage.partial = false
+					lastMessage.questionId = ownedQuestion?.id
 					lastMessage.progressStatus = progressStatus
 					lastMessage.isProtected = isProtected
 					if (isAutoAnswered) {
@@ -1576,6 +1736,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						isProtected,
 						isAnswered: isAutoAnswered || undefined,
 						autoApprovalDecision,
+						questionId: ownedQuestion?.id,
 					})
 				}
 			}
@@ -1594,10 +1755,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				isProtected,
 				isAnswered: isAutoAnswered || undefined,
 				autoApprovalDecision,
+				questionId: ownedQuestion?.id,
 			})
 		}
 
 		const timeouts: NodeJS.Timeout[] = []
+		if (ownedQuestion) this.activeQuestionWaitId = ownedQuestion.id
 
 		if (approval.decision === "approve") {
 			this.approveAsk()
@@ -1607,7 +1770,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Store the auto-approval timeout so it can be cancelled if user interacts
 			this.autoApprovalTimeoutRef = setTimeout(() => {
 				const { askResponse, text, images } = approval.fn()
-				this.handleWebviewAskResponse(askResponse, text, images)
+				if (
+					!this.abort &&
+					!this.abandoned &&
+					this.lastMessageTs === askTs &&
+					(!ownedQuestion || this.pendingQuestion?.id === ownedQuestion.id)
+				) {
+					this.handleWebviewAskResponse(
+						askResponse,
+						text,
+						images,
+						ownedQuestion
+							? { taskId: this.taskId, questionId: ownedQuestion.id, explicitAnswer: true }
+							: undefined,
+					)
+				}
 				this.autoApprovalTimeoutRef = undefined
 			}, approval.timeout)
 			timeouts.push(this.autoApprovalTimeoutRef)
@@ -1668,73 +1845,136 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			queuedMessageId = this.handleQueuedAskResponse(queuedMessage, queuedAskResolution)
 		}
 
-		// Wait for askResponse to be set
-		await pWaitFor(
-			() => {
-				if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
-					return true
-				}
-
-				// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
-				// suggestion click that was incorrectly queued due to UI state), consume it
-				// immediately so the task doesn't hang.
-				if (shouldDrainQueuedMessageForAsk && !this.messageQueueService.isEmpty()) {
-					const message = this.messageQueueService.claimNextMessage()
-					const resolution = message ? queuedResponseForAsk(type, text) : undefined
-					if (message && resolution) {
-						queuedMessageId = this.handleQueuedAskResponse(message, resolution)
+		try {
+			// Wait for askResponse to be set
+			await pWaitFor(
+				() => {
+					if (
+						this.abort ||
+						this.askResponse !== undefined ||
+						(!ownedQuestion && this.lastMessageTs !== askTs)
+					) {
+						return true
 					}
+
+					// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
+					// suggestion click that was incorrectly queued due to UI state), consume it
+					// immediately so the task doesn't hang.
+					if (
+						shouldDrainQueuedMessageForAsk &&
+						!this.acceptingQuestionAnswer &&
+						!queuedMessageId &&
+						!this.messageQueueService.isEmpty()
+					) {
+						const message = this.messageQueueService.claimNextMessage()
+						const resolution = message ? queuedResponseForAsk(type, text) : undefined
+						if (message && resolution) {
+							queuedMessageId = this.handleQueuedAskResponse(message, resolution)
+						}
+					}
+
+					return false
+				},
+				{ interval: 100 },
+			)
+
+			/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
+			if (this.abort) {
+				if (queuedMessageId) {
+					this.messageQueueService.releaseMessage(queuedMessageId)
 				}
-
-				return false
-			},
-			{ interval: 100 },
-		)
-
-		/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
-		if (this.abort) {
-			if (queuedMessageId) {
-				this.messageQueueService.releaseMessage(queuedMessageId)
+				throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
 			}
-			throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
-		}
 
-		if (this.lastMessageTs !== askTs) {
-			// Could happen if we send multiple asks in a row i.e. with
-			// command_output. It's important that when we know an ask could
-			// fail, it is handled gracefully.
-			if (queuedMessageId) {
-				this.messageQueueService.releaseMessage(queuedMessageId)
+			if (!ownedQuestion && this.lastMessageTs !== askTs) {
+				// Could happen if we send multiple asks in a row i.e. with
+				// command_output. It's important that when we know an ask could
+				// fail, it is handled gracefully.
+				if (queuedMessageId) {
+					this.messageQueueService.releaseMessage(queuedMessageId)
+				}
+				throw new AskIgnoredError("superseded")
 			}
-			throw new AskIgnoredError("superseded")
+
+			const result = {
+				response: this.askResponse!,
+				text: this.askResponseText,
+				images: this.askResponseImages,
+				queuedMessageId,
+			}
+			this.askResponse = undefined
+			this.askResponseText = undefined
+			this.askResponseImages = undefined
+
+			// Cancel the timeouts if they are still running.
+			timeouts.forEach((timeout) => clearTimeout(timeout))
+
+			// Switch back to an active state.
+			if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
+				this.idleAsk = undefined
+				this.resumableAsk = undefined
+				this.interactiveAsk = undefined
+				this.emit(RooCodeEventName.TaskActive, this.taskId)
+			}
+
+			this.emit(RooCodeEventName.TaskAskResponded)
+			return result
+		} finally {
+			if (this.activeQuestionWaitId === ownedQuestion?.id) this.activeQuestionWaitId = undefined
+			timeouts.forEach((timeout) => clearTimeout(timeout))
 		}
-
-		const result = {
-			response: this.askResponse!,
-			text: this.askResponseText,
-			images: this.askResponseImages,
-			queuedMessageId,
-		}
-		this.askResponse = undefined
-		this.askResponseText = undefined
-		this.askResponseImages = undefined
-
-		// Cancel the timeouts if they are still running.
-		timeouts.forEach((timeout) => clearTimeout(timeout))
-
-		// Switch back to an active state.
-		if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
-			this.idleAsk = undefined
-			this.resumableAsk = undefined
-			this.interactiveAsk = undefined
-			this.emit(RooCodeEventName.TaskActive, this.taskId)
-		}
-
-		this.emit(RooCodeEventName.TaskAskResponded)
-		return result
 	}
 
-	handleWebviewAskResponse(askResponse: ClineAskResponse, text?: string, images?: string[]) {
+	handleWebviewAskResponse(
+		askResponse: ClineAskResponse,
+		text?: string,
+		images?: string[],
+		ownership?: { taskId?: string; questionId?: string; explicitAnswer?: boolean },
+	) {
+		const question = this.pendingQuestion
+		if (question) {
+			if (
+				this.abort ||
+				this.abandoned ||
+				question.answer ||
+				this.acceptingQuestionAnswer ||
+				askResponse !== "messageResponse" ||
+				ownership?.taskId !== this.taskId ||
+				ownership.questionId !== question.id ||
+				!ownership.explicitAnswer
+			)
+				return
+			this.acceptingQuestionAnswer = true
+			this.cancelAutoApprovalTimeout()
+			void this.mutatePendingQuestion((item) =>
+				answerPendingQuestion(item, question.id, { text: text ?? "", images }),
+			)
+				.then(() => {
+					if (
+						this.abort ||
+						this.abandoned ||
+						this.pendingQuestion?.id !== question.id ||
+						!this.pendingQuestion.answer
+					)
+						return
+					if (this.questionQueuedMessageId) {
+						this.messageQueueService.removeMessage(this.questionQueuedMessageId)
+						this.questionQueuedMessageId = undefined
+					}
+					this.askResponse = "messageResponse"
+					this.askResponseText = this.pendingQuestion.answer.text
+					this.askResponseImages = this.pendingQuestion.answer.images
+					for (const message of this.clineMessages)
+						if (message.questionId === question.id && message.ask === "followup") message.isAnswered = true
+					return this.saveClineMessages()
+				})
+				.catch((error) => console.error("Failed to persist question answer:", error))
+				.finally(() => {
+					this.acceptingQuestionAnswer = false
+				})
+			return
+		}
+		if (ownership?.questionId) return
 		// Clear any pending auto-approval timeout when user responds
 		this.cancelAutoApprovalTimeout()
 
@@ -1747,24 +1987,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Suppress the checkpoint_saved chat row for this particular checkpoint to keep the timeline clean.
 		if (askResponse === "messageResponse") {
 			void this.checkpointSave(false, true)
-		}
-
-		// Mark the last follow-up question as answered
-		if (askResponse === "messageResponse" || askResponse === "yesButtonClicked") {
-			// Find the last unanswered follow-up message using findLastIndex
-			const lastFollowUpIndex = findLastIndex(
-				this.clineMessages,
-				(msg) => msg.type === "ask" && msg.ask === "followup" && !msg.isAnswered,
-			)
-
-			if (lastFollowUpIndex !== -1) {
-				// Mark this follow-up as answered
-				this.clineMessages[lastFollowUpIndex].isAnswered = true
-				// Save the updated messages
-				this.saveClineMessages().catch((error) => {
-					console.error("Failed to save answered follow-up state:", error)
-				})
-			}
 		}
 
 		// Mark the last tool-approval ask as answered when user approves (or auto-approval)
@@ -2407,6 +2629,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
 			}
 
+			if (this.pendingQuestion) {
+				await this.resumePendingQuestion()
+				return
+			}
+
 			if (this.pendingAction) {
 				this.isInitialized = true
 				await this.resumePendingTaskAction(this.pendingAction)
@@ -2712,6 +2939,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		this.abort = true
+		this.cancelAutoApprovalTimeout()
 		this.cancelAssistantMessagePersistence()
 		this.abortPromise ??= this.abortTaskOnce()
 		return this.abortPromise
@@ -2999,7 +3227,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		this.emit(RooCodeEventName.TaskStarted)
 
-		while (!this.abort && !this.isDelegatedCompletionStopped) {
+		while (!this.abort && !this.isDelegatedCompletionStopped && !this.hasPendingQuestion) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
 			includeFileDetails = false // We only need file details the first time.
 
@@ -3014,7 +3242,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// requests, but Cline is prompted to finish the task as efficiently
 			// as he can.
 
-			if (didEndLoop) {
+			if (didEndLoop || this.hasPendingQuestion) {
 				// For now a task never 'completes'. This will only happen if
 				// the user hits max requests and denies resetting the count.
 				break
@@ -3038,7 +3266,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const stack: StackItem[] = [{ userContent, includeFileDetails, retryAttempt: 0 }]
 
 		while (stack.length > 0) {
-			if (this.isDelegatedCompletionStopped) return true
+			if (this.isDelegatedCompletionStopped || this.hasPendingQuestion) return true
 			const currentItem = stack.pop()!
 			const currentUserContent = currentItem.userContent
 			const currentIncludeFileDetails = currentItem.includeFileDetails
@@ -4144,7 +4372,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							this.isDelegatedCompletionStopped,
 					)
 
-					if (this.isDelegatedCompletionStopped) return true
+					if (this.isDelegatedCompletionStopped || this.hasPendingQuestion) return true
 
 					if (this.abort || this.abandoned) {
 						throw new Error(
@@ -4677,6 +4905,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		retryAttempt: number = 0,
 		options: { skipProviderRateLimit?: boolean; requestModelInfo?: ModelInfo } = {},
 	): ApiStream {
+		if (this.pendingQuestion) return
 		const state = await this.providerRef.deref()?.getState()
 
 		const {
@@ -5005,6 +5234,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.skipPrevResponseIdOnce = false
 
 		// The provider accepts reasoning items alongside standard messages; cast to the expected parameter type.
+		if (this.pendingQuestion || this.abort || this.abandoned) return
 		const stream = this.api.createMessage(
 			systemPrompt,
 			cleanConversationHistory as unknown as Anthropic.Messages.MessageParam[],

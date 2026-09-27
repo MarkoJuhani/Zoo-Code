@@ -11,6 +11,7 @@ describe("AskFollowupQuestionTool", () => {
 	let tool: AskFollowupQuestionTool
 	let mockTask: Task
 	let mockCallbacks: ToolCallbacks
+	let askResponse: ReturnType<typeof vi.fn<Task["ask"]>>
 
 	beforeEach(() => {
 		vi.clearAllMocks()
@@ -22,11 +23,31 @@ describe("AskFollowupQuestionTool", () => {
 			recordToolError: vi.fn(),
 			didToolFailInCurrentTurn: false,
 			sayAndCreateMissingParamError: vi.fn().mockResolvedValue("Missing parameter error"),
-			ask: vi.fn().mockResolvedValue({ text: "User answer", images: [] }),
+			ask: vi.fn().mockResolvedValue({ response: "messageResponse", text: "User answer", images: [] }),
 			say: vi.fn().mockResolvedValue(undefined),
 		} as unknown as Task
 
+		mockTask.registerQuestion = vi.fn(async (text, toolCallId) => {
+			mockTask.pendingQuestion = { id: "question", taskId: "task", text, toolCallId }
+			return true
+		})
+		mockTask.deliverQuestionResult = vi.fn(async () => {
+			const answer = mockTask.pendingQuestion!.answer!
+			await mockTask.say("user_feedback", answer.text, answer.images)
+			return formatResponse.toolResult(`<user_message>\n${answer.text}\n</user_message>`, answer.images)
+		})
+		// The real Task accepts and persists the owned answer before its ask resolves.
+		askResponse = vi.mocked(mockTask.ask)
+		const ask = askResponse
+		mockTask.ask = vi.fn(async (...args: Parameters<Task["ask"]>) => {
+			const result = await ask(...args)
+			if (mockTask.pendingQuestion && result.response === "messageResponse") {
+				mockTask.pendingQuestion.answer = { text: result.text ?? "", images: result.images }
+			}
+			return result
+		})
 		mockCallbacks = {
+			toolCallId: "call",
 			askApproval: vi.fn().mockResolvedValue(true),
 			handleError: vi.fn(),
 			pushToolResult: vi.fn(),
@@ -186,7 +207,7 @@ describe("AskFollowupQuestionTool", () => {
 			question: "Which approach?",
 			follow_up: [{ text: "Approach 1" }],
 		}
-		;(mockTask.ask as any).mockResolvedValue({ text: "I'll go with Approach 1", images: [] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: "I'll go with Approach 1", images: [] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -202,7 +223,7 @@ describe("AskFollowupQuestionTool", () => {
 			follow_up: [{ text: "Yes" }],
 		}
 		const validDataUrl = "data:image/png;base64,iVBORw0KGgo="
-		;(mockTask.ask as any).mockResolvedValue({ text: "See image", images: [validDataUrl] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: "See image", images: [validDataUrl] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -223,7 +244,7 @@ describe("AskFollowupQuestionTool", () => {
 
 	it("should handle user providing empty text response", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
-		;(mockTask.ask as any).mockResolvedValue({ text: "", images: [] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: "", images: [] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -232,33 +253,33 @@ describe("AskFollowupQuestionTool", () => {
 
 	// ===== Error handling tests =====
 
-	it("should call handleError when task.ask throws", async () => {
+	it("should retain the question without error encouragement when task.ask throws", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
 		const error = new Error("ask failed")
-		;(mockTask.ask as any).mockRejectedValue(error)
+		askResponse.mockRejectedValue(error)
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
-		expect(mockCallbacks.handleError).toHaveBeenCalledWith("asking question", error)
+		expect(mockCallbacks.handleError).not.toHaveBeenCalled()
 	})
 
 	it("should not call pushToolResult when task.ask throws", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
-		;(mockTask.ask as any).mockRejectedValue(new Error("fail"))
+		askResponse.mockRejectedValue(new Error("fail"))
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
 		expect(mockCallbacks.pushToolResult).not.toHaveBeenCalled()
 	})
 
-	it("should call handleError when task.say throws", async () => {
+	it("should retain the answer when feedback persistence throws", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
 		const error = new Error("say failed")
 		;(mockTask.say as any).mockRejectedValue(error)
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
-		expect(mockCallbacks.handleError).toHaveBeenCalledWith("asking question", error)
+		expect(mockCallbacks.handleError).not.toHaveBeenCalled()
 	})
 
 	// ===== handlePartial tests =====
@@ -315,7 +336,7 @@ describe("AskFollowupQuestionTool", () => {
 
 	it("should silently catch errors during handlePartial", async () => {
 		const block = createBlock({ question: "What?", follow_up: [{ text: "A" }] }, true)
-		;(mockTask.ask as any).mockRejectedValue(new Error("partial failed"))
+		askResponse.mockRejectedValue(new Error("partial failed"))
 
 		// Should not throw
 		await expect(tool.handlePartial(mockTask, block)).resolves.toBeUndefined()
@@ -360,7 +381,7 @@ describe("AskFollowupQuestionTool", () => {
 		const params = { question: "Look at these?", follow_up: [{ text: "Yes" }] }
 		const img1 = "data:image/png;base64,iVBORw0KGgo="
 		const img2 = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
-		;(mockTask.ask as any).mockResolvedValue({ text: "See images", images: [img1, img2] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: "See images", images: [img1, img2] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -372,7 +393,7 @@ describe("AskFollowupQuestionTool", () => {
 
 	it("should pass empty images array when user provides no images", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
-		;(mockTask.ask as any).mockResolvedValue({ text: "answer", images: [] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: "answer", images: [] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -384,7 +405,8 @@ describe("AskFollowupQuestionTool", () => {
 
 	it("should handle null text in user response by using empty string", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
-		;(mockTask.ask as any).mockResolvedValue({ text: null, images: [] })
+		// A malformed transport may deliver null despite the declared response type.
+		askResponse.mockResolvedValue({ response: "messageResponse", text: null as unknown as string, images: [] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
@@ -422,9 +444,8 @@ describe("AskFollowupQuestionTool", () => {
 
 		await tool.execute(params, mockTask, mockCallbacks)
 
-		// Whitespace-only question is truthy, so it should proceed normally
-		expect(mockTask.ask).toHaveBeenCalledWith("followup", expect.stringContaining("   "), false)
-		expect(mockTask.recordToolError).not.toHaveBeenCalled()
+		expect(mockTask.ask).not.toHaveBeenCalled()
+		expect(mockTask.recordToolError).toHaveBeenCalled()
 	})
 
 	it("should handle follow_up with mixed mode and undefined mode suggestions", async () => {
@@ -468,7 +489,7 @@ describe("AskFollowupQuestionTool", () => {
 
 	it("should handle execute when task.ask resolves with undefined text", async () => {
 		const params = { question: "What?", follow_up: [{ text: "A" }] }
-		;(mockTask.ask as any).mockResolvedValue({ text: undefined, images: [] })
+		askResponse.mockResolvedValue({ response: "messageResponse", text: undefined, images: [] })
 
 		await tool.execute(params, mockTask, mockCallbacks)
 

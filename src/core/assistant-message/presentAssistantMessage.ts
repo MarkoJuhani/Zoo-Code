@@ -85,7 +85,7 @@ export function toTelemetryToolName(
  */
 
 export async function presentAssistantMessage(cline: Task) {
-	if (cline.abort) {
+	if (cline.abort || cline.hasPendingQuestion) {
 		return
 	}
 
@@ -849,6 +849,7 @@ export async function presentAssistantMessage(cline: Task) {
 					break
 				case "ask_followup_question":
 					await askFollowupQuestionTool.handle(cline, block as ToolUse<"ask_followup_question">, {
+						toolCallId: block.id,
 						askApproval,
 						handleError,
 						pushToolResult,
@@ -990,6 +991,10 @@ export async function presentAssistantMessage(cline: Task) {
 	// cline.presentAssistantMessage below would fail (sometimes) since it's
 	// locked.
 	cline.presentAssistantMessageLocked = false
+	if (cline.hasPendingQuestion) {
+		cline.userMessageContentReady = true
+		return
+	}
 
 	// NOTE: When tool is rejected, iterator stream is interrupted and it waits
 	// for `userMessageContentReady` to be true. Future calls to present will

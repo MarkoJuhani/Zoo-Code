@@ -992,6 +992,29 @@ export class TaskHistoryStore {
 	 *
 	 * @throws If the task ID is not present in the cache.
 	 */
+	/** Evaluate a question reducer against disk under safeWriteJson's advisory lock. */
+	public updateQuestion(taskId: string, update: (current: HistoryItem) => HistoryItem): Promise<HistoryItem> {
+		return this.withLock(async () => {
+			const cached = this.cache.get(taskId)
+			if (!cached) throw new Error(`Question task ${taskId} is not persisted`)
+			let written = cached
+			await safeWriteJson(await this.getTaskFilePath(taskId), cached, {
+				merge: (existing) => {
+					if (!existing || typeof existing !== "object" || !("id" in existing) || existing.id !== taskId) {
+						throw new Error("Question task ownership changed")
+					}
+					const current = existing as HistoryItem
+					const updated = update(structuredClone(current))
+					written = { ...current, pendingQuestion: updated.pendingQuestion }
+					return written
+				},
+			})
+			this.cache.set(taskId, written)
+			if (this.onWrite) await this.onWrite(this.getAll())
+			return written
+		})
+	}
+
 	public atomicReadAndUpdate(taskId: string, updater: (current: HistoryItem) => HistoryItem): Promise<HistoryItem[]> {
 		return this.withLock(async () => {
 			const current = this.cache.get(taskId)

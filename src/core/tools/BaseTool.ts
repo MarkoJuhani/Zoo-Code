@@ -118,6 +118,7 @@ export abstract class BaseTool<TName extends ToolName> {
 		block: ToolUse<TName>,
 		callbacks: TCallbacks,
 	): Promise<void> {
+		if (task.hasPendingQuestion) return
 		// Handle partial messages
 		if (block.partial) {
 			try {

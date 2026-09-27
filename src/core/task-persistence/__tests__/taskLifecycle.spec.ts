@@ -153,3 +153,16 @@ describe("task lifecycle transitions", () => {
 		expect(abandoned.child).toMatchObject({ parentTaskId: undefined, rootTaskId: undefined })
 	})
 })
+
+describe("question ownership on delegated abandonment", () => {
+	it("clears the interrupted child's question without fabricating an answer", () => {
+		const parent = item("parent", { status: "delegated", awaitingChildId: "child", delegatedToId: "child" })
+		const child = item("child", {
+			status: "interrupted",
+			parentTaskId: "parent",
+			pendingQuestion: { id: "q", taskId: "child", toolCallId: "call", text: "Choose?" },
+		})
+		expect(abandonDelegatedChild(parent, child).child.pendingQuestion).toBeUndefined()
+		expect(child.pendingQuestion?.answer).toBeUndefined()
+	})
+})

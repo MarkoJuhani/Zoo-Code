@@ -146,7 +146,7 @@ export function abandonDelegatedChild(
 	assertValidTransition(parent.status, "active")
 
 	return {
-		child: { ...child, parentTaskId: undefined, rootTaskId: undefined },
+		child: { ...child, parentTaskId: undefined, rootTaskId: undefined, pendingQuestion: undefined },
 		parent: {
 			...parent,
 			status: "active",
@@ -156,4 +156,36 @@ export function abandonDelegatedChild(
 			protocolErrorChildId: undefined,
 		},
 	}
+}
+
+/** A question is not resolved by interruption, approval, or synthetic tool feedback. */
+export function registerPendingQuestion(
+	item: HistoryItem,
+	question: NonNullable<HistoryItem["pendingQuestion"]>,
+): HistoryItem {
+	if (question.taskId !== item.id || item.pendingQuestion || item.status === "completed") {
+		throw new LifecycleTransitionError("Question registration conflicts with task ownership")
+	}
+	return { ...item, pendingQuestion: question }
+}
+
+export function answerPendingQuestion(
+	item: HistoryItem,
+	questionId: string,
+	answer: NonNullable<NonNullable<HistoryItem["pendingQuestion"]>["answer"]>,
+): HistoryItem {
+	if (item.pendingQuestion?.id !== questionId || item.pendingQuestion.answer) return item
+	return { ...item, pendingQuestion: { ...item.pendingQuestion, answer } }
+}
+
+export function clearPendingQuestion(
+	item: HistoryItem,
+	questionId: string,
+	reason: "durable_result" | "abandon" | "replace",
+): HistoryItem {
+	if (item.pendingQuestion?.id !== questionId) return item
+	if (reason === "durable_result" && !item.pendingQuestion.answer) {
+		throw new LifecycleTransitionError("An unanswered question has no durable answer result")
+	}
+	return { ...item, pendingQuestion: undefined }
 }

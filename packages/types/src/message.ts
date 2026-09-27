@@ -273,6 +273,7 @@ export const clineMessageSchema = z.object({
 	isProtected: z.boolean().optional(),
 	apiProtocol: z.union([z.literal("openai"), z.literal("anthropic")]).optional(),
 	isAnswered: z.boolean().optional(),
+	questionId: z.string().optional(),
 	autoApprovalDecision: z.union([z.literal("approve"), z.literal("deny")]).optional(),
 })
 

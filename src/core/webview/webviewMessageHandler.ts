@@ -718,10 +718,15 @@ export const webviewMessageHandler = async (
 
 		case "askResponse":
 			{
+				const task = provider.getCurrentTask()
+				if (!task || (message.taskId && message.taskId !== task.taskId)) break
 				const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
-				provider
-					.getCurrentTask()
-					?.handleWebviewAskResponse(message.askResponse!, resolved.text, resolved.images)
+				if (provider.getCurrentTask() !== task || task.abort || task.abandoned) break
+				task.handleWebviewAskResponse(message.askResponse!, resolved.text, resolved.images, {
+					taskId: message.taskId,
+					questionId: message.questionId,
+					explicitAnswer: message.explicitAnswer,
+				})
 			}
 			break
 

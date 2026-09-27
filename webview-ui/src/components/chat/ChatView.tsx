@@ -643,7 +643,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		(text: string, images: string[]) => {
 			text = text.trim()
 
-			if (text || images.length > 0) {
+			if (text || images.length > 0 || clineAskRef.current === "followup") {
 				// Intercept when the active provider is retired — show a
 				// WarningRow instead of sending anything to the backend.
 				if (apiConfiguration?.apiProvider && isRetiredProvider(apiConfiguration.apiProvider)) {
@@ -657,10 +657,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				// - Queue has items (preserve message order during drain)
 				// - Command is running (command_output) - user's message should be queued for AI, not sent to terminal
 				if (
-					sendingDisabled ||
-					isStreaming ||
-					messageQueue.length > 0 ||
-					clineAskRef.current === "command_output"
+					clineAskRef.current !== "followup" &&
+					(sendingDisabled ||
+						isStreaming ||
+						messageQueue.length > 0 ||
+						clineAskRef.current === "command_output")
 				) {
 					try {
 						console.log("queueMessage", text, images)
@@ -701,6 +702,13 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 							vscode.postMessage({
 								type: "askResponse",
 								askResponse: "messageResponse",
+								taskId: currentTaskItem?.id,
+								questionId:
+									clineAskRef.current === "followup"
+										? messagesRef.current.findLast((message) => message.ask === "followup")
+												?.questionId
+										: undefined,
+								explicitAnswer: clineAskRef.current === "followup",
 								text,
 								images,
 							})
@@ -718,6 +726,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		[
 			handleChatReset,
 			markFollowUpAsAnswered,
+			currentTaskItem?.id,
 			sendingDisabled,
 			isStreaming,
 			messageQueue.length,
@@ -1430,7 +1439,9 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	)
 
 	const handleSuggestionClickInRow = useCallback(
-		(suggestion: SuggestionItem, event?: React.MouseEvent) => {
+		(suggestion: SuggestionItem, event?: React.MouseEvent, questionId?: string) => {
+			const currentQuestionId = messagesRef.current.findLast((message) => message.ask === "followup")?.questionId
+			if (questionId !== currentQuestionId) return
 			// The model may emit suggestions with missing or blank answers (issue #1226).
 			// Ignore them instead of pushing an undefined value into the input, which
 			// would crash the text area (inputValue.trim on undefined).

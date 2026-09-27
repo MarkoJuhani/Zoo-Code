@@ -32,6 +32,7 @@ interface ClineMessage {
 	ts: number
 	text?: string
 	partial?: boolean
+	questionId?: string
 }
 
 // Mock vscode API
@@ -57,7 +58,7 @@ vi.mock("../ChatRow", () => ({
 		isFollowUpAnswered,
 	}: {
 		message: ClineMessage
-		onSuggestionClick?: (suggestion: SuggestionItem, event?: React.MouseEvent) => void
+		onSuggestionClick?: (suggestion: SuggestionItem, event?: React.MouseEvent, questionId?: string) => void
 		isFollowUpAnswered?: boolean
 	}) {
 		if (message.type === "ask" && message.ask === "followup" && message.text) {
@@ -70,7 +71,7 @@ vi.mock("../ChatRow", () => ({
 								key={suggestion.answer}
 								type="button"
 								data-testid="followup-suggestion"
-								onClick={(event) => onSuggestionClick?.(suggestion, event)}>
+								onClick={(event) => onSuggestionClick?.(suggestion, event, message.questionId)}>
 								{suggestion.answer}
 							</button>
 						))}
@@ -1380,6 +1381,55 @@ describe("ChatView - Follow-up Suggestions", () => {
 		vscodePostMessageMock.cleanup()
 	})
 
+	it("binds follow-up answers to task/question identity and ignores stale row suggestions", async () => {
+		const { getByRole } = renderChatView()
+		mockPostMessage({
+			currentTaskItem: {
+				id: "task-owned",
+				number: 1,
+				ts: 1,
+				task: "Initial",
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			},
+			clineMessages: [
+				{ type: "say", say: "task", ts: 1, text: "Initial" },
+				{
+					type: "ask",
+					ask: "followup",
+					ts: 2,
+					questionId: "old",
+					text: JSON.stringify({ question: "Old?", suggest: [{ answer: "Stale answer", mode: "code" }] }),
+				},
+				{
+					type: "ask",
+					ask: "followup",
+					ts: 3,
+					questionId: "current",
+					text: JSON.stringify({ question: "Current?", suggest: [{ answer: "Owned answer" }] }),
+				},
+			],
+		})
+		const stale = await waitFor(() => getByRole("button", { name: "Stale answer" }))
+		vscodePostMessageMock.cleanup()
+		fireEvent.click(stale)
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "askResponse" }))
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "mode" }))
+		fireEvent.click(getByRole("button", { name: "Owned answer" }))
+		await waitFor(() =>
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "askResponse",
+				askResponse: "messageResponse",
+				taskId: "task-owned",
+				questionId: "current",
+				explicitAnswer: true,
+				text: "Owned answer",
+				images: [],
+			}),
+		)
+	})
+
 	it("switches to a known mode from a malformed object mode suggestion", async () => {
 		const { getByRole } = renderChatView()
 
@@ -1417,6 +1467,9 @@ describe("ChatView - Follow-up Suggestions", () => {
 		expect(vscode.postMessage).toHaveBeenCalledWith({
 			type: "askResponse",
 			askResponse: "messageResponse",
+			taskId: undefined,
+			questionId: undefined,
+			explicitAnswer: true,
 			text: "Use code mode",
 			images: [],
 		})
@@ -1457,6 +1510,9 @@ describe("ChatView - Follow-up Suggestions", () => {
 			expect(vscode.postMessage).toHaveBeenCalledWith({
 				type: "askResponse",
 				askResponse: "messageResponse",
+				taskId: undefined,
+				questionId: undefined,
+				explicitAnswer: true,
 				text: "Use invalid mode",
 				images: [],
 			})
@@ -1517,6 +1573,9 @@ describe("ChatView - Follow-up Suggestions", () => {
 			expect(vscode.postMessage).toHaveBeenCalledWith({
 				type: "askResponse",
 				askResponse: "messageResponse",
+				taskId: undefined,
+				questionId: undefined,
+				explicitAnswer: true,
 				text: "Valid answer",
 				images: [],
 			})
