@@ -359,6 +359,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	api: ApiHandler
 	private rateLimitClock: RateLimitClock
 	private autoApprovalHandler: AutoApprovalHandler
+	/** Scoped to the active queue dispatch; never derived from global auto-approval settings. */
+	public queueSubtaskApprovalAllowed?: () => boolean
 
 	toolRepetitionDetector: ToolRepetitionDetector
 	rooIgnoreController?: RooIgnoreController
@@ -1643,11 +1645,29 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// The path inside `text` was made relative to this task's workspace,
 		// which for a resumed or child task need not be the one the provider
 		// currently reports.
-		const approval = queuedAskResolution
+		let approval = queuedAskResolution
 			? ({ decision: "ask" } as const)
 			: await checkAutoApproval({ state, cwd: this.cwd, ask: type, text, isProtected })
+		if (
+			approval.decision === "ask" &&
+			!queuedAskResolution &&
+			!isProtected &&
+			state?.autoApprovalEnabled &&
+			type === "tool" &&
+			this.queueSubtaskApprovalAllowed?.()
+		) {
+			try {
+				const tool = JSON.parse(text ?? "") as { tool?: string }
+				if (tool.tool === "newTask" || (tool.tool === "finishTask" && this.parentTaskId)) {
+					approval = { decision: "approve" }
+				}
+			} catch {
+				/* Malformed tool payloads require explicit approval. */
+			}
+		}
 		const isAutoAnswered = approval.decision === "approve" || approval.decision === "deny"
-		const autoApprovalDecision = isAutoAnswered ? approval.decision : undefined
+		const autoApprovalDecision =
+			approval.decision === "approve" ? "approve" : approval.decision === "deny" ? "deny" : undefined
 
 		if (partial !== undefined) {
 			const lastMessage = this.clineMessages.at(-1)

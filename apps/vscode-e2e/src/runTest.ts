@@ -94,6 +94,8 @@ async function main() {
 	const extensionTestsPath = path.resolve(__dirname, "./suite/index")
 
 	let testWorkspace: string | undefined
+	let testUserData: string | undefined
+	let testExtensions: string | undefined
 	let scenarioWorkspace: Awaited<ReturnType<typeof createScenarioWorkspace>> | undefined
 
 	try {
@@ -101,6 +103,8 @@ async function main() {
 		// all of their paths under the dedicated scenario root below.
 		if (!isRestartPersistenceTest) {
 			testWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "roo-test-workspace-"))
+			testUserData = await fs.mkdtemp(path.join(os.tmpdir(), "roo-test-user-data-"))
+			testExtensions = await fs.mkdtemp(path.join(os.tmpdir(), "roo-test-extensions-"))
 		}
 
 		if (useMock) {
@@ -174,8 +178,13 @@ async function main() {
 		// - TEST_FILE="task.test.js" npm run test:e2e
 
 		// Pass test filters and mock URL as environment variables to the test runner
+		const { ROO_CODE_IPC_SOCKET_PATH: _ignoredProductionSocket, ...safeTestEnvironment } = process.env
 		const extensionTestsEnv = {
-			...process.env,
+			...safeTestEnvironment,
+			...(testUserData &&
+				testFile?.includes("queue-nested-delegation.test") && {
+					ROO_CODE_IPC_SOCKET_PATH: path.join(testUserData, "isolated-queue.sock"),
+				}),
 			...(testGrep && { TEST_GREP: testGrep }),
 			...(testFile && { TEST_FILE: testFile }),
 			...(mock && { AIMOCK_URL: mock.url }),
@@ -212,7 +221,7 @@ async function main() {
 			await runTests({
 				extensionDevelopmentPath,
 				extensionTestsPath,
-				launchArgs: [testWorkspace],
+				launchArgs: [`--user-data-dir=${testUserData}`, `--extensions-dir=${testExtensions}`, testWorkspace],
 				extensionTestsEnv,
 				version: vscodeVersion,
 			})
@@ -224,6 +233,8 @@ async function main() {
 		if (testWorkspace) {
 			await fs.rm(testWorkspace, { recursive: true, force: true })
 		}
+		if (testUserData) await fs.rm(testUserData, { recursive: true, force: true })
+		if (testExtensions) await fs.rm(testExtensions, { recursive: true, force: true })
 		if (scenarioWorkspace) {
 			await removeScenarioWorkspace(scenarioWorkspace)
 		}

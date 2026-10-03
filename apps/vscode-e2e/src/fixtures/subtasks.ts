@@ -3,6 +3,11 @@ import type { ChatCompletionRequest } from "@copilotkit/aimock"
 
 import { toolResultContains } from "./tool-result"
 
+export const TWO_LEVEL_ROOT = "TWO_LEVEL_ROOT_BOUNDARY"
+const TWO_LEVEL_CHILD = "TWO_LEVEL_CHILD_BOUNDARY"
+const TWO_LEVEL_GRANDCHILD = "TWO_LEVEL_GRANDCHILD_BOUNDARY"
+export const TWO_LEVEL_ROOT_PROMPT = `${TWO_LEVEL_ROOT}: delegate to ask mode with message ${TWO_LEVEL_CHILD}`
+
 const SUBTASK_PARENT_MARKER = "SUBTASK_PARENT_CANCELLATION_SMOKE"
 const SUBTASK_CHILD_MARKER = "SUBTASK_CHILD_CALCULATOR_SMOKE"
 const SUBTASK_INTERRUPT_PARENT_MARKER = "SUBTASK_PARENT_INTERRUPT_RESUME"
@@ -127,6 +132,64 @@ const completionAfterAnswer = (followupId: string, completionId: string) => ({
 })
 
 export function addSubtaskFixtures(mock: InstanceType<typeof LLMock>) {
+	for (const [marker, next, id] of [
+		[TWO_LEVEL_ROOT, TWO_LEVEL_CHILD, "root"],
+		[TWO_LEVEL_CHILD, TWO_LEVEL_GRANDCHILD, "child"],
+	] as const) {
+		mock.addFixture({
+			match: {
+				predicate: (req: ChatCompletionRequest) =>
+					lastUserMessageContains(req, marker) &&
+					!requestContains(req, [SUBTASK_RESULT_INJECTION]) &&
+					(marker !== TWO_LEVEL_CHILD || !requestContains(req, [TWO_LEVEL_ROOT])),
+			},
+			response: {
+				toolCalls: [
+					{
+						name: "new_task",
+						id: `call_two_level_${id}`,
+						arguments: JSON.stringify({ mode: "ask", message: next }),
+					},
+				],
+			},
+		})
+	}
+	mock.addFixture({
+		match: {
+			predicate: (req: ChatCompletionRequest) =>
+				lastUserMessageContains(req, TWO_LEVEL_GRANDCHILD) && !requestContains(req, [TWO_LEVEL_CHILD]),
+		},
+		response: {
+			toolCalls: [
+				{
+					name: "attempt_completion",
+					id: "call_two_level_finish_grandchild",
+					arguments: JSON.stringify({ result: "Grandchild finished" }),
+				},
+			],
+		},
+	})
+	for (const [marker, result, id] of [
+		[TWO_LEVEL_CHILD, "Child resumed", "child"],
+		[TWO_LEVEL_ROOT, "Root resumed", "root"],
+	] as const) {
+		mock.addFixture({
+			match: {
+				predicate: (req: ChatCompletionRequest) =>
+					requestContains(req, [marker, SUBTASK_RESULT_INJECTION]) &&
+					(id !== "child" || !requestContains(req, [TWO_LEVEL_ROOT])),
+			},
+			response: {
+				toolCalls: [
+					{
+						name: "attempt_completion",
+						id: `call_two_level_finish_${id}`,
+						arguments: JSON.stringify({ result }),
+					},
+				],
+			},
+		})
+	}
 	mock.addFixture({
 		match: {
 			userMessage: new RegExp(SUBTASK_APPROVAL_RESTORE_PARENT_MARKER),

@@ -30,6 +30,7 @@ import { IpcServer } from "@roo-code/ipc"
 import { Package } from "../shared/package"
 import type { Mode } from "../shared/modes"
 import { ClineProvider } from "../core/webview/ClineProvider"
+import type { Task } from "../core/task/Task"
 import { Terminal } from "../integrations/terminal/Terminal"
 import { TerminalRegistry } from "../integrations/terminal/TerminalRegistry"
 import { openClineInNewTab } from "../activate/registerCommands"
@@ -59,6 +60,7 @@ export interface QueueDispatchRecord {
 	rootTaskCompleted?: boolean
 	rootTaskAborted?: boolean
 	fenceActive?: boolean
+	unattendedSubtasks?: boolean
 }
 
 export function canonicalTaskPath(value: string): string {
@@ -400,6 +402,7 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 							rootTaskCompleted: false,
 							rootTaskAborted: false,
 							fenceActive: false,
+							unattendedSubtasks: configuration?.autoApprovalEnabled === true,
 						}
 						this.pendingDispatch = dispatch
 						this.queueDispatches.set(requestId, dispatch)
@@ -1031,6 +1034,15 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 		})
 
 		provider.on(RooCodeEventName.TaskCreated, (task) => {
+			;(task as Task).queueSubtaskApprovalAllowed = () => {
+				const dispatch = this.queueDispatches.get(task.taskId)
+				return (
+					!!dispatch &&
+					!dispatch.fenceActive &&
+					!dispatch.ownershipReleased &&
+					dispatch.unattendedSubtasks === true
+				)
+			}
 			if (this.pendingDispatch && !this.pendingDispatch.rootTaskId) {
 				this.pendingDispatch.rootTaskId = task.taskId
 				this.pendingDispatch.activeTaskId = task.taskId
