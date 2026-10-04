@@ -84,6 +84,23 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 		})
 	})
 
+	it.each([true, false])(
+		"does not supersede a tool approval when rendering assistant text (partial=%s)",
+		async (partial) => {
+			mockTask.assistantMessageContent = [{ type: "text", content: "I will run the tool.", partial }]
+			await presentAssistantMessage(mockTask)
+			expect(mockTask.say).toHaveBeenCalledWith(
+				"text",
+				"I will run the tool.",
+				undefined,
+				partial,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+		},
+	)
+
 	it("returns a matching result when a completed delegation approval is superseded", async () => {
 		mockTask.assistantMessageContent = [
 			{

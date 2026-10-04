@@ -342,7 +342,9 @@ export async function presentAssistantMessage(cline: Task) {
 				content = content.replace(/\s?<\/thinking>/g, "")
 			}
 
-			await cline.say("text", content, undefined, block.partial)
+			// Streamed assistant text can arrive after an auto-approved tool ask is emitted.
+			// It must not supersede that ask while the tool handler awaits its response.
+			await cline.say("text", content, undefined, block.partial, undefined, undefined, { isNonInteractive: true })
 			break
 		}
 		case "tool_use": {
