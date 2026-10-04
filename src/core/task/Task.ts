@@ -2024,6 +2024,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return
 		}
 		if (ownership?.questionId) return
+		if (
+			this.initialStatus === "interrupted" &&
+			this.pendingAction?.kind === "create_subtask" &&
+			this.clineMessages.at(-1)?.ask === "resume_task" &&
+			askResponse !== "messageResponse"
+		) {
+			// Continue cannot resolve this unfinished tool call or consume its waiter.
+			return
+		}
 		// Clear any pending auto-approval timeout when user responds
 		this.cancelAutoApprovalTimeout()
 

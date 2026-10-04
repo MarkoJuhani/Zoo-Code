@@ -423,7 +423,12 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						case "resume_task":
 							setSendingDisabled(false)
 							setClineAsk("resume_task")
-							setEnableButtons(true)
+							// An interrupted create handoff can only be recovered by a message.
+							// Continue must not imply that a child was started or the call resolved.
+							const awaitingRecoveryMessage =
+								currentTaskItem?.status === "interrupted" &&
+								currentTaskItem.pendingAction?.kind === "create_subtask"
+							setEnableButtons(!awaitingRecoveryMessage)
 							// For completed subtasks, show "Start New Task" instead of "Resume"
 							// A subtask is considered completed if:
 							// - It has a parentTaskId AND
@@ -435,6 +440,9 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 								)
 							if (isCompletedSubtask) {
 								setPrimaryButtonText(t("chat:startNewTask.title"))
+								setSecondaryButtonText(undefined)
+							} else if (awaitingRecoveryMessage) {
+								setPrimaryButtonText(undefined)
 								setSecondaryButtonText(undefined)
 							} else {
 								setPrimaryButtonText(t("chat:resumeTask.title"))
@@ -664,7 +672,6 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						clineAskRef.current === "command_output")
 				) {
 					try {
-						console.log("queueMessage", text, images)
 						vscode.postMessage({ type: "queueMessage", text, images })
 						setInputValue("")
 						setSelectedImages([])

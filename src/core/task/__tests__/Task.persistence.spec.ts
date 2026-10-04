@@ -1885,6 +1885,40 @@ describe("Task persistence", () => {
 			)
 		})
 
+		it("keeps the interrupted recovery ask owned after Continue", () => {
+			const action: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: "create-action",
+				approvalText: "newTask",
+				mode: "ask",
+				message: "Child",
+				todos: [],
+			}
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				startTask: false,
+				initialStatus: "interrupted",
+				historyItem: {
+					id: "recovery-continue",
+					number: 1,
+					ts: 1,
+					task: "Parent",
+					status: "interrupted",
+					pendingAction: action,
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+				},
+			})
+			task.clineMessages.push({ ts: 1, type: "ask", ask: "resume_task" })
+			task.handleWebviewAskResponse("yesButtonClicked")
+			expect(task["askResponse"]).toBeUndefined()
+			task.handleWebviewAskResponse("messageResponse", "User feedback")
+			expect(task["askResponse"]).toBe("messageResponse")
+			expect(task["askResponseText"]).toBe("User feedback")
+		})
+
 		it("retains queued feedback if the recovery result cannot be saved", async () => {
 			const action: PendingTaskAction = {
 				kind: "create_subtask",
