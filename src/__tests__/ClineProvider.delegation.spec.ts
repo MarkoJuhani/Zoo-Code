@@ -93,6 +93,43 @@ const runDelegationTransition = (ClineProvider.prototype as unknown as Delegatio
 	.runDelegationTransition
 
 describe("ClineProvider.delegateParentAndOpenChild()", () => {
+	it("rejects an interrupted parent before disposing it or creating a child", async () => {
+		const pendingAction = {
+			kind: "create_subtask" as const,
+			actionId: "create-action",
+			approvalText: "{}",
+			mode: "code",
+			message: "Do something",
+			todos: [],
+		}
+		const parentTask = makeParentTask()
+		const removeClineFromStack = vi.fn()
+		const createTask = vi.fn()
+		const taskHistoryStore = makeStoreStub({
+			get: vi.fn().mockReturnValue({ ...parentHistoryItem, status: "interrupted", pendingAction }),
+		})
+		const provider = prepareProvider({
+			getCurrentTask: vi.fn(() => parentTask),
+			removeClineFromStack,
+			createTask,
+			taskHistoryStore,
+		})
+
+		await expect(
+			ClineProvider.prototype.delegateParentAndOpenChild.call(provider, {
+				parentTaskId: "parent-1",
+				message: "Do something",
+				initialTodos: [],
+				mode: "code",
+				pendingActionId: "create-action",
+			}),
+		).rejects.toThrow("is interrupted")
+		expect(parentTask.flushPendingToolResultsToHistory).not.toHaveBeenCalled()
+		expect(removeClineFromStack).not.toHaveBeenCalled()
+		expect(createTask).not.toHaveBeenCalled()
+		expect(taskHistoryStore.atomicReadAndUpdate).not.toHaveBeenCalled()
+	})
+
 	it("rejects a stale restored action before delegation side effects", async () => {
 		const parentTask = makeParentTask()
 		const removeClineFromStack = vi.fn()

@@ -1751,6 +1751,56 @@ describe("Task persistence", () => {
 	})
 
 	describe("resumeTaskFromHistory", () => {
+		it("opens an interrupted pending delegation without replaying or rewriting it", async () => {
+			const pendingAction: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: "create-action",
+				approvalText: JSON.stringify({ tool: "newTask" }),
+				mode: "ask",
+				message: "Do something",
+				todos: [],
+			}
+			const messages: ClineMessage[] = [{ ts: 1, type: "say", say: "text", text: "Saved conversation" }]
+			mockReadTaskMessages.mockResolvedValue(messages)
+			mockReadApiMessages.mockResolvedValue([
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: "create-action", name: "new_task", input: {} }],
+				},
+			])
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				historyItem: {
+					id: "interrupted-pending-parent",
+					number: 1,
+					ts: 1,
+					task: "Saved conversation",
+					status: "interrupted",
+					pendingAction,
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+				},
+				initialStatus: "interrupted",
+				startTask: false,
+			})
+			const ask = vi.spyOn(task, "ask")
+			const delegate = vi.spyOn(mockProvider, "delegateParentAndOpenChild")
+
+			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
+
+			expect(task.clineMessages).toEqual(expect.arrayContaining([expect.objectContaining(messages[0])]))
+			expect(task.apiConversationHistory).toHaveLength(1)
+			expect(task["pendingAction"]).toEqual(pendingAction)
+			expect(mockProvider.postStateToWebviewWithoutTaskHistory).toHaveBeenCalled()
+			expect(ask).not.toHaveBeenCalled()
+			expect(delegate).not.toHaveBeenCalled()
+			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
+			expect(mockSaveApiMessages).not.toHaveBeenCalled()
+			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalled()
+		})
+
 		it.each(["not_found", "invalid", "io_error"] as const)(
 			"does not persist when hydration fails with %s",
 			async (kind) => {

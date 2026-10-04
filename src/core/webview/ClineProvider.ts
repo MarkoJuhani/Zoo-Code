@@ -3932,6 +3932,11 @@ export class ClineProvider
 		if (pendingActionId && authoritativeParent.pendingAction?.actionId !== pendingActionId) {
 			throw new Error(`[delegateParentAndOpenChild] Pending action mismatch for parent ${parentTaskId}`)
 		}
+		if (authoritativeParent.status === "interrupted") {
+			throw new Error(
+				`[delegateParentAndOpenChild] Parent ${parentTaskId} is interrupted; refusing to dispose it for delegation`,
+			)
+		}
 
 		const parentExecutionContext: DelegatedChildContext = {
 			mode,

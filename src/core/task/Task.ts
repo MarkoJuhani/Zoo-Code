@@ -2665,6 +2665,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				return
 			}
 
+			if (this.pendingAction?.kind === "create_subtask" && this.initialStatus === "interrupted") {
+				// Keep the saved approval/action and history intact. Replaying it here
+				// would dispose this chat before an interrupted parent can delegate.
+				this.isInitialized = true
+				await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
+				void vscode.window.showErrorMessage(
+					"This interrupted chat has an unfinished subtask handoff. Opening it will not start a child; reconcile the saved action before delegation continues.",
+				)
+				return
+			}
+
 			if (this.pendingAction) {
 				this.isInitialized = true
 				await this.resumePendingTaskAction(this.pendingAction)
