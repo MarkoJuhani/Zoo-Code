@@ -436,6 +436,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	userMessageContent: (Anthropic.TextBlockParam | Anthropic.ImageBlockParam | Anthropic.ToolResultBlockParam)[] = []
 	userMessageContentReady = false
 
+	/** A ready signal alone cannot finish a turn while its tool presenter still owns a block. */
+	public isAssistantTurnPresentationComplete(): boolean {
+		return (
+			this.userMessageContentReady &&
+			!this.presentAssistantMessageLocked &&
+			this.currentStreamingContentIndex >= this.assistantMessageContent.length
+		)
+	}
+
 	/**
 	 * Flag indicating whether the assistant message for the current streaming session
 	 * has been saved to API conversation history.
@@ -4386,7 +4395,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					await pWaitFor(
 						() =>
-							this.userMessageContentReady ||
+							this.isAssistantTurnPresentationComplete() ||
 							this.abort ||
 							this.abandoned ||
 							this.isDelegatedCompletionStopped,

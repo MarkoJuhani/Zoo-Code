@@ -117,12 +117,16 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 			}
 
 			const didApprove = await askApproval("tool", toolMessage)
+			console.info(
+				`[new_task] approval task=${task.taskId} action=${pendingActionId ?? "none"} approved=${didApprove}`,
+			)
 
 			if (!didApprove) {
 				return
 			}
 
 			// Delegate parent and open child as sole active task
+			console.info(`[new_task] delegation_begin task=${task.taskId} action=${pendingActionId ?? "none"}`)
 			const child = await (provider as any).delegateParentAndOpenChild({
 				parentTaskId: task.taskId,
 				message: unescapedMessage,
@@ -130,11 +134,15 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 				mode,
 				...(pendingActionId && { pendingActionId }),
 			})
+			console.info(
+				`[new_task] delegation_returned task=${task.taskId} child=${child.taskId} action=${pendingActionId ?? "none"}`,
+			)
 
 			// Reflect delegation in tool result (no pause/unpause, no wait)
 			pushToolResult(`Delegated to child task ${child.taskId}`)
 			return
 		} catch (error) {
+			console.error(`[new_task] delegation_failed task=${task.taskId} action=${toolCallId ?? "none"}`, error)
 			await handleError("creating new task", error)
 			return
 		}

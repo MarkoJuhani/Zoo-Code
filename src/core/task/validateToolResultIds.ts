@@ -215,6 +215,11 @@ export function validateAndFixToolResultIds(
 	)
 
 	const stillMissingToolUseIds = toolUseBlocks.filter((toolUse) => !coveredToolUseIds.has(toolUse.id))
+	for (const toolUse of stillMissingToolUseIds) {
+		if (toolUse.name === "new_task") {
+			console.warn(`[new_task] synthesized_interruption action=${toolUse.id}`)
+		}
+	}
 
 	// Build final content: add missing tool_results at the beginning if any
 	const missingToolResults: Anthropic.ToolResultBlockParam[] = stillMissingToolUseIds.map((toolUse) => ({

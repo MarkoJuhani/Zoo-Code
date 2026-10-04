@@ -501,6 +501,27 @@ describe("Cline", () => {
 		})
 	})
 
+	describe("assistant turn presentation readiness", () => {
+		it("waits for both presenter unlock and consumption of the final tool block", () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "delegate",
+				startTask: false,
+			})
+			task.assistantMessageContent = [
+				{ type: "tool_use", id: "call_delegate", name: "new_task", params: {}, partial: false },
+			]
+			task.userMessageContentReady = true
+			task.presentAssistantMessageLocked = true
+			expect(task.isAssistantTurnPresentationComplete()).toBe(false)
+			task.presentAssistantMessageLocked = false
+			expect(task.isAssistantTurnPresentationComplete()).toBe(false)
+			task.currentStreamingContentIndex = 1
+			expect(task.isAssistantTurnPresentationComplete()).toBe(true)
+		})
+	})
+
 	describe("empty-response retries", () => {
 		function stream(chunks: ApiStreamChunk[]): AsyncGenerator<ApiStreamChunk> {
 			return (async function* () {

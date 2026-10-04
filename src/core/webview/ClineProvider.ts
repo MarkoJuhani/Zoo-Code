@@ -3979,7 +3979,11 @@ export class ClineProvider
 		//    recursivelyMakeClineRequests BEFORE tools start executing. We only need to
 		//    flush the pending user message with tool_results.
 		try {
+			console.info(
+				`[new_task] parent_flush_begin task=${parentTaskId} action=${pendingActionId ?? "none"} pendingResults=${parent.userMessageContent.filter((item) => item.type === "tool_result").length}`,
+			)
 			const flushSuccess = await parent.flushPendingToolResultsToHistory()
+			console.info(`[new_task] parent_flush_end task=${parentTaskId} saved=${flushSuccess}`)
 
 			if (!flushSuccess) {
 				console.warn(`[delegateParentAndOpenChild] Flush failed for parent ${parentTaskId}, retrying...`)
@@ -4138,6 +4142,9 @@ export class ClineProvider
 
 		// 6) Register lineage before scheduling so no child-owned progress is untracked.
 		// 7) Emit TaskDelegated (provider-level)
+		console.info(
+			`[new_task] ownership_committed task=${parentTaskId} child=${child.taskId} action=${pendingActionId ?? "none"}`,
+		)
 		try {
 			this.emit(RooCodeEventName.TaskDelegated, parentTaskId, child.taskId, transition)
 		} catch {

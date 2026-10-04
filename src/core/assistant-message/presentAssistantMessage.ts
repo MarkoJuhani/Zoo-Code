@@ -133,6 +133,9 @@ export async function presentAssistantMessage(cline: Task) {
 	switch (finalizationFailed ? "finalization_failed" : block.type) {
 		case "finalization_failed": {
 			if (block.partial) break
+			if (block.name === "new_task") {
+				console.warn(`[new_task] finalization_failed task=${cline.taskId} action=${block.id ?? "none"}`)
+			}
 			const errorMessage = `Invalid tool call for '${block.name}': arguments could not be finalized.`
 			cline.consecutiveMistakeCount++
 			cline.recordToolError("invalid_tool_call", errorMessage)
@@ -461,6 +464,9 @@ export async function presentAssistantMessage(cline: Task) {
 				const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined
 				const isKnownTool = isValidToolName(String(block.name), stateExperiments)
 				if (isKnownTool && !block.nativeArgs && !customTool) {
+					if (block.name === "new_task") {
+						console.warn(`[new_task] missing_native_args task=${cline.taskId} action=${toolCallId}`)
+					}
 					const errorMessage =
 						`Invalid tool call for '${block.name}': missing nativeArgs. ` +
 						`This usually means the model streamed invalid or incomplete arguments and the call could not be finalized.`
