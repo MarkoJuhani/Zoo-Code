@@ -1,4 +1,5 @@
 import { Task } from "../Task"
+import type { PendingTaskAction } from "@roo-code/types"
 
 type QueueTaskTestAccess = {
 	say: Task["say"]
@@ -46,6 +47,26 @@ describe("Task.ask queued message drain", () => {
 		const result = await askPromise
 		expect(result.response).toBe("messageResponse")
 		expect(result.text).toBe("picked answer")
+	})
+
+	it("retains a late recovery message until the interrupted handoff is durably resolved", async () => {
+		const task = await createTask()
+		const access = task as unknown as { initialStatus: "interrupted"; pendingAction: PendingTaskAction }
+		access.initialStatus = "interrupted"
+		access.pendingAction = {
+			kind: "create_subtask",
+			actionId: "create-action",
+			approvalText: "newTask",
+			mode: "ask",
+			message: "Child",
+			todos: [],
+		}
+		const askPromise = task.ask("resume_task")
+		const queued = task.messageQueueService.addMessage("Continue without child")!
+		const result = await askPromise
+		expect(result).toMatchObject({ response: "messageResponse", text: queued.text, queuedMessageId: queued.id })
+		expect(task.messageQueueService.messages).toContainEqual(queued)
+		expect(task.messageQueueService.claimNextMessage()).toBeUndefined()
 	})
 
 	it("does not consume queued messages for command_output asks", async () => {

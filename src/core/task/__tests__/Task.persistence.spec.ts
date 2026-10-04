@@ -27,6 +27,7 @@ type TaskPersistenceAccess = {
 	resolveAssistantMessagePersistence: (result: boolean) => void
 	assistantMessagePersistenceCancellation?: { resolve: () => void }
 	resumeTaskFromHistory: () => Promise<void>
+	resumeInterruptedCreateSubtask: (action: PendingTaskAction) => Promise<void>
 	resumePendingTaskAction: (action: PendingTaskAction) => Promise<void>
 	saveClineMessages: () => Promise<boolean>
 	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
@@ -1786,19 +1787,207 @@ describe("Task persistence", () => {
 				startTask: false,
 			})
 			const ask = vi.spyOn(task, "ask")
+			const pendingResponse = createDeferred<Awaited<ReturnType<Task["ask"]>>>()
+			ask.mockImplementation(() => pendingResponse.promise)
 			const delegate = vi.spyOn(mockProvider, "delegateParentAndOpenChild")
 
-			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
+			const resume = getTaskPersistenceAccess(task).resumeTaskFromHistory()
+			await vi.waitFor(() => expect(ask).toHaveBeenCalledWith("resume_task"))
 
 			expect(task.clineMessages).toEqual(expect.arrayContaining([expect.objectContaining(messages[0])]))
 			expect(task.apiConversationHistory).toHaveLength(1)
 			expect(task["pendingAction"]).toEqual(pendingAction)
 			expect(mockProvider.postStateToWebviewWithoutTaskHistory).toHaveBeenCalled()
-			expect(ask).not.toHaveBeenCalled()
+			expect(ask).toHaveBeenCalledTimes(1)
 			expect(delegate).not.toHaveBeenCalled()
 			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
 			expect(mockSaveApiMessages).not.toHaveBeenCalled()
 			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalled()
+			pendingResponse.resolve({ response: "noButtonClicked" })
+			await resume
+		})
+
+		it.each([false, true])("recovers a matching interrupted handoff with queued feedback=%s", async (queued) => {
+			const action: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: "create-action",
+				approvalText: "newTask",
+				mode: "ask",
+				message: "Child",
+				todos: [],
+			}
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				startTask: false,
+				initialStatus: "interrupted",
+				historyItem: {
+					id: "recover-parent",
+					number: 1,
+					ts: 1,
+					task: "Parent",
+					status: "interrupted",
+					pendingAction: action,
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+				},
+			})
+			const access = getTaskPersistenceAccess(task)
+			const claimed = queued ? task.messageQueueService.addMessage("Continue without child") : undefined
+			vi.spyOn(task, "ask").mockResolvedValue({
+				response: "messageResponse",
+				text: "Continue without child",
+				queuedMessageId: claimed?.id,
+			})
+			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
+				kind: "found",
+				item: { id: task.taskId, status: "interrupted", pendingAction: action },
+			} as Awaited<ReturnType<ClineProvider["getTaskMetadata"]>>)
+			mockReadApiMessages.mockResolvedValue([
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: action.actionId, name: "new_task", input: {} }],
+				},
+			])
+			mockSaveApiMessages.mockImplementation(async ({ messages }: { messages: Anthropic.MessageParam[] }) => {
+				mockReadApiMessages.mockResolvedValue(messages)
+			})
+			vi.spyOn(mockProvider, "clearPendingTaskAction").mockResolvedValue(true)
+			const delegate = vi.spyOn(mockProvider, "delegateParentAndOpenChild")
+			const loop = vi.spyOn(access, "initiateTaskLoop").mockResolvedValue(undefined)
+			await access.resumeInterruptedCreateSubtask(action)
+			expect(mockSaveApiMessages).toHaveBeenCalledWith(
+				expect.objectContaining({
+					messages: expect.arrayContaining([
+						expect.objectContaining({
+							role: "user",
+							content: expect.arrayContaining([
+								expect.objectContaining({
+									type: "tool_result",
+									tool_use_id: action.actionId,
+									is_error: true,
+								}),
+							]),
+						}),
+					]),
+				}),
+			)
+			expect(loop).toHaveBeenCalledWith(
+				expect.arrayContaining([
+					expect.objectContaining({ type: "text", text: expect.stringContaining("Continue without child") }),
+				]),
+			)
+			expect(task.messageQueueService.isEmpty()).toBe(true)
+			expect(delegate).not.toHaveBeenCalled()
+			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalledWith(
+				expect.objectContaining({ status: "active" }),
+			)
+		})
+
+		it("retains queued feedback if the recovery result cannot be saved", async () => {
+			const action: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: "create-action",
+				approvalText: "newTask",
+				mode: "ask",
+				message: "Child",
+				todos: [],
+			}
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				startTask: false,
+				initialStatus: "interrupted",
+				historyItem: {
+					id: "recover-parent",
+					number: 1,
+					ts: 1,
+					task: "Parent",
+					status: "interrupted",
+					pendingAction: action,
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+				},
+			})
+			const item = task.messageQueueService.addMessage("Keep me")!
+			task.messageQueueService.claimNextMessage()
+			vi.spyOn(task, "ask").mockResolvedValue({
+				response: "messageResponse",
+				text: item.text,
+				queuedMessageId: item.id,
+			})
+			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
+				kind: "found",
+				item: { id: task.taskId, status: "interrupted", pendingAction: action },
+			} as Awaited<ReturnType<ClineProvider["getTaskMetadata"]>>)
+			mockReadApiMessages.mockResolvedValue([
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: action.actionId, name: "new_task", input: {} }],
+				},
+			])
+			mockSaveApiMessages.mockRejectedValue(new Error("save failed"))
+			const access = getTaskPersistenceAccess(task)
+			const loop = vi.spyOn(access, "initiateTaskLoop").mockResolvedValue(undefined)
+			await expect(access.resumeInterruptedCreateSubtask(action)).rejects.toThrow("not durably saved")
+			expect(task.messageQueueService.messages).toContainEqual(item)
+			expect(task.messageQueueService.claimNextMessage()).toEqual(item)
+			expect(task["pendingAction"]).toEqual(action)
+			expect(loop).not.toHaveBeenCalled()
+		})
+
+		it("refuses a changed pending-action owner without consuming queued feedback", async () => {
+			const action: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: "old-action",
+				approvalText: "newTask",
+				mode: "ask",
+				message: "Child",
+				todos: [],
+			}
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				startTask: false,
+				initialStatus: "interrupted",
+				historyItem: {
+					id: "recover-parent",
+					number: 1,
+					ts: 1,
+					task: "Parent",
+					status: "interrupted",
+					pendingAction: action,
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+				},
+			})
+			const item = task.messageQueueService.addMessage("Do not lose this")!
+			task.messageQueueService.claimNextMessage()
+			vi.spyOn(task, "ask").mockResolvedValue({
+				response: "messageResponse",
+				text: item.text,
+				queuedMessageId: item.id,
+			})
+			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
+				kind: "found",
+				item: { id: task.taskId, status: "interrupted", pendingAction: { ...action, actionId: "new-action" } },
+			} as Awaited<ReturnType<ClineProvider["getTaskMetadata"]>>)
+			mockReadApiMessages.mockResolvedValue([
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: action.actionId, name: "new_task", input: {} }],
+				},
+			])
+			const loop = vi.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop").mockResolvedValue(undefined)
+			await expect(getTaskPersistenceAccess(task).resumeInterruptedCreateSubtask(action)).rejects.toThrow(
+				"Ownership or API boundary changed",
+			)
+			expect(task.messageQueueService.claimNextMessage()).toEqual(item)
+			expect(mockSaveApiMessages).not.toHaveBeenCalled()
+			expect(loop).not.toHaveBeenCalled()
 		})
 
 		it.each(["not_found", "invalid", "io_error"] as const)(

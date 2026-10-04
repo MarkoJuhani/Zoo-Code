@@ -1657,7 +1657,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const state = provider ? await provider.getState() : undefined
 		const queuedMessage =
 			partial === true || type === "command_output" ? undefined : this.messageQueueService.claimNextMessage()
-		const queuedAskResolution = queuedMessage ? queuedResponseForAsk(type, text) : undefined
+		const queuedAskResolution = queuedMessage
+			? type === "resume_task" &&
+				this.initialStatus === "interrupted" &&
+				this.pendingAction?.kind === "create_subtask"
+				? { response: "messageResponse" as const, requiresDurableAck: true }
+				: queuedResponseForAsk(type, text)
+			: undefined
 		// `this.cwd`, not `provider.cwd`:
 		// The path inside `text` was made relative to this task's workspace,
 		// which for a resumed or child task need not be the one the provider
@@ -1904,7 +1910,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						!this.messageQueueService.isEmpty()
 					) {
 						const message = this.messageQueueService.claimNextMessage()
-						const resolution = message ? queuedResponseForAsk(type, text) : undefined
+						const resolution = message
+							? type === "resume_task" &&
+								this.initialStatus === "interrupted" &&
+								this.pendingAction?.kind === "create_subtask"
+								? { response: "messageResponse" as const, requiresDurableAck: true }
+								: queuedResponseForAsk(type, text)
+							: undefined
 						if (message && resolution) {
 							queuedMessageId = this.handleQueuedAskResponse(message, resolution)
 						}
@@ -2669,10 +2681,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Keep the saved approval/action and history intact. Replaying it here
 				// would dispose this chat before an interrupted parent can delegate.
 				this.isInitialized = true
+				console.warn(
+					`[Task#resumeTaskFromHistory] waiting for recovery feedback task=${this.taskId} action=${this.pendingAction.actionId} apiMessages=${this.apiConversationHistory.length} queued=${this.messageQueueService.messages.length}; delegation is not replayed`,
+				)
 				await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
 				void vscode.window.showErrorMessage(
-					"This interrupted chat has an unfinished subtask handoff. Opening it will not start a child; reconcile the saved action before delegation continues.",
+					"This interrupted chat has an unfinished subtask handoff. No child will start; send a message to continue the chat without completing that handoff.",
 				)
+				await this.resumeInterruptedCreateSubtask(this.pendingAction)
 				return
 			}
 
@@ -2873,6 +2889,80 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 			throw error
 		}
+	}
+
+	private async resumeInterruptedCreateSubtask(action: PendingTaskAction): Promise<void> {
+		const { response, text, images, queuedMessageId } = await this.ask("resume_task")
+		if (this.abort || this.abandoned || response !== "messageResponse") {
+			if (queuedMessageId) this.messageQueueService.releaseMessage(queuedMessageId)
+			return
+		}
+		const provider = this.providerRef.deref()
+		const metadata = await provider?.getTaskMetadata(this.taskId)
+		const saved = await this.getSavedApiConversationHistory()
+		const last = saved.at(-1)
+		const matches =
+			metadata?.kind === "found" &&
+			metadata.item.status === "interrupted" &&
+			!metadata.item.awaitingChildId &&
+			metadata.item.pendingAction?.kind === "create_subtask" &&
+			metadata.item.pendingAction.actionId === action.actionId &&
+			this.pendingAction?.actionId === action.actionId &&
+			last?.role === "assistant" &&
+			Array.isArray(last.content) &&
+			last.content.filter((block) => block.type === "tool_use").length === 1 &&
+			last.content.some(
+				(block) => block.type === "tool_use" && block.id === action.actionId && block.name === "new_task",
+			)
+		if (!matches || this.abort || this.abandoned) {
+			if (queuedMessageId) this.messageQueueService.releaseMessage(queuedMessageId)
+			throw new Error(
+				`[Task#resumeInterruptedCreateSubtask] Ownership or API boundary changed for ${this.taskId}`,
+			)
+		}
+		try {
+			await this.say("user_feedback", text ?? "", images)
+			if (!(await this.saveClineMessages())) throw new Error("Recovery feedback was not saved")
+			const result: ApiMessage = {
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: action.actionId,
+						content: "Subtask handoff was interrupted; no child was started by this recovery.",
+						is_error: true,
+					},
+				],
+				messageId: crypto.randomUUID(),
+				ts: Date.now(),
+			}
+			this.apiConversationHistory.push(result)
+			if (!(await this.saveApiConversationHistory()) && !(await this.retrySaveApiConversationHistory()))
+				throw new Error("Recovery result was not durably saved")
+			const persistedResult = (await this.getSavedApiConversationHistory()).at(-1)
+			if (
+				persistedResult?.role !== "user" ||
+				!Array.isArray(persistedResult.content) ||
+				!persistedResult.content.some(
+					(block) =>
+						block.type === "tool_result" &&
+						block.tool_use_id === action.actionId &&
+						block.is_error === true,
+				)
+			)
+				throw new Error("Recovery result read-back did not match the interrupted action")
+			await this.clearPendingActionAfterDurableResult(action.actionId)
+			if (this.pendingAction?.actionId === action.actionId)
+				throw new Error("Recovery result was not durably resolved")
+			if (queuedMessageId) this.messageQueueService.removeMessage(queuedMessageId)
+		} catch (error) {
+			if (queuedMessageId) this.messageQueueService.releaseMessage(queuedMessageId)
+			throw error
+		}
+		await this.initiateTaskLoop([
+			{ type: "text", text: `<user_message>\n${text ?? ""}\n</user_message>` },
+			...formatResponse.imageBlocks(images),
+		])
 	}
 
 	private async resumePendingTaskAction(action: PendingTaskAction): Promise<void> {

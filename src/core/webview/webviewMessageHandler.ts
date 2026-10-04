@@ -3757,7 +3757,11 @@ export const webviewMessageHandler = async (
 
 		case "queueMessage": {
 			const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
-			provider.getCurrentTask()?.messageQueueService.addMessage(resolved.text, resolved.images)
+			const task = provider.getCurrentTask()
+			const queued = task?.messageQueueService.addMessage(resolved.text, resolved.images)
+			provider.log(
+				`[queueMessage] task=${task?.taskId ?? "none"} queued=${queued?.id ?? "none"} status=${task?.taskStatus ?? "none"} queueLength=${task?.queuedMessages.length ?? 0}`,
+			)
 			break
 		}
 		case "removeQueuedMessage": {
