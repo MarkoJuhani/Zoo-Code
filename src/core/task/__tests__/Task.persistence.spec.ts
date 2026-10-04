@@ -1415,6 +1415,48 @@ describe("Task persistence", () => {
 			expect(task.ask).toHaveBeenCalledWith("resume_task")
 		})
 
+		it("replays an interrupted pending action rather than treating the synthesized result as resolution", async () => {
+			mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "Child" }])
+			mockReadApiMessages.mockResolvedValue([
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "finish-action",
+							content: "Tool execution was interrupted before completion.",
+						},
+					],
+				},
+			])
+			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				historyItem: {
+					id: "child-1",
+					number: 1,
+					ts: 1,
+					task: "Child",
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+					pendingAction,
+				},
+				startTask: false,
+			})
+			const replay = vi
+				.spyOn(getTaskPersistenceAccess(task), "resumePendingTaskAction")
+				.mockResolvedValue(undefined)
+			const ask = vi.spyOn(task, "ask")
+
+			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
+
+			expect(replay).toHaveBeenCalledWith(pendingAction)
+			expect(ask).not.toHaveBeenCalled()
+			expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
+		})
+
 		it("clears pending metadata after the matching tool result is saved", async () => {
 			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
 			const task = new Task({
@@ -1439,6 +1481,39 @@ describe("Task persistence", () => {
 			})
 
 			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action")
+		})
+
+		it("retains pending metadata when a matching synthetic interruption is saved", async () => {
+			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				historyItem: {
+					id: "child-1",
+					number: 1,
+					ts: 1,
+					task: "Child",
+					tokensIn: 0,
+					tokensOut: 0,
+					totalCost: 0,
+					pendingAction,
+				},
+				startTask: false,
+			})
+
+			await getTaskPersistenceAccess(task).addToApiConversationHistory({
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "finish-action",
+						content: "Tool execution was interrupted before completion.",
+					},
+				],
+			})
+
+			expect(mockSaveApiMessages).toHaveBeenCalled()
+			expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
 		})
 
 		it("retries a rejected tool-result save before clearing pending metadata", async () => {

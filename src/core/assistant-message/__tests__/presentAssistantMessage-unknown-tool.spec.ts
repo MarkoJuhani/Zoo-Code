@@ -3,8 +3,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
 import { isValidToolName } from "../../tools/validateToolUse"
+import { AskIgnoredError } from "../../task/AskIgnoredError"
 
 const mockNewTaskHandle = vi.hoisted(() => vi.fn())
+const mockWriteToFileHandle = vi.hoisted(() => vi.fn())
 
 // Mock dependencies
 vi.mock("../../task/Task")
@@ -14,6 +16,9 @@ vi.mock("../../tools/validateToolUse", () => ({
 }))
 vi.mock("../../tools/NewTaskTool", () => ({
 	newTaskTool: { handle: mockNewTaskHandle },
+}))
+vi.mock("../../tools/WriteToFileTool", () => ({
+	writeToFileTool: { handle: mockWriteToFileHandle },
 }))
 vi.mock("@roo-code/telemetry", () => ({
 	TelemetryService: {
@@ -29,6 +34,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 
 	beforeEach(() => {
 		mockNewTaskHandle.mockReset()
+		mockWriteToFileHandle.mockReset()
 		// Create a mock Task with minimal properties needed for testing
 		mockTask = {
 			taskId: "test-task-id",
@@ -76,6 +82,61 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			mockTask.userMessageContent.push(toolResult)
 			return true
 		})
+	})
+
+	it("returns a matching result when a completed delegation approval is superseded", async () => {
+		mockTask.assistantMessageContent = [
+			{
+				type: "tool_use",
+				id: "call_superseded",
+				name: "new_task",
+				params: { mode: "ask", message: "child" },
+				nativeArgs: { mode: "ask", message: "child" },
+				partial: false,
+			},
+		]
+		mockNewTaskHandle.mockImplementationOnce(async (_task, _block, callbacks) => {
+			await callbacks.handleError("creating new task", new AskIgnoredError("superseded"))
+		})
+		await presentAssistantMessage(mockTask)
+		expect(mockTask.userMessageContent).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "tool_result",
+					tool_use_id: "call_superseded",
+					content: expect.stringContaining("superseded"),
+				}),
+			]),
+		)
+	})
+
+	it("returns a matching result when a completed ordinary tool approval is superseded", async () => {
+		mockTask.assistantMessageContent = [
+			{
+				type: "tool_use",
+				id: "call_write_superseded",
+				name: "write_to_file",
+				params: { path: "example.txt", content: "test" },
+				nativeArgs: { path: "example.txt", content: "test" },
+				partial: false,
+			},
+		]
+		mockWriteToFileHandle.mockImplementationOnce(async (_task, _block, callbacks) => {
+			await callbacks.handleError("writing file", new AskIgnoredError("superseded"))
+		})
+
+		await presentAssistantMessage(mockTask)
+
+		expect(mockWriteToFileHandle).toHaveBeenCalledOnce()
+		expect(mockTask.userMessageContent).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "tool_result",
+					tool_use_id: "call_write_superseded",
+					content: expect.stringContaining("superseded"),
+				}),
+			]),
+		)
 	})
 
 	it("should return error for unknown tool in native protocol", async () => {

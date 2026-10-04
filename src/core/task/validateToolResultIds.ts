@@ -2,6 +2,8 @@ import { Anthropic } from "@anthropic-ai/sdk"
 import { TelemetryService } from "@roo-code/telemetry"
 import { findLastIndex } from "../../shared/array"
 
+export const interruptedToolResultContent = "Tool execution was interrupted before completion."
+
 /**
  * Custom error class for tool result ID mismatches.
  * Used for structured error tracking via PostHog.
@@ -216,16 +218,14 @@ export function validateAndFixToolResultIds(
 
 	const stillMissingToolUseIds = toolUseBlocks.filter((toolUse) => !coveredToolUseIds.has(toolUse.id))
 	for (const toolUse of stillMissingToolUseIds) {
-		if (toolUse.name === "new_task") {
-			console.warn(`[new_task] synthesized_interruption action=${toolUse.id}`)
-		}
+		console.warn(`[tool-boundary] synthesized_interruption tool=${toolUse.name} action=${toolUse.id}`)
 	}
 
 	// Build final content: add missing tool_results at the beginning if any
 	const missingToolResults: Anthropic.ToolResultBlockParam[] = stillMissingToolUseIds.map((toolUse) => ({
 		type: "tool_result" as const,
 		tool_use_id: toolUse.id,
-		content: "Tool execution was interrupted before completion.",
+		content: interruptedToolResultContent,
 	}))
 
 	// Insert missing tool_results at the beginning of the content array

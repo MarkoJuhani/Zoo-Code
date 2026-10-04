@@ -138,7 +138,7 @@ import { getMessagesSinceLastSummary, summarizeConversation, getEffectiveApiHist
 import { MessageQueueService } from "../message-queue/MessageQueueService"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
-import { validateAndFixToolResultIds } from "./validateToolResultIds"
+import { interruptedToolResultContent, validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
 import { prepareApiConversationMessage } from "./apiConversationHistory"
 import { shouldAddUserMessageToHistory } from "./messageCounting"
@@ -1195,18 +1195,26 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return ensureMessageIdentifiers(messages)
 	}
 
+	private hasResolvedPendingActionResult(message: Anthropic.MessageParam, actionId: string): boolean {
+		return (
+			message.role === "user" &&
+			Array.isArray(message.content) &&
+			message.content.some(
+				(block) =>
+					block.type === "tool_result" &&
+					block.tool_use_id === actionId &&
+					block.content !== interruptedToolResultContent,
+			)
+		)
+	}
+
 	/**
 	 * Appends an API turn and records whether an assistant turn reached persistent storage.
 	 * If the message resolves a pending action, retries the save on initial failure before clearing the action.
 	 */
 	private async addToApiConversationHistory(message: Anthropic.MessageParam, reasoning?: string): Promise<void> {
 		const resolvesPendingAction =
-			this.pendingAction &&
-			message.role === "user" &&
-			Array.isArray(message.content) &&
-			message.content.some(
-				(block) => block.type === "tool_result" && block.tool_use_id === this.pendingAction?.actionId,
-			)
+			this.pendingAction && this.hasResolvedPendingActionResult(message, this.pendingAction.actionId)
 		this.apiConversationHistory.push(
 			prepareApiConversationMessage({
 				message,
@@ -2645,14 +2653,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.hydrateApiConversationHistory(savedApiConversationHistory)
 			if (
 				this.pendingAction &&
-				this.apiConversationHistory.some(
-					(message) =>
-						message.role === "user" &&
-						Array.isArray(message.content) &&
-						message.content.some(
-							(block) =>
-								block.type === "tool_result" && block.tool_use_id === this.pendingAction?.actionId,
-						),
+				this.apiConversationHistory.some((message) =>
+					this.hasResolvedPendingActionResult(message, this.pendingAction!.actionId),
 				)
 			) {
 				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
@@ -3533,6 +3535,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				}
 
 				// Reset streaming state for each new API request
+				if (this.pendingAction?.kind === "create_subtask") {
+					console.warn(
+						`[tool-boundary] request_reset task=${this.taskId} action=${this.pendingAction.actionId} ready=${this.userMessageContentReady} locked=${this.presentAssistantMessageLocked} index=${this.currentStreamingContentIndex}/${this.assistantMessageContent.length} results=${this.userMessageContent
+							.filter((item) => item.type === "tool_result")
+							.map((item) => item.tool_use_id)
+							.join(",")}`,
+					)
+				}
 				this.currentStreamingContentIndex = 0
 				this.currentStreamingDidCheckpoint = false
 				this.assistantMessageContent = []
@@ -4400,6 +4410,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							this.abandoned ||
 							this.isDelegatedCompletionStopped,
 					)
+					if (this.pendingAction?.kind === "create_subtask") {
+						console.warn(
+							`[tool-boundary] turn_ready task=${this.taskId} action=${this.pendingAction.actionId} ready=${this.userMessageContentReady} locked=${this.presentAssistantMessageLocked} index=${this.currentStreamingContentIndex}/${this.assistantMessageContent.length} blocks=${this.assistantMessageContent.map((block) => (block.type === "tool_use" ? block.name : block.type)).join(",")} results=${this.userMessageContent
+								.filter((item) => item.type === "tool_result")
+								.map((item) => item.tool_use_id)
+								.join(",")} abort=${this.abort} abandoned=${this.abandoned}`,
+						)
+					}
 
 					if (this.isDelegatedCompletionStopped || this.hasPendingQuestion) return true
 
@@ -4430,6 +4448,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							return true
 						}
 					} else if (!didToolUse) {
+						const lastAssistant = [...this.apiConversationHistory]
+							.reverse()
+							.find((message) => message.role === "assistant")
+						const savedToolCalls = Array.isArray(lastAssistant?.content)
+							? lastAssistant.content
+									.filter((block) => block.type === "tool_use")
+									.map((block) => `${block.name}:${block.id}`)
+							: []
+						console.warn(
+							`[tool-boundary] no_tool_detected task=${this.taskId} savedCalls=${savedToolCalls.join(",") || "none"} currentBlocks=${this.assistantMessageContent.map((block) => (block.type === "tool_use" ? `${block.name}:${block.id ?? "none"}` : block.type)).join(",") || "none"} ready=${this.userMessageContentReady} locked=${this.presentAssistantMessageLocked} index=${this.currentStreamingContentIndex}/${this.assistantMessageContent.length}`,
+						)
 						// Increment consecutive no-tool-use counter
 						this.consecutiveNoToolUseCount++
 

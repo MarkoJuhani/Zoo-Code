@@ -265,9 +265,13 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 			const handleError = async (action: string, error: Error) => {
-				// Silently ignore AskIgnoredError - this is an internal control flow
-				// signal, not an actual error. It occurs when a newer ask supersedes an older one.
+				// A partial ask needs no result; a complete superseded call must return one.
 				if (error instanceof AskIgnoredError) {
+					if (!block.partial) {
+						pushToolResult(
+							formatResponse.toolError(`Tool ${mcpBlock.name} was superseded before completion.`),
+						)
+					}
 					return
 				}
 				const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`
@@ -600,9 +604,11 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 			const handleError = async (action: string, error: Error) => {
-				// Silently ignore AskIgnoredError - this is an internal control flow
-				// signal, not an actual error. It occurs when a newer ask supersedes an older one.
+				// A partial ask needs no result; a complete superseded call must return one.
 				if (error instanceof AskIgnoredError) {
+					if (!block.partial) {
+						pushToolResult(formatResponse.toolError(`Tool ${block.name} was superseded before completion.`))
+					}
 					return
 				}
 				const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`
@@ -869,6 +875,11 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "new_task":
+					if (!block.partial) {
+						console.info(
+							`[new_task] presenter_dispatch task=${cline.taskId} action=${toolCallId} index=${cline.currentStreamingContentIndex}/${cline.assistantMessageContent.length} locked=${cline.presentAssistantMessageLocked}`,
+						)
+					}
 					await checkpointSaveAndMark(cline)
 					await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
 						askApproval,
