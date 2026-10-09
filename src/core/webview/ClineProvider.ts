@@ -156,6 +156,7 @@ import {
 import { LifecycleTransitionContentionError, type OrdinaryPersistenceIdentity } from "../task-persistence/taskLifecycle"
 import { getNonce } from "./getNonce"
 import { getUri } from "./getUri"
+import { omitOriginalContentFromExtensionMessage } from "./stripOriginalContent"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
 import type { DelegationHandoffOutcome } from "../task/childCompletionProtocol"
@@ -1903,7 +1904,7 @@ export class ClineProvider
 		}
 
 		try {
-			await this.view?.webview.postMessage(message)
+			await this.view?.webview.postMessage(omitOriginalContentFromExtensionMessage(message))
 		} catch {
 			// View disposed, drop message silently
 		}
