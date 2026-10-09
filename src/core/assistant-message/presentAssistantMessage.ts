@@ -96,6 +96,29 @@ export async function presentAssistantMessage(cline: Task) {
 	}
 
 	cline.presentAssistantMessageLocked = true
+	try {
+		// Drain updates queued while the lock was held, including one that
+		// arrives after the helper's final check but before this continuation.
+		// The last pending check and the release below run in the same
+		// synchronous step, so no update can be stranded behind the lock.
+		// A registered pending question stops the drain, as at the wrapper entry.
+		do {
+			await presentAssistantMessageBlock(cline)
+		} while (!cline.abort && !cline.hasPendingQuestion && cline.presentAssistantMessageHasPendingUpdates)
+	} finally {
+		// Tool handlers and provider-state reads can reject. Never strand the
+		// task behind a dispatch lock after the presenter has unwound.
+		cline.presentAssistantMessageLocked = false
+	}
+}
+
+async function presentAssistantMessageBlock(cline: Task): Promise<void> {
+	if (cline.abort || cline.hasPendingQuestion) {
+		return
+	}
+
+	// Each internal pass consumes the pending update. New updates arriving
+	// during an awaited operation can request another pass.
 	cline.presentAssistantMessageHasPendingUpdates = false
 
 	if (cline.currentStreamingContentIndex >= cline.assistantMessageContent.length) {
@@ -107,7 +130,6 @@ export async function presentAssistantMessage(cline: Task) {
 			cline.userMessageContentReady = true
 		}
 
-		cline.presentAssistantMessageLocked = false
 		return
 	}
 
@@ -124,7 +146,6 @@ export async function presentAssistantMessage(cline: Task) {
 			`Block content:`,
 			JSON.stringify(cline.assistantMessageContent[cline.currentStreamingContentIndex], null, 2),
 		)
-		cline.presentAssistantMessageLocked = false
 		return
 	}
 
@@ -1062,16 +1083,7 @@ export async function presentAssistantMessage(cline: Task) {
 		}
 	}
 
-	// Seeing out of bounds is fine, it means that the next too call is being
-	// built up and ready to add to assistantMessageContent to present.
-	// When you see the UI inactive during this, it means that a tool is
-	// breaking without presenting any UI. For example the write_to_file tool
-	// was breaking when relpath was undefined, and for invalid relpath it never
-	// presented UI.
-	// This needs to be placed here, if not then calling
-	// cline.presentAssistantMessage below would fail (sometimes) since it's
-	// locked.
-	cline.presentAssistantMessageLocked = false
+	// The wrapper owns the presentation lock and releases it after this pass.
 	if (cline.hasPendingQuestion) {
 		cline.userMessageContentReady = true
 		return
@@ -1104,7 +1116,7 @@ export async function presentAssistantMessage(cline: Task) {
 		if (cline.currentStreamingContentIndex < cline.assistantMessageContent.length) {
 			// There are already more content blocks to stream, so we'll call
 			// this function ourselves.
-			return presentAssistantMessage(cline)
+			return await presentAssistantMessageBlock(cline)
 		} else {
 			// CRITICAL FIX: If we're out of bounds and the stream is complete, set userMessageContentReady
 			// This handles the case where assistantMessageContent is empty or becomes empty after processing
@@ -1114,10 +1126,8 @@ export async function presentAssistantMessage(cline: Task) {
 		}
 	}
 
-	// Block is partial, but the read stream may have finished.
-	if (cline.presentAssistantMessageHasPendingUpdates) {
-		return presentAssistantMessage(cline)
-	}
+	// Pending updates are drained by presentAssistantMessage, which owns the
+	// lock and checks for them immediately before releasing it.
 }
 
 /**
