@@ -1922,8 +1922,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// rendered, leaving them stuck on-screen).
 		const provider = this.providerRef.deref()
 		const state = provider ? await provider.getState() : undefined
+		// A queued message must not short-circuit protected asks (e.g.
+		// DCG-blocked commands): claiming one here skips checkAutoApproval, and
+		// the drain below would auto-approve what protection intentionally
+		// leaves pending for explicit user approval.
 		const queuedMessage =
-			partial === true || type === "command_output" ? undefined : this.messageQueueService.claimNextMessage()
+			partial === true || type === "command_output" || isProtected
+				? undefined
+				: this.messageQueueService.claimNextMessage()
 		const queuedAskResolution = queuedMessage
 			? type === "resume_task" &&
 				this.liveStatus === "interrupted" &&
@@ -2214,9 +2220,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 						// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
 						// suggestion click that was incorrectly queued due to UI state), consume it
-						// immediately so the task doesn't hang.
+						// immediately so the task doesn't hang. Protected asks are exempt: like
+						// the pre-block claim above, they must wait for explicit user approval.
 						if (
 							shouldDrainQueuedMessageForAsk &&
+							!isProtected &&
 							!this.acceptingQuestionAnswer &&
 							!queuedMessageId &&
 							!this.messageQueueService.isEmpty()
