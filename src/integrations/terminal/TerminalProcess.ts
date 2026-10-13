@@ -7,6 +7,7 @@ import * as vscode from "vscode"
 import type { ExitCodeDetails } from "./types"
 import { BaseTerminalProcess } from "./BaseTerminalProcess"
 import { Terminal } from "./Terminal"
+import { errorMessage } from "../../utils/errors"
 
 export class TerminalProcess extends BaseTerminalProcess {
 	// #266: Some processes (interactive tools, programs that trap SIGINT and
@@ -220,7 +221,7 @@ export class TerminalProcess extends BaseTerminalProcess {
 			stream = result as AsyncIterable<string>
 		} catch (error) {
 			// Stream timeout or other error occurred
-			console.error("[Terminal Process] Stream error:", error.message)
+			console.error("[Terminal Process] Stream error:", errorMessage(error))
 
 			// Emit completed event with error message
 			this.emit(

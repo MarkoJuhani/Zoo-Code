@@ -21,6 +21,7 @@ import { Package } from "../../../shared/package"
 import { expectRequestObjectContaining, makeApiHandlerOptions } from "../../../test-utils/api"
 import { asyncStreamFrom, collectStream } from "../../../test-utils/stream"
 import { deleteGlobalFetch } from "../../../test-utils/reset"
+import { calculateApiCostOpenAI } from "../../../shared/cost"
 
 // Mock OpenAI client - now everything uses Responses API
 const mockResponsesCreate = vitest.fn()
@@ -75,6 +76,87 @@ describe("OpenAiNativeHandler", () => {
 
 	afterEach(() => {
 		deleteGlobalFetch()
+	})
+
+	it.each([
+		{ options: {}, effort: "medium" },
+		{ options: { reasoningEffort: "none" }, effort: "medium" },
+		{ options: { reasoningEffort: "minimal" }, effort: "medium" },
+		{ options: { reasoningEffort: "disable" }, effort: "medium" },
+		{ options: { enableReasoningEffort: false }, effort: "medium" },
+		...(["low", "medium", "high", "xhigh", "max"] as const).map((effort) => ({
+			options: { reasoningEffort: effort },
+			effort,
+		})),
+	])("sends GPT-6.1 Sol Responses tools with supported reasoning for $options", async ({ options, effort }) => {
+		const sol = new OpenAiNativeHandler({
+			apiModelId: "gpt-6.1-sol",
+			openAiNativeApiKey: "test-key",
+			modelTemperature: 0.7,
+			...options,
+		} as ApiHandlerOptions)
+		mockResponsesCreate.mockResolvedValue(asyncStreamFrom([]))
+		await collectStream(
+			sol.createMessage(systemPrompt, messages, {
+				taskId: "sol-task",
+				tools: [
+					{
+						type: "function",
+						function: { name: "read_file", parameters: { type: "object", properties: {} } },
+					},
+				],
+			}),
+		)
+		expect(sol.getModel().id).toBe("gpt-6.1-sol")
+		expect(mockResponsesCreate).toHaveBeenCalledTimes(1)
+		const body = mockResponsesCreate.mock.calls[0][0]
+		expect(body).toMatchObject({
+			model: "gpt-6.1-sol",
+			max_output_tokens: 128_000,
+			reasoning: { effort },
+			tools: [{ type: "function", name: "read_file", strict: true }],
+		})
+		expect(body).not.toHaveProperty("temperature")
+	})
+
+	it.each([
+		{ tier: "default", inputPrice: 2, outputPrice: 10, cacheReadsPrice: 0.1, cacheWritesPrice: 2.5 },
+		{ tier: "flex", inputPrice: 1, outputPrice: 5, cacheReadsPrice: 0.05, cacheWritesPrice: 1.25 },
+		{ tier: "priority", inputPrice: 4, outputPrice: 20, cacheReadsPrice: 0.2, cacheWritesPrice: 5 },
+	] as const)("keeps GPT-6.1 Sol $tier pricing in native requests", async ({ tier, ...prices }) => {
+		const sol = new OpenAiNativeHandler({
+			apiModelId: "gpt-6.1-sol",
+			openAiNativeApiKey: "test-key",
+			openAiNativeServiceTier: tier,
+		})
+		mockResponsesCreate.mockResolvedValue(asyncStreamFrom([]))
+		await collectStream(sol.createMessage(systemPrompt, messages))
+		expect(mockResponsesCreate.mock.calls[0][0]).toHaveProperty("service_tier", tier)
+		expect(sol["applyServiceTierPricing"](sol.getModel().info, tier)).toMatchObject(prices)
+	})
+
+	it.each(
+		(["default", "flex", "priority"] as const).flatMap((tier) =>
+			[272_000, 272_001].map((inputTokens) => ({ tier, inputTokens })),
+		),
+	)("prices the full GPT-6.1 Sol request at $inputTokens input tokens on $tier", ({ tier, inputTokens }) => {
+		const sol = new OpenAiNativeHandler({ apiModelId: "gpt-6.1-sol", openAiNativeApiKey: "test-key" })
+		const info = sol["applyServiceTierPricing"](sol.getModel().info, tier)
+		const tierMultiplier = tier === "flex" ? 0.5 : tier === "priority" ? 2 : 1
+		const inputMultiplier = inputTokens > 272_000 ? 2 : 1
+		const outputMultiplier = inputTokens > 272_000 ? 1.5 : 1
+		// Input totals include 20K cache writes and 100K cached reads.
+		const expected =
+			(tierMultiplier *
+				((inputTokens - 120_000) * 2 * inputMultiplier +
+					20_000 * 2.5 * inputMultiplier +
+					100_000 * 0.1 * inputMultiplier +
+					1_000 * 10 * outputMultiplier)) /
+			1_000_000
+		expect(calculateApiCostOpenAI(info, inputTokens, 1_000, 20_000, 100_000, tier).totalCost).toBeCloseTo(
+			expected,
+			8,
+		)
 	})
 
 	describe("constructor", () => {

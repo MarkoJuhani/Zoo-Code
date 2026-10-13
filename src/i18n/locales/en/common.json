@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Are you sure you want to delete this {scope} mode?\n\nThis will also delete the associated rules folder at:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "Task history loaded, but startup repairs were skipped: the startup lock is in use. If no other Zoo Code window is open, a crashed process left it; move this folder aside and reload: {{lockPath}}",
+		"task_history_startup_generation_invalid": "Task history loaded, but startup repairs were skipped: the startup lock's generation file is invalid. Close other Zoo Code windows, move this file and the folder {{lockPath}} aside, and reload: {{generationPath}}",
+		"task_history_startup_fence_unusable": "Task history loaded, but startup repairs were skipped: the lock folder cannot be used ({{code}}). Check that it is a writable folder, then reload: {{fencePath}}",
 		"invalid_data_uri": "Invalid data URI format",
 		"error_copying_image": "Error copying image: {{errorMessage}}",
 		"error_opening_image": "Error opening image: {{error}}",

@@ -12,6 +12,7 @@
 // Fix: abortTask() skips saveClineMessages() for history tasks whose message
 // load has not completed. The on-disk data is already correct at that point.
 import * as os from "os"
+import * as fs from "fs/promises"
 import * as path from "path"
 
 import type { ClineMessage, GlobalState, HistoryItem, ProviderSettings } from "@roo-code/types"
@@ -84,6 +85,7 @@ vi.mock("../../environment/getEnvironmentDetails", () => ({
 }))
 vi.mock("../../ignore/RooIgnoreController")
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn().mockImplementation(async (storage: string) => storage),
 	getTaskDirectoryPath: vi
 		.fn()
 		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
@@ -189,6 +191,8 @@ describe("Task resume/eviction race (Work #1 (no message) regression)", () => {
 
 		const updateTaskHistory = vi.fn().mockResolvedValue([])
 		const mockProvider = makeMockProvider(updateTaskHistory)
+		const storage = await fs.mkdtemp(path.join(os.tmpdir(), "resume-exclusion-"))
+		mockProvider.context.globalStorageUri = { fsPath: storage }
 
 		const task = new Task({
 			provider: mockProvider as unknown as ClineProvider,
@@ -204,6 +208,8 @@ describe("Task resume/eviction race (Work #1 (no message) regression)", () => {
 		const runPromise = task.run().catch(() => {
 			// After abort, downstream steps (e.g. ask()) throw — expected.
 		})
+
+		await vi.waitFor(() => expect(mockReadTaskMessages).toHaveBeenCalledTimes(1))
 
 		// Abort while the disk read is still in flight, as evictCurrentTask()
 		// does when the user navigates away before messages load.
@@ -225,5 +231,6 @@ describe("Task resume/eviction race (Work #1 (no message) regression)", () => {
 		expect(mockSaveTaskMessages).not.toHaveBeenCalled()
 		expect(updateTaskHistory).not.toHaveBeenCalled()
 		expect(mockReadTaskMessages).toHaveBeenCalledTimes(1)
+		await fs.rm(storage, { recursive: true, force: true })
 	})
 })

@@ -1,6 +1,9 @@
 // pnpm --filter roo-cline test core/webview/__tests__/ClineProvider.taskHistory.spec.ts
 
 import * as vscode from "vscode"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 import type { HistoryItem, ExtensionMessage } from "@roo-code/types"
 import { providerIdentifiers, RooCodeEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
@@ -14,17 +17,6 @@ import { ClineProvider } from "../ClineProvider"
 vi.mock("p-wait-for", () => ({
 	__esModule: true,
 	default: vi.fn().mockResolvedValue(undefined),
-}))
-
-vi.mock("fs/promises", () => ({
-	mkdir: vi.fn().mockResolvedValue(undefined),
-	writeFile: vi.fn().mockResolvedValue(undefined),
-	readFile: vi.fn().mockResolvedValue(""),
-	readdir: vi.fn().mockResolvedValue([]),
-	unlink: vi.fn().mockResolvedValue(undefined),
-	rmdir: vi.fn().mockResolvedValue(undefined),
-	access: vi.fn().mockResolvedValue(undefined),
-	rm: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock("axios", () => ({
@@ -47,17 +39,16 @@ vi.mock("delay", () => {
 vi.mock("../../prompts/sections/custom-instructions")
 
 vi.mock("../../../utils/storage", () => ({
-	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
-	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
-	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
-	getStorageBasePath: vi.fn().mockImplementation((defaultPath: string) => {
-		return defaultPath
-	}),
+	getSettingsDirectoryPath: vi.fn(async (root: string) => path.join(root, "settings")),
+	getTaskDirectoryPath: vi.fn(async (root: string, id: string) => path.join(root, "tasks", id)),
+	getGlobalStoragePath: vi.fn(async (root: string) => root),
+	getStorageBasePath: vi.fn(async (root: string) => root),
 }))
 
-vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockResolvedValue(undefined),
-}))
+vi.mock("../../../utils/safeWriteJson", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../utils/safeWriteJson")>()
+	return { ...actual, safeWriteJson: vi.fn(actual.safeWriteJson) }
+})
 
 vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
 	CallToolResultSchema: {},
@@ -183,6 +174,7 @@ vi.mock("../../task/Task", () => ({
 		return {
 			api: undefined,
 			abortTask: vi.fn(),
+			dispose: vi.fn().mockResolvedValue(undefined),
 			handleWebviewAskResponse: vi.fn(),
 			clineMessages: [],
 			apiConversationHistory: [],
@@ -261,9 +253,11 @@ describe("ClineProvider Task History Synchronization", () => {
 	let mockWebviewView: vscode.WebviewView
 	let mockPostMessage: ReturnType<typeof vi.fn>
 	let taskHistoryState: HistoryItem[]
+	let storagePath: string
 
 	beforeEach(async () => {
 		vi.clearAllMocks()
+		storagePath = await fs.mkdtemp(path.join(os.tmpdir(), "provider-history-"))
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -318,7 +312,7 @@ describe("ClineProvider Task History Synchronization", () => {
 				packageJSON: { version: "1.0.0" },
 			},
 			globalStorageUri: {
-				fsPath: "/test/storage/path",
+				fsPath: storagePath,
 			},
 		} as unknown as vscode.ExtensionContext
 
@@ -353,7 +347,7 @@ describe("ClineProvider Task History Synchronization", () => {
 
 		// Wait for the async TaskHistoryStore initialization to complete
 		// (fire-and-forget from the constructor; microtasks need to flush)
-		await new Promise((resolve) => setTimeout(resolve, 10))
+		await provider.taskHistoryStore.initialized
 
 		// Mock the custom modes manager
 		;(provider as any).customModesManager = {
@@ -370,6 +364,11 @@ describe("ClineProvider Task History Synchronization", () => {
 			readResource: vi.fn().mockResolvedValue({ contents: [] }),
 			getAllServers: vi.fn().mockReturnValue([]),
 		})
+	})
+
+	afterEach(async () => {
+		await provider.dispose()
+		await fs.rm(storagePath, { recursive: true, force: true })
 	})
 
 	// Helper to create valid HistoryItem with required fields
@@ -411,6 +410,66 @@ describe("ClineProvider Task History Synchronization", () => {
 		await provider.dispose()
 
 		expect(mockContext.globalState.update).not.toHaveBeenCalledWith("taskHistory", expect.anything())
+	})
+
+	it("ordinary non-running create/resume and task/API save/delete preserve question changes and unrelated progress on disk", async () => {
+		const { registerPendingQuestion, clearPendingQuestion } = await import("../../task-persistence/taskLifecycle")
+		const { saveTaskMessages, readTaskMessages } = await import("../../task-persistence/taskMessages")
+		const { saveApiMessages, readApiMessages } = await import("../../task-persistence/apiMessages")
+		const state = await provider.getState()
+		vi.spyOn(provider, "getState").mockResolvedValue({
+			...state,
+			organizationAllowList: { allowAll: true, providers: {} },
+		})
+		const schedule = vi.spyOn(provider["taskScheduler"], "schedule")
+		const created = await provider.createTask("ordinary", [], undefined, { startTask: false })
+		const owner = createHistoryItem({ id: created.taskId, task: "ordinary" })
+		await provider.updateTaskHistory(owner, { broadcast: false })
+		const resumed = await provider.createTaskWithHistoryItem(owner, { startTask: false })
+		expect(provider.getCurrentTask()).toBe(resumed)
+		expect(vi.mocked(Task).mock.calls.every(([options]) => options.startTask === false)).toBe(true)
+		const question = { id: "ordinary-q", taskId: owner.id, toolCallId: "call", text: "Choose?" }
+		await provider.taskHistoryStore.updateQuestion(owner.id, (item) => registerPendingQuestion(item, question))
+		const other = createHistoryItem({ id: "ordinary-other", task: "other" })
+		await provider.updateTaskHistory(other, { broadcast: false })
+		await Promise.all([
+			provider.updateTaskHistory({ ...owner, tokensIn: 123 }, { broadcast: false }),
+			provider.taskHistoryStore.updateQuestion(other.id, (item) =>
+				registerPendingQuestion(item, { ...question, id: "other-q", taskId: other.id }),
+			),
+		])
+		const read = async (id: string): Promise<HistoryItem> =>
+			JSON.parse(await fs.readFile(path.join(storagePath, "tasks", id, "history_item.json"), "utf8"))
+		expect(await read(owner.id)).toMatchObject({ tokensIn: 123 })
+		expect((await read(owner.id)).pendingQuestion).toEqual(question)
+		await provider.taskHistoryStore.updateQuestion(owner.id, (item) =>
+			clearPendingQuestion(item, question.id, "replace"),
+		)
+		expect((await read(owner.id)).pendingQuestion).toBeUndefined()
+		expect((await read(other.id)).pendingQuestion?.id).toBe("other-q")
+		const taskMessages = await saveTaskMessages({
+			taskId: owner.id,
+			globalStoragePath: storagePath,
+			messages: [{ ts: 1, type: "say", say: "text", text: "ordinary task" }],
+		})
+		expect(await readTaskMessages({ taskId: owner.id, globalStoragePath: storagePath })).toEqual(taskMessages)
+		const saved = await saveApiMessages({
+			taskId: owner.id,
+			globalStoragePath: storagePath,
+			messages: [{ role: "user", content: "ordinary API" }],
+		})
+		expect(await readApiMessages({ taskId: owner.id, globalStoragePath: storagePath })).toEqual(saved)
+		await provider.taskHistoryStore.updateQuestion(other.id, (item) =>
+			clearPendingQuestion(item, "other-q", "replace"),
+		)
+		await provider.evictCurrentTask()
+		const { ShadowCheckpointService } = await import("../../../services/checkpoints/ShadowCheckpointService")
+		vi.spyOn(ShadowCheckpointService, "deleteTask").mockResolvedValue(undefined)
+		await provider.deleteTaskWithId(owner.id, false)
+		await expect(fs.access(path.join(storagePath, "tasks", owner.id))).rejects.toMatchObject({ code: "ENOENT" })
+		expect(provider.taskHistoryStore.get(owner.id)).toBeUndefined()
+		expect((await read(other.id)).pendingQuestion).toBeUndefined()
+		expect(schedule).not.toHaveBeenCalled()
 	})
 
 	describe("updateTaskHistory", () => {
@@ -690,6 +749,9 @@ describe("ClineProvider Task History Synchronization", () => {
 				clineMessages: [],
 				todoList: [],
 				messageQueueService: { messages: [] },
+				emit: vi.fn(),
+				abortTask: vi.fn().mockResolvedValue(undefined),
+				dispose: vi.fn().mockResolvedValue(undefined),
 			}
 			// The module-level Task mock intentionally implements only the fields this provider-state test reads.
 			provider["taskRegistry"].push(activeTask as unknown as Task)
@@ -718,7 +780,13 @@ describe("ClineProvider Task History Synchronization", () => {
 				consecutiveMistakeLimit: 7,
 			}
 			const isProfileAllowed = vi.spyOn(ProfileValidator, "isProfileAllowed").mockReturnValue(true)
-			const parentTask = { taskId: "parent", workspacePath: "/test/workspace" } as Task
+			const parentTask = {
+				taskId: "parent",
+				workspacePath: "/test/workspace",
+				emit: vi.fn(),
+				abortTask: vi.fn().mockResolvedValue(undefined),
+				dispose: vi.fn().mockResolvedValue(undefined),
+			} as unknown as Task
 
 			await provider.createTask("child", undefined, parentTask, {
 				startTask: false,
@@ -849,22 +917,13 @@ describe("ClineProvider Task History Synchronization", () => {
 			// Temporarily make the store's safeWriteJson throw
 			const { safeWriteJson } = await import("../../../utils/safeWriteJson")
 			const mockSafeWriteJson = vi.mocked(safeWriteJson)
-			let callCount = 0
-			mockSafeWriteJson.mockImplementation(async () => {
-				callCount++
-				if (callCount === 1) {
-					throw new Error("simulated write failure")
-				}
-			})
+			mockSafeWriteJson.mockRejectedValueOnce(new Error("simulated write failure"))
 
 			// First call should fail (store write failure)
 			const item1 = createHistoryItem({ id: "fail-item", task: "Fail" })
 			await expect(provider.updateTaskHistory(item1, { broadcast: false })).rejects.toThrow(
 				"simulated write failure",
 			)
-
-			// Restore mock
-			mockSafeWriteJson.mockResolvedValue(undefined)
 
 			// Second call should still succeed (store lock not stuck)
 			const item2 = createHistoryItem({ id: "ok-item", task: "OK" })
@@ -878,21 +937,44 @@ describe("ClineProvider Task History Synchronization", () => {
 			const base = createHistoryItem({ id: "race-item", task: "Original" })
 			await provider.updateTaskHistory(base, { broadcast: false })
 
-			// Fire two concurrent updates to the same item
-			await Promise.all([
-				provider.updateTaskHistory(createHistoryItem({ id: "race-item", task: "Original", tokensIn: 111 }), {
-					broadcast: false,
-				}),
-				provider.updateTaskHistory(createHistoryItem({ id: "race-item", task: "Original", tokensIn: 222 }), {
-					broadcast: false,
-				}),
-			])
+			// Establish writer-entry order, not just JavaScript invocation order.
+			let entered!: () => void
+			let release!: () => void
+			const firstEntered = new Promise<void>((resolve) => {
+				entered = resolve
+			})
+			const firstGate = new Promise<void>((resolve) => {
+				release = resolve
+			})
+			const { safeWriteJson } = await import("../../../utils/safeWriteJson")
+			const actual =
+				await vi.importActual<typeof import("../../../utils/safeWriteJson")>("../../../utils/safeWriteJson")
+			vi.mocked(safeWriteJson).mockImplementationOnce(async (...args) => {
+				entered()
+				await firstGate
+				return actual.safeWriteJson(...args)
+			})
+			const first = provider.updateTaskHistory(
+				createHistoryItem({ id: "race-item", task: "Original", tokensIn: 111 }),
+				{ broadcast: false },
+			)
+			await firstEntered
+			const second = provider.updateTaskHistory(
+				createHistoryItem({ id: "race-item", task: "Original", tokensIn: 222 }),
+				{ broadcast: false },
+			)
+			release()
+			await Promise.all([first, second])
 
 			const history = provider.taskHistoryStore.getAll()
 			const item = history.find((h: HistoryItem) => h.id === "race-item")
 			expect(item).toBeDefined()
-			// The second write (tokensIn: 222) should be the last one since writes are serialized
+			// The ordered second write must remain the last write, including on disk.
 			expect(item!.tokensIn).toBe(222)
+			const persisted = JSON.parse(
+				await fs.readFile(path.join(storagePath, "tasks", "race-item", "history_item.json"), "utf8"),
+			)
+			expect(persisted.tokensIn).toBe(222)
 		})
 	})
 

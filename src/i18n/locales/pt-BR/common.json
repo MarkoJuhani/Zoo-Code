@@ -24,6 +24,9 @@
 		"delete_custom_mode_with_rules": "Tem certeza de que deseja excluir este modo {scope}?\n\nIsso também excluirá a pasta de regras associada em:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "O histórico de tarefas foi carregado, mas os reparos de inicialização foram ignorados: o bloqueio de inicialização está em uso. Se nenhuma outra janela do Zoo Code estiver aberta, um processo que travou o deixou; mova esta pasta para outro lugar e recarregue: {{lockPath}}",
+		"task_history_startup_generation_invalid": "O histórico de tarefas foi carregado, mas os reparos de inicialização foram ignorados: o arquivo de geração do bloqueio de inicialização é inválido. Feche as outras janelas do Zoo Code, mova este arquivo e a pasta {{lockPath}} para outro lugar e recarregue: {{generationPath}}",
+		"task_history_startup_fence_unusable": "O histórico de tarefas foi carregado, mas os reparos de inicialização foram ignorados: a pasta de bloqueios não pode ser usada ({{code}}). Verifique se é uma pasta com permissão de escrita e recarregue: {{fencePath}}",
 		"invalid_data_uri": "Formato de URI de dados inválido",
 		"error_copying_image": "Erro ao copiar imagem: {{errorMessage}}",
 		"error_saving_image": "Erro ao salvar imagem: {{errorMessage}}",

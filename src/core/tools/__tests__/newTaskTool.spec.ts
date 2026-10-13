@@ -1,6 +1,7 @@
 // npx vitest core/tools/__tests__/newTaskTool.spec.ts
 
-import type { AskApproval, HandleError, NativeToolArgs, ToolUse } from "../../../shared/tools"
+import type { AskApproval, HandleError, NativeToolArgs, PushToolResult, ToolUse } from "../../../shared/tools"
+import type { Task } from "../../task/Task"
 
 // Mock vscode module
 vi.mock("vscode", () => ({
@@ -87,6 +88,8 @@ const mockCheckpointSave = vi.fn()
 // Mock the Cline instance and its methods/properties
 const mockCline = {
 	ask: vi.fn(),
+	waitForCurrentAssistantMessagePersistence: vi.fn(async () => true),
+	waitForAnsweredAskPersistence: vi.fn(async () => {}),
 	sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 	emit: mockEmit,
 	recordToolError: mockRecordToolError,
@@ -589,6 +592,8 @@ describe("newTaskTool delegation flow", () => {
 		const localEmit = vi.fn()
 		const localCline = {
 			ask: vi.fn(),
+			waitForCurrentAssistantMessagePersistence: vi.fn(async () => true),
+			waitForAnsweredAskPersistence: vi.fn(async () => {}),
 			sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 			emit: localEmit,
 			recordToolError: mockRecordToolError,
@@ -652,5 +657,145 @@ describe("newTaskTool delegation flow", () => {
 
 		// Assert: tool result reflects delegation
 		expect(mockPushToolResult).toHaveBeenCalledWith(expect.stringContaining("Delegated to child task child-1"))
+	})
+})
+
+describe("newTaskTool handoff after the answered-ask save", () => {
+	/** The Task members NewTaskTool and BaseTool.handle read on the approved path. */
+	type HandoffTaskDouble = Pick<
+		Task,
+		| "taskId"
+		| "instanceId"
+		| "abort"
+		| "abandoned"
+		| "hasPendingQuestion"
+		| "consecutiveMistakeCount"
+		| "didToolFailInCurrentTurn"
+		| "recordToolError"
+		| "sayAndCreateMissingParamError"
+		| "setPendingTaskAction"
+		| "waitForCurrentAssistantMessagePersistence"
+		| "waitForAnsweredAskPersistence"
+	> & { providerRef: { deref: () => unknown } }
+
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.mocked(getModeBySlug).mockReturnValue({
+			slug: "code",
+			name: "Code Mode",
+			roleDefinition: "Test role definition",
+			groups: ["command", "read", "edit"],
+		})
+	})
+
+	/** `interrupt` is set on the task while its answered-ask save settles, before the wait resolves. */
+	function handoffFixture(interrupt?: "abort" | "abandoned") {
+		const diagnostics = { event: vi.fn<(phase: string, stage: string, error?: unknown) => void>() }
+		const provider = {
+			getState: vi.fn(async () => ({ mode: "ask", customModes: [] })),
+			setPendingTaskAction: vi.fn(async () => {}),
+			createDelegationDiagnostics: vi.fn(() => diagnostics),
+			delegateParentAndOpenChild: vi.fn(async () => ({ taskId: "child-1" })),
+		}
+		const answeredAskSaveSettled = vi.fn()
+		let settle: (() => void) | undefined
+		const task: HandoffTaskDouble = {
+			taskId: "parent-task",
+			instanceId: "parent-instance",
+			abort: false,
+			abandoned: false,
+			hasPendingQuestion: false,
+			consecutiveMistakeCount: 0,
+			didToolFailInCurrentTurn: false,
+			recordToolError: vi.fn(),
+			sayAndCreateMissingParamError: vi.fn(async () => "missing parameter"),
+			setPendingTaskAction: vi.fn(),
+			waitForCurrentAssistantMessagePersistence: vi.fn(async () => true),
+			// Deferred: resolves only when the test settles the answered-ask save.
+			waitForAnsweredAskPersistence: vi.fn(
+				() =>
+					new Promise<void>((resolve) => {
+						settle = () => {
+							if (interrupt) task[interrupt] = true
+							answeredAskSaveSettled()
+							resolve()
+						}
+					}),
+			),
+			providerRef: { deref: () => provider },
+		}
+		const callbacks = {
+			askApproval: vi.fn<AskApproval>(async () => true),
+			handleError: vi.fn<HandleError>(async () => {}),
+			pushToolResult: vi.fn<PushToolResult>(),
+			toolCallId: "call-new-task",
+		}
+		const block: ToolUse<"new_task"> = {
+			type: "tool_use",
+			name: "new_task",
+			params: { mode: "code", message: "Do something", todos: "" },
+			nativeArgs: { mode: "code", message: "Do something", todos: "" },
+			partial: false,
+		}
+		// Double assertion: the tool reads only the HandoffTaskDouble members. A real Task needs a
+		// provider, API handler and storage, and its providerRef is a WeakRef that cannot hold this
+		// plain provider double.
+		const handle = () => newTaskTool.handle(task as unknown as Task, block, callbacks)
+		const settleAnsweredAskSave = () => {
+			expect(settle).toBeDefined()
+			settle?.()
+		}
+		const handoffEvents = () => diagnostics.event.mock.calls.filter(([phase]) => phase === "tool_handoff")
+		return {
+			task,
+			provider,
+			diagnostics,
+			callbacks,
+			handle,
+			settleAnsweredAskSave,
+			answeredAskSaveSettled,
+			handoffEvents,
+		}
+	}
+
+	it.each(["abort", "abandoned"] as const)(
+		"does not hand off when the task is marked %s while its answered-ask save settles",
+		async (interrupt) => {
+			const f = handoffFixture(interrupt)
+			const handled = f.handle()
+			await vi.waitFor(() => expect(f.task.waitForAnsweredAskPersistence).toHaveBeenCalledOnce())
+			expect(f.provider.delegateParentAndOpenChild).not.toHaveBeenCalled()
+
+			f.settleAnsweredAskSave()
+			await handled
+
+			expect(f.task[interrupt]).toBe(true)
+			expect(f.diagnostics.event).toHaveBeenCalledWith("approval", "end") // Diagnostics are observed.
+			expect(f.provider.delegateParentAndOpenChild).not.toHaveBeenCalled()
+			expect(f.handoffEvents()).toEqual([])
+			expect(f.callbacks.pushToolResult).not.toHaveBeenCalled()
+			expect(f.callbacks.handleError).not.toHaveBeenCalled()
+		},
+	)
+
+	it("hands off only after its answered-ask save settles when the task stays live", async () => {
+		const f = handoffFixture()
+		const handled = f.handle()
+		await vi.waitFor(() => expect(f.task.waitForAnsweredAskPersistence).toHaveBeenCalledOnce())
+		expect(f.provider.delegateParentAndOpenChild).not.toHaveBeenCalled()
+
+		f.settleAnsweredAskSave()
+		await handled
+
+		expect(f.provider.delegateParentAndOpenChild).toHaveBeenCalledOnce()
+		expect(f.answeredAskSaveSettled.mock.invocationCallOrder[0]).toBeLessThan(
+			f.provider.delegateParentAndOpenChild.mock.invocationCallOrder[0],
+		)
+		expect(f.handoffEvents()).toEqual([
+			["tool_handoff", "begin"],
+			["tool_handoff", "end"],
+		])
+		expect(f.callbacks.pushToolResult).toHaveBeenCalledWith("Delegated to child task child-1")
+		expect(f.callbacks.handleError).not.toHaveBeenCalled()
 	})
 })

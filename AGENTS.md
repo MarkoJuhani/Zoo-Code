@@ -15,7 +15,7 @@ When writing new code:
 - Fix lint violations in the new code rather than suppressing them.
 - Avoid `as any`; use typed APIs directly (e.g. `RooCodeEventName.X` constants with typed `on()`/`listenerCount()`), or bracket notation (`obj["privateField"]`) to access private members. Prefer precise test doubles or `unknown` with a type guard over double assertions (`as unknown as T`); use double assertions only as a last resort, with a comment explaining why.
 - Avoid floating promises; add `void`, `await`, or `.catch()` as appropriate.
-- After editing a file, run `pnpm --dir src exec eslint --prune-suppressions --max-warnings=0 <relative-file>` and confirm the count for that file did not increase.
+- After editing files, run `node .claude/skills/zoo-verify/scripts/verify.mjs <changed files>`. It lints without pruning and fails if a suppression count increases. To reduce a count, edit only the changed file's entry in `eslint-suppressions.json` by hand. Do not run `eslint --prune-suppressions`: it also deletes entries for files that fail to parse or are temporarily missing.
 - If a suppression is truly unavoidable (e.g. `vi.spyOn(Cls.prototype as any, "privateMethod")` where no typed alternative exists), document why in a comment next to the cast.
 
 ## Persisted Setting Checklist

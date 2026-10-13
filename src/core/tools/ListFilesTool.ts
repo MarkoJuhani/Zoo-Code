@@ -6,6 +6,7 @@ import { Task } from "../task/Task"
 import { formatResponse } from "../prompts/responses"
 import { listFiles } from "../../services/glob/list-files"
 import { getReadablePath } from "../../utils/path"
+import { toError } from "../../utils/errors"
 import { isPathOutsideWorkspace } from "../../utils/pathUtils"
 import type { ToolUse } from "../../shared/tools"
 
@@ -64,7 +65,7 @@ export class ListFilesTool extends BaseTool<"list_files"> {
 
 			pushToolResult(result)
 		} catch (error) {
-			await handleError("listing files", error)
+			await handleError("listing files", toError(error))
 		}
 	}
 

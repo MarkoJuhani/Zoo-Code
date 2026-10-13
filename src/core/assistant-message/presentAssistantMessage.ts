@@ -41,6 +41,7 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { errorMessage as errorText } from "../../utils/errors"
 
 /**
  * Maps a raw, potentially model-controlled tool name to a safe analytics key.
@@ -660,7 +661,7 @@ export async function presentAssistantMessage(cline: Task) {
 					// 2. NOT set didAlreadyUseTool = true (the tool was never executed, just failed validation)
 					// This prevents the stream from being interrupted with "Response interrupted by tool use result"
 					// which would cause the extension to appear to hang
-					const errorContent = formatResponse.toolError(error.message)
+					const errorContent = formatResponse.toolError(errorText(error))
 					// Push tool_result directly without setting didAlreadyUseTool
 					cline.pushToolResultToUserContent({
 						type: "tool_result",
@@ -673,7 +674,7 @@ export async function presentAssistantMessage(cline: Task) {
 					// model-controlled tool name.
 					cline.recordToolError(
 						toTelemetryToolName(block.name, isCustomTool, stateExperiments),
-						error.message,
+						errorText(error),
 					)
 
 					break
@@ -949,7 +950,7 @@ export async function presentAssistantMessage(cline: Task) {
 								try {
 									customToolArgs = customTool.parameters.parse(block.nativeArgs || block.params || {})
 								} catch (parseParamsError) {
-									const message = `Custom tool "${block.name}" argument validation failed: ${parseParamsError.message}`
+									const message = `Custom tool "${block.name}" argument validation failed: ${errorText(parseParamsError)}`
 									console.error(message)
 									cline.consecutiveMistakeCount++
 									await cline.say("error", message)
@@ -1071,6 +1072,6 @@ async function checkpointSaveAndMark(task: Task) {
 		await task.checkpointSave(true)
 		task.currentStreamingDidCheckpoint = true
 	} catch (error) {
-		console.error(`[Task#presentAssistantMessage] Error saving checkpoint: ${error.message}`, error)
+		console.error(`[Task#presentAssistantMessage] Error saving checkpoint: ${errorText(error)}`, error)
 	}
 }

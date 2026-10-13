@@ -8,6 +8,8 @@ import {
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
+	LifecycleTransitionError,
+	resumeInterruptedTask,
 } from "../src/core/task-persistence/taskLifecycle"
 
 const taskIds = ["parent", "child-a", "child-b"] as const
@@ -26,7 +28,7 @@ interface TraceStep {
 
 const MAX_DEPTH = 12
 const MAX_STATES = 10_000
-const expectedActions = ["delegate", "interrupt", "block", "complete", "abandon"] as const
+const expectedActions = ["delegate", "interrupt", "block", "complete", "abandon", "resume"] as const
 const semanticLandmarks = {
 	"interrupted-child-redelegation": (state: ModelState, _trace: TraceStep[]) =>
 		state.parent?.status === "delegated" &&
@@ -46,6 +48,21 @@ const semanticLandmarks = {
 			(step, index) => step.action.startsWith("block(") && trace[index + 1]?.action.startsWith("interrupt("),
 		),
 } satisfies Record<string, (state: ModelState, trace: TraceStep[]) => boolean>
+/**
+ * Landmarks over one explored transition. Breadth-first deduplication drops a trace whose
+ * successor state was already visited (resume restores the pre-interruption record), so a
+ * trace-only predicate could never observe interrupt -> resume -> delegate.
+ */
+const transitionLandmarks = {
+	"interrupted-child-resume-then-delegation": (trace: TraceStep[], transition: Transition) => {
+		const resumed = /^resume\((.+)\)$/.exec(transition.name)?.[1]
+		return (
+			resumed !== undefined &&
+			trace.at(-1)?.action === `interrupt(${resumed})` &&
+			transitions(transition.next).some((next) => next.name.startsWith(`delegate(${resumed}, `))
+		)
+	},
+} satisfies Record<string, (trace: TraceStep[], transition: Transition) => boolean>
 
 function task(id: TaskId, parentTaskId?: TaskId): HistoryItem {
 	return {
@@ -140,6 +157,19 @@ function transitions(state: ModelState): Transition[] {
 				name: `abandon(${childId})`,
 				next: replace(state, abandoned.parent, abandoned.child),
 			})
+		}
+	}
+
+	// A user may press Resume on any interrupted chat, linked or not. Only the production
+	// reducer decides; the model adds no guard, so an unguarded resume reaches the invariants.
+	for (const taskId of taskIds) {
+		const current = state[taskId]
+		if (current?.status !== "interrupted") continue
+		const parent = current.parentTaskId ? state[current.parentTaskId as TaskId] : undefined
+		try {
+			result.push({ name: `resume(${taskId})`, next: replace(state, resumeInterruptedTask(current, parent)) })
+		} catch (error) {
+			if (!(error instanceof LifecycleTransitionError)) throw error
 		}
 	}
 	return result
@@ -262,6 +292,9 @@ function runModelCheck(): number {
 
 		for (const transition of transitions(node.state)) {
 			reachedActions.add(transition.name.slice(0, transition.name.indexOf("(")))
+			for (const [name, predicate] of Object.entries(transitionLandmarks)) {
+				if (predicate(node.trace, transition)) reachedLandmarks.add(name)
+			}
 			const transitionViolations = checkTransitionInvariants(node.state, transition)
 			const trace = [...node.trace, { action: transition.name, state: transition.next }]
 			if (transitionViolations.length) {
@@ -282,7 +315,9 @@ function runModelCheck(): number {
 	if (unreachableActions.length) {
 		throw new Error(`Task lifecycle model has unreachable actions: ${unreachableActions.join(", ")}`)
 	}
-	const missingLandmarks = Object.keys(semanticLandmarks).filter((name) => !reachedLandmarks.has(name))
+	const missingLandmarks = [...Object.keys(semanticLandmarks), ...Object.keys(transitionLandmarks)].filter(
+		(name) => !reachedLandmarks.has(name),
+	)
 	if (missingLandmarks.length) {
 		throw new Error(`Task lifecycle model has unreachable semantic landmarks: ${missingLandmarks.join(", ")}`)
 	}
@@ -327,6 +362,13 @@ function runRepresentativeScenarios(): void {
 	assert.equal(blockedCompletion.parent.status, "active")
 	assert.equal(interruptDelegatedChild(blocked.parent, blocked.child).status, "interrupted")
 
+	const resumedA = resumeInterruptedTask(interruptedA, delegated)
+	assert.equal(resumedA.status, "active")
+	assert.equal(delegateTaskToChild(resumedA, "child-b").awaitingChildId, "child-b")
+	assert.throws(() => resumeInterruptedTask(interruptedA, redelegated), /no longer awaits/)
+	assert.throws(() => resumeInterruptedTask(childA, delegated), /Cannot resume/)
+	assert.equal(resumeInterruptedTask(abandoned.child).status, "active")
+
 	const wrongParentChild = { ...childA, parentTaskId: "child-b" }
 	assert.throws(() => blockDelegatedChildProtocol(delegated, wrongParentChild), /not delegated to child/)
 	assert.throws(() => completeDelegatedChild(delegated, wrongParentChild, "wrong lineage"), /not delegated to child/)
@@ -334,6 +376,7 @@ function runRepresentativeScenarios(): void {
 
 runRepresentativeScenarios()
 const checkedStates = runModelCheck()
+const landmarkTotal = Object.keys(semanticLandmarks).length + Object.keys(transitionLandmarks).length
 console.log(
-	`Task lifecycle model check passed: ${checkedStates} reachable states, ${expectedActions.length}/${expectedActions.length} actions reachable, ${Object.keys(semanticLandmarks).length}/${Object.keys(semanticLandmarks).length} landmarks reached, depth <= ${MAX_DEPTH}, ${taskIds.length} task slots`,
+	`Task lifecycle model check passed: ${checkedStates} reachable states, ${expectedActions.length}/${expectedActions.length} actions reachable, ${landmarkTotal}/${landmarkTotal} landmarks reached, depth <= ${MAX_DEPTH}, ${taskIds.length} task slots`,
 )

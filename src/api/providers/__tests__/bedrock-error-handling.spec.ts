@@ -36,6 +36,14 @@ import { Anthropic } from "@anthropic-ai/sdk"
 import { collectStream } from "../../../test-utils/stream"
 import { clearAllMocks } from "../../../test-utils/reset"
 
+// Catch variables are `unknown`; narrow without weakening the assertions that follow.
+function asError(value: unknown): Error {
+	if (value instanceof Error) {
+		return value
+	}
+	throw new Error(`Expected an Error to be thrown, got: ${String(value)}`)
+}
+
 describe("AwsBedrockHandler Error Handling", () => {
 	let handler: AwsBedrockHandler
 
@@ -84,7 +92,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 
@@ -100,7 +108,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 
@@ -116,7 +124,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 
@@ -132,7 +140,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 
@@ -147,7 +155,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toMatch(/throttled or rate limited/)
+				expect(asError(error).message).toMatch(/throttled or rate limited/)
 			}
 		})
 
@@ -171,7 +179,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 					// Should not reach here as completePrompt should throw
 					throw new Error("Expected error to be thrown")
 				} catch (error) {
-					expect(error.message).toContain("throttled or rate limited")
+					expect(asError(error).message).toContain("throttled or rate limited")
 				}
 			}
 		})
@@ -196,7 +204,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				throw new Error("Expected error to be thrown")
 			} catch (error) {
 				// Should contain the main error message
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 	})
@@ -213,7 +221,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("Service quota exceeded")
 			} catch (error) {
-				expect(error.message).toContain("Service quota exceeded")
+				expect(asError(error).message).toContain("Service quota exceeded")
 			}
 		})
 	})
@@ -230,7 +238,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("Model is not ready")
 			} catch (error) {
-				expect(error.message).toContain("Model is not ready")
+				expect(asError(error).message).toContain("Model is not ready")
 			}
 		})
 	})
@@ -247,7 +255,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("internal server error")
 			} catch (error) {
-				expect(error.message).toContain("internal server error")
+				expect(asError(error).message).toContain("internal server error")
 			}
 		})
 	})
@@ -271,7 +279,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 					throw new Error("Expected error to be thrown")
 				} catch (error) {
 					// Either "Too many tokens" for token-specific errors or "throttled" for limit-related errors
-					expect(error.message).toMatch(/Too many tokens|throttled or rate limited/)
+					expect(asError(error).message).toMatch(/Too many tokens|throttled or rate limited/)
 				}
 			}
 		})
@@ -353,7 +361,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 
@@ -370,7 +378,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("throttled or rate limited")
 			} catch (error) {
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 			}
 		})
 	})
@@ -387,7 +395,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				const result = await handler.completePrompt("test")
 				expect(result).toContain("Unknown Error")
 			} catch (error) {
-				expect(error.message).toContain("Unknown Error")
+				expect(asError(error).message).toContain("Unknown Error")
 			}
 		})
 	})
@@ -409,7 +417,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				throw new Error("Expected error to be thrown")
 			} catch (error) {
 				// Should contain the verbose message template
-				expect(error.message).toContain("Request was throttled or rate limited")
+				expect(asError(error).message).toContain("Request was throttled or rate limited")
 				// Should preserve original error properties
 				expect((error as any).status).toBe(429)
 				expect((error as any).$metadata.requestId).toBe("test-request-id-12345")
@@ -445,9 +453,9 @@ describe("AwsBedrockHandler Error Handling", () => {
 				throw new Error("Expected error to be thrown")
 			} catch (error) {
 				// Should contain error codes (note: this will be caught by the non-throttling error path)
-				expect(error.message).toContain("Too many tokens")
+				expect(asError(error).message).toContain("Too many tokens")
 				// Should preserve original error properties
-				expect(error.name).toBe("ValidationException")
+				expect(asError(error).name).toBe("ValidationException")
 				expect((error as any).$metadata.requestId).toBe("token-error-id-67890")
 			}
 		})
@@ -495,7 +503,7 @@ describe("AwsBedrockHandler Error Handling", () => {
 				await handler.completePrompt("test")
 			} catch (error) {
 				// Should be treated as throttling due to 429 status taking priority
-				expect(error.message).toContain("throttled or rate limited")
+				expect(asError(error).message).toContain("throttled or rate limited")
 				// Should still preserve metadata
 				expect((error as any).$metadata?.requestId).toBe("mixed-error-id")
 			}
@@ -549,9 +557,9 @@ describe("AwsBedrockHandler Error Handling", () => {
 				await handler.completePrompt("test")
 			} catch (error) {
 				// Should handle gracefully without accessing undefined properties
-				expect(error.message).toContain("Unknown Error")
+				expect(asError(error).message).toContain("Unknown Error")
 				// Should not have undefined values in the error message
-				expect(error.message).not.toContain("undefined")
+				expect(asError(error).message).not.toContain("undefined")
 			}
 		})
 	})

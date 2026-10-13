@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Weet je zeker dat je deze {scope}-modus wilt verwijderen?\n\nDit verwijdert ook de bijbehorende regelsmap op:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "De taakgeschiedenis is geladen, maar opstartreparaties zijn overgeslagen: de opstartvergrendeling is in gebruik. Als er geen ander Zoo Code-venster open is, heeft een gecrasht proces haar achtergelaten; verplaats deze map en laad opnieuw: {{lockPath}}",
+		"task_history_startup_generation_invalid": "De taakgeschiedenis is geladen, maar opstartreparaties zijn overgeslagen: het generatiebestand van de opstartvergrendeling is ongeldig. Sluit andere Zoo Code-vensters, verplaats dit bestand en de map {{lockPath}} en laad opnieuw: {{generationPath}}",
+		"task_history_startup_fence_unusable": "De taakgeschiedenis is geladen, maar opstartreparaties zijn overgeslagen: de vergrendelingsmap is niet bruikbaar ({{code}}). Controleer of het een beschrijfbare map is en laad opnieuw: {{fencePath}}",
 		"invalid_data_uri": "Ongeldig data-URI-formaat",
 		"error_copying_image": "Fout bij kopiëren van afbeelding: {{errorMessage}}",
 		"error_saving_image": "Fout bij opslaan van afbeelding: {{errorMessage}}",

@@ -18,10 +18,26 @@ vi.mock("../../../utils/storage", () => ({
 
 // Mock safeWriteJson to use plain fs writes in tests (avoids proper-lockfile issues)
 vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockImplementation(async (filePath: string, data: any) => {
-		await fs.mkdir(path.dirname(filePath), { recursive: true })
-		await fs.writeFile(filePath, JSON.stringify(data, null, "\t"), "utf8")
-	}),
+	safeWriteJson: vi
+		.fn()
+		.mockImplementation(
+			async (
+				filePath: string,
+				data: any,
+				options?: import("../../../utils/safeWriteJson").SafeWriteJsonOptions,
+			) => {
+				await fs.mkdir(path.dirname(filePath), { recursive: true })
+				let existing: unknown = null
+				try {
+					existing = JSON.parse(await fs.readFile(filePath, "utf8"))
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+				}
+				const output = options?.merge ? options.merge(existing, data) : data
+				options?.publicationGuard?.check(existing, output)
+				await fs.writeFile(filePath, JSON.stringify(output, null, "\t"), "utf8")
+			},
+		),
 }))
 
 function makeHistoryItem(overrides: Partial<HistoryItem> = {}): HistoryItem {

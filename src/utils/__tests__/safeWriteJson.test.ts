@@ -543,3 +543,130 @@ describe("safeWriteJson", () => {
 		expect(content).toEqual({ c: 3 })
 	})
 })
+
+describe("opt-in guarded publication on real temporary storage", () => {
+	let root: string
+	let file: string
+	beforeEach(async () => {
+		vi.clearAllMocks()
+		vi.mocked(fs.rename).mockImplementation(fsPromisesActuals.rename!)
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "guarded-publication-"))
+		file = path.join(root, "history.json")
+		await fs.writeFile(file, JSON.stringify({ owner: "old" }))
+	})
+	afterEach(async () => {
+		vi.restoreAllMocks()
+		await fs.rm(root, { recursive: true, force: true })
+	})
+
+	for (const point of ["streaming", "backup", "before-replacement"] as const) {
+		it(`lost guard at ${point} preserves exact authority and performs no replacement`, async () => {
+			let checks = 0
+			let valid = true
+			const rename = vi.spyOn(fs, "rename")
+			if (point === "backup") {
+				const actual = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+				vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+					await actual.copyFile(...args)
+					valid = false
+				})
+			}
+			await expect(
+				safeWriteJson(
+					file,
+					{ owner: "child" },
+					{
+						publicationGuard: {
+							check: () => {
+								checks++
+								if (point === "streaming" && checks === 2) valid = false
+								if (point === "before-replacement" && checks === 3) valid = false
+								if (!valid) throw new Error("guard lost")
+							},
+						},
+					},
+				),
+			).rejects.toMatchObject({ outcome: "UNKNOWN/BLOCKED", evidence: { owner: "old" } })
+			expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ owner: "old" })
+			expect(rename).not.toHaveBeenCalled()
+		})
+	}
+
+	it("commit-then-error strictly rereads committed bytes, retains backup and never restores or retries", async () => {
+		let renames = 0
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			renames++
+			await fsPromisesActuals.rename!(from, to)
+			throw new Error("after commit")
+		})
+		await expect(
+			safeWriteJson(file, { owner: "child" }, { publicationGuard: { check: () => {} } }),
+		).rejects.toMatchObject({ outcome: "UNKNOWN/BLOCKED", evidence: { owner: "child" } })
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ owner: "child" })
+		expect(renames).toBe(1)
+		expect((await fs.readdir(root)).some((name) => name.endsWith(".backup"))).toBe(true)
+	})
+
+	it("success keeps authority present during backup and publishes once", async () => {
+		const actual = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+			expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ owner: "old" })
+			await actual.copyFile(...args)
+		})
+		await safeWriteJson(file, { owner: "child" }, { publicationGuard: { check: () => {} } })
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ owner: "child" })
+		expect(await fs.readdir(root)).toEqual(["history.json"])
+	})
+})
+
+describe("guarded lock release and compromise", () => {
+	for (const fault of ["release", "compromise"] as const) {
+		it(`${fault} is UNKNOWN with strict committed disk evidence and no retry`, async () => {
+			const actualLock = await vi.importActual<typeof import("proper-lockfile")>("proper-lockfile")
+			vi.resetModules()
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "guarded-release-"))
+			const file = path.join(root, "history.json")
+			vi.mocked(fs.rename).mockImplementation(fsPromisesActuals.rename!)
+			let callback: ((error: Error) => void) | undefined
+			let releases = 0
+			vi.doMock("proper-lockfile", () => ({
+				...actualLock,
+				lock: async (name: string, options?: import("proper-lockfile").LockOptions) => {
+					callback = options?.onCompromised
+					const release = await actualLock.lock(name, options)
+					return async () => {
+						releases++
+						await release()
+						if (fault === "release") throw new Error("release uncertain")
+					}
+				},
+			}))
+			const { safeWriteJson: guardedWriter } = await import("../safeWriteJson")
+			let checks = 0
+			try {
+				await fs.writeFile(file, JSON.stringify({ owner: "old" }))
+				await expect(
+					guardedWriter(
+						file,
+						{ owner: "child" },
+						{
+							publicationGuard: {
+								check: () => {
+									checks++
+									if (fault === "compromise" && checks === 4) callback!(new Error("compromised"))
+								},
+							},
+						},
+					),
+				).rejects.toMatchObject({ outcome: "UNKNOWN/BLOCKED", evidence: { owner: "child" } })
+				expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ owner: "child" })
+				expect(releases).toBe(1)
+			} finally {
+				vi.doUnmock("proper-lockfile")
+				vi.resetModules()
+				vi.restoreAllMocks()
+				await fs.rm(root, { recursive: true, force: true })
+			}
+		})
+	}
+})

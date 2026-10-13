@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Anda yakin ingin menghapus mode {scope} ini?\n\nIni juga akan menghapus folder aturan terkait di:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "Riwayat tugas dimuat, tetapi perbaikan startup dilewati: kunci startup sedang digunakan. Jika tidak ada jendela Zoo Code lain yang terbuka, kunci ini ditinggalkan proses yang crash; pindahkan folder ini ke tempat lain lalu muat ulang: {{lockPath}}",
+		"task_history_startup_generation_invalid": "Riwayat tugas dimuat, tetapi perbaikan startup dilewati: file generasi kunci startup tidak valid. Tutup jendela Zoo Code lain, pindahkan file ini dan folder {{lockPath}} ke tempat lain, lalu muat ulang: {{generationPath}}",
+		"task_history_startup_fence_unusable": "Riwayat tugas dimuat, tetapi perbaikan startup dilewati: folder kunci tidak dapat digunakan ({{code}}). Pastikan itu folder yang dapat ditulis, lalu muat ulang: {{fencePath}}",
 		"invalid_data_uri": "Format data URI tidak valid",
 		"error_copying_image": "Error menyalin gambar: {{errorMessage}}",
 		"error_opening_image": "Error membuka gambar: {{error}}",

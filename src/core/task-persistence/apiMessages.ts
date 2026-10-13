@@ -1,5 +1,6 @@
 import * as path from "path"
 import * as fs from "fs/promises"
+import * as lockfile from "proper-lockfile"
 
 import { Anthropic } from "@anthropic-ai/sdk"
 
@@ -8,6 +9,14 @@ import { GlobalFileNames } from "../../shared/globalFileNames"
 import { getTaskDirectoryPath } from "../../utils/storage"
 import { ensureMessageIdentifiers, mergeApiMessageSnapshots } from "./mergeMessageSnapshots"
 import { getErrorCode, readFileWithMissingRetry } from "./readFileWithMissingRetry"
+import {
+	targetPublicationGuard,
+	persistenceIdentityGuard,
+	assertTargetApiEffect,
+	assertTargetApiOutput,
+	isTargetBound,
+	withTargetPersistence,
+} from "./targetPersistenceBoundary"
 
 export type ApiMessage = Anthropic.MessageParam & {
 	messageId?: string
@@ -118,17 +127,53 @@ export async function readApiMessages({
 	console.warn(
 		`[readApiMessages] Migrating legacy API conversation history for task ${taskId} from claude_messages.json to api_conversation_history.json.`,
 	)
-	await safeWriteJson(filePath, legacyMessages, { merge: mergeApiMessageSnapshots })
+	await withTargetPersistence(globalStoragePath, taskId, async () => {
+		const bound = await isTargetBound(globalStoragePath, taskId)
+		if (bound) {
+			// A target never migrates from an absent current file: its bound API snapshot
+			// would be absent, so replaying legacy data is uncertain, not authority.
+			assertTargetApiEffect(globalStoragePath, taskId, null)
+			throw new ApiMessagesReadError("invalid", "Target API migration requires independent reconciliation")
+		}
+		const checkIdentity = persistenceIdentityGuard(path.dirname(path.dirname(taskDir)), taskId)
+		const guard = targetPublicationGuard(path.dirname(path.dirname(taskDir)), taskId, true)!
+		await safeWriteJson(filePath, legacyMessages, {
+			publicationGuard: {
+				check: (existing, output) => {
+					checkIdentity()
+					guard.check(existing, output)
+				},
+			},
+			merge: (existing, incoming) => {
+				assertTargetApiEffect(path.dirname(path.dirname(taskDir)), taskId, existing)
+				return mergeApiMessageSnapshots(existing, incoming)
+			},
+		})
+		try {
+			// Publication has released the API lock; legacy cleanup takes a separate sequential lock.
+			const release = await lockfile.lock(oldPath, { realpath: false, retries: 5 })
+			try {
+				if (await isTargetBound(globalStoragePath, taskId))
+					throw new ApiMessagesReadError("invalid", "Target migration cleanup refused")
+				assertTargetApiEffect(path.dirname(path.dirname(taskDir)), taskId, legacyMessages)
+				const currentLegacy = await readApiMessagesFile(taskId, oldPath)
+				if (JSON.stringify(currentLegacy) !== JSON.stringify(legacyMessages))
+					throw new Error("Legacy migration source changed")
+				checkIdentity()
+				await fs.unlink(oldPath)
+				checkIdentity()
+			} finally {
+				await release()
+			}
+		} catch (error) {
+			throw new ApiMessagesReadError(
+				"io_error",
+				`Failed to remove migrated API conversation history for ${taskId} at ${oldPath}`,
+				error,
+			)
+		}
+	})
 
-	try {
-		await fs.unlink(oldPath)
-	} catch (error) {
-		throw new ApiMessagesReadError(
-			"io_error",
-			`Failed to remove migrated API conversation history for ${taskId} at ${oldPath}`,
-			error,
-		)
-	}
 	return legacyMessages
 }
 
@@ -143,21 +188,22 @@ export async function saveApiMessages({
 	globalStoragePath: string
 	merge?: boolean
 }): Promise<ApiMessage[]> {
-	ensureMessageIdentifiers(messages)
-	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
-	const filePath = path.join(taskDir, GlobalFileNames.apiConversationHistory)
-	let savedMessages = messages
-	await safeWriteJson(
-		filePath,
-		messages,
-		merge
-			? {
-					merge: (existing, incoming) => {
-						savedMessages = mergeApiMessageSnapshots(existing, incoming) as ApiMessage[]
-						return savedMessages
-					},
-				}
-			: undefined,
-	)
-	return savedMessages
+	return withTargetPersistence(globalStoragePath, taskId, async () => {
+		ensureMessageIdentifiers(messages)
+		const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+		const filePath = path.join(taskDir, GlobalFileNames.apiConversationHistory)
+		let savedMessages = messages
+		await safeWriteJson(filePath, messages, {
+			publicationGuard: targetPublicationGuard(path.dirname(path.dirname(taskDir)), taskId, true),
+			merge: (existing, incoming) => {
+				assertTargetApiEffect(path.dirname(path.dirname(taskDir)), taskId, existing)
+				savedMessages = merge
+					? (mergeApiMessageSnapshots(existing, incoming) as ApiMessage[])
+					: (incoming as ApiMessage[])
+				assertTargetApiOutput(path.dirname(path.dirname(taskDir)), taskId, savedMessages)
+				return savedMessages
+			},
+		})
+		return savedMessages
+	})
 }

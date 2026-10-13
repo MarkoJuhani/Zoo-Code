@@ -5,11 +5,14 @@ import { EventEmitter } from "node:events"
 import type { HistoryItem, PendingTaskAction } from "@roo-code/types"
 import { RooCodeEventName } from "@roo-code/types"
 import { Task } from "../core/task/Task"
+import { TaskScheduler, type TaskScheduledRunner, type TaskScheduleObserver } from "../core/task/TaskScheduler"
 import { ClineProvider } from "../core/webview/ClineProvider"
 import { TaskHistoryStore } from "../core/task-persistence/TaskHistoryStore"
 import { readTaskMessages, saveTaskMessages } from "../core/task-persistence/taskMessages"
 import { readApiMessages, saveApiMessages } from "../core/task-persistence/apiMessages"
 import { GlobalFileNames } from "../shared/globalFileNames"
+import { GuardedPublicationError } from "../utils/safeWriteJson"
+import { createOrdinaryTaskPersistenceAuthority } from "../core/task-persistence/targetPersistenceBoundary"
 import { makeProviderStub } from "./helpers/provider-stub"
 
 vi.mock("../core/environment/getEnvironmentDetails", () => ({
@@ -44,10 +47,21 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 	let runs: Array<{ task: Task; run: () => Promise<void> }>
 	const location = () => ({ taskId: "parent", globalStoragePath: directory })
 	const file = (id: string, name: string) => path.join(directory, "tasks", id, name)
-	const replay = (task: Task, pending: PendingTaskAction) =>
-		(
-			task as unknown as { resumePendingTaskAction(action: PendingTaskAction): Promise<void> }
-		).resumePendingTaskAction(pending)
+	type UserWait = {
+		kind: "user_wait"
+		wait: () => ReturnType<Task["ask"]>
+		resolve: (answer: Awaited<ReturnType<Task["ask"]>>) => Promise<unknown>
+	}
+	/** Present, wait and resolve the restored approval in order, as resumeTaskFromHistory does. */
+	const replay = async (task: Task, pending: PendingTaskAction) => {
+		// Private member access on a prototype-built Task; no public seam exists.
+		const access = task as unknown as { resumePendingTaskAction(action: PendingTaskAction): Promise<UserWait> }
+		let next: unknown = await access.resumePendingTaskAction(pending)
+		while (typeof next === "object" && next !== null && (next as { kind?: unknown }).kind === "user_wait") {
+			const presented = next as UserWait
+			next = await presented.resolve(await presented.wait())
+		}
+	}
 	const complete = () =>
 		ClineProvider.prototype.reopenParentFromDelegation.call(provider, {
 			parentTaskId: "parent",
@@ -63,6 +77,13 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 			taskId: id,
 			instanceId: id + "-restarted",
 			rootTaskId: "parent",
+			parentTaskId: id === "parent" ? undefined : "parent",
+			globalStoragePath: directory,
+			persistenceAuthority: createOrdinaryTaskPersistenceAuthority(
+				store.get(id) ?? { id, parentTaskId: "parent", rootTaskId: "parent" },
+			),
+			// Constructor-owned cleanup is absent from this prototype-loop fixture.
+			dispose: vi.fn().mockResolvedValue(undefined),
 			taskNumber: 1,
 			providerRef: { deref: () => provider },
 			apiConfiguration: {},
@@ -73,6 +94,9 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 			abort: false,
 			abandoned: false,
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
+			// A restored ask is presented by prepareAsk and answered by its returned wait; the
+			// `ask` mock stands for that presented ask and supplies its answer.
+			prepareAsk: vi.fn((...args: Parameters<Task["ask"]>) => Promise.resolve(() => value.ask(...args))),
 			say: vi.fn().mockResolvedValue(undefined),
 			getTaskMode: vi.fn().mockResolvedValue("code"),
 			getTaskApiConfigName: vi.fn().mockResolvedValue("test"),
@@ -132,8 +156,9 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 				throw new Error("No legacy history fallback")
 			}),
 			taskScheduler: {
-				schedule: vi.fn((scheduled: Task, run: () => Promise<void>) => {
-					runs.push({ task: scheduled, run })
+				schedule: vi.fn((scheduled: Task, run?: TaskScheduledRunner, observe?: TaskScheduleObserver) => {
+					// Capture admission, then execute the real scheduler's typed entry on demand.
+					runs.push({ task: scheduled, run: () => new TaskScheduler().schedule(scheduled, run, observe) })
 					return new Promise<void>(() => {})
 				}),
 			},
@@ -161,16 +186,20 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 			if (failure === "metadata absent") await fs.unlink(file("child", GlobalFileNames.historyItem))
 			if (failure === "metadata corrupt") await fs.writeFile(file("child", GlobalFileNames.historyItem), "{")
 			const before = await fs.readFile(file("parent", GlobalFileNames.historyItem), "utf8")
-			expect(await complete()).toMatchObject({
-				kind: "recoverable_failure",
-				phase: "precommit",
-				reason:
-					failure === "metadata absent"
-						? "child_metadata_missing"
-						: failure === "metadata corrupt"
-							? "metadata_read_failed"
-							: "history_read_failed",
-			})
+			if (failure === "metadata corrupt") {
+				await expect(complete()).rejects.toBeInstanceOf(SyntaxError)
+				expect(await fs.readFile(file("child", GlobalFileNames.historyItem), "utf8")).toBe("{")
+			} else
+				expect(await complete()).toMatchObject({
+					kind: "recoverable_failure",
+					phase: "precommit",
+					reason:
+						failure === "metadata absent"
+							? "child_metadata_missing"
+							: failure === "metadata corrupt"
+								? "metadata_read_failed"
+								: "history_read_failed",
+				})
 			expect(await fs.readFile(file("parent", GlobalFileNames.historyItem), "utf8")).toBe(before)
 			expect(runs).toHaveLength(0)
 			expect(provider.getTaskWithId).not.toHaveBeenCalled()
@@ -197,6 +226,10 @@ describe("delegation restart with real persistence and Task prototype loop", () 
 		await store.initialize()
 		Object.defineProperty(provider, "taskHistoryStore", { value: store, configurable: true })
 		expect(store.get("child")).toMatchObject({ status: "blocked_protocol_error", pendingAction: action })
+		await expect(saveTaskMessages({ ...location(), messages: [] })).rejects.toBeInstanceOf(GuardedPublicationError)
+		expect(await fs.readFile(file("parent", GlobalFileNames.uiMessages), "utf8")).toBe("{")
+		// Explicitly restore this test-owned fixture; guarded persistence must not normalize corrupt bytes.
+		await fs.writeFile(file("parent", GlobalFileNames.uiMessages), "[]")
 		await saveTaskMessages({ ...location(), messages: [] })
 		current = task("child")
 		await replay(current, store.get("child")!.pendingAction!)

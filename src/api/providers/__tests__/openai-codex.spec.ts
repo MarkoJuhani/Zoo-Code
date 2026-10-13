@@ -92,6 +92,87 @@ describe("OpenAiCodexHandler.createMessage", () => {
 		vitest.unstubAllGlobals()
 	})
 
+	it.each([
+		{ options: {}, effort: "low" },
+		{ options: { reasoningEffort: "none" }, effort: "low" },
+		{ options: { reasoningEffort: "minimal" }, effort: "low" },
+		{ options: { reasoningEffort: "disable" }, effort: "low" },
+		{ options: { enableReasoningEffort: false }, effort: "low" },
+		...(["low", "medium", "high", "xhigh", "max"] as const).map((effort) => ({
+			options: { reasoningEffort: effort },
+			effort,
+		})),
+	])("sends GPT-6.1 Sol Lite tools with supported reasoning for $options", async ({ options, effort }) => {
+		const sol = new OpenAiCodexHandler({
+			apiModelId: "gpt-6.1-sol",
+			modelTemperature: 0.7,
+			modelMaxTokens: 2048,
+			openAiCodexServiceTier: "priority",
+			...options,
+		} as ConstructorParameters<typeof OpenAiCodexHandler>[0])
+		vitest.spyOn(openAiCodexOAuthManager, "getAccessToken").mockResolvedValue("test-token")
+		vitest.spyOn(openAiCodexOAuthManager, "getAccountId").mockResolvedValue("test-account")
+		const create = vitest.fn().mockResolvedValue(createCompletedStream())
+		Reflect.set(sol, "client", { responses: { create } })
+		await collectStream(
+			sol.createMessage("System", [{ role: "user", content: "Read the file" }], {
+				taskId: "sol-task",
+				tools: [
+					{
+						type: "function",
+						function: { name: "read_file", parameters: { type: "object", properties: {} } },
+					},
+				],
+			}),
+		)
+		expect(sol.getModel().id).toBe("gpt-6.1-sol")
+		expect(create).toHaveBeenCalledTimes(1)
+		const [body, request] = create.mock.calls[0]
+		expect(body).toMatchObject({
+			model: "gpt-6.1-sol",
+			service_tier: "priority",
+			prompt_cache_key: "sol-task",
+			reasoning: { effort, summary: "auto", context: "all_turns" },
+			tool_choice: "auto",
+			parallel_tool_calls: false,
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "additional_tools",
+					tools: [expect.objectContaining({ type: "function", name: "read_file", strict: true })],
+				}),
+			]),
+		})
+		expect(request.headers).toMatchObject({
+			"ChatGPT-Account-Id": "test-account",
+			"session-id": "sol-task",
+			"x-openai-internal-codex-responses-lite": "true",
+		})
+		for (const field of [
+			"instructions",
+			"tools",
+			"max_output_tokens",
+			"max_tokens",
+			"max_completion_tokens",
+			"temperature",
+		]) {
+			expect(body).not.toHaveProperty(field)
+		}
+	})
+
+	it.each(["gpt-6-sol", "gpt-6-luna"])(
+		"routes %s through Lite without changing its medium reasoning default",
+		async (apiModelId) => {
+			const sol = new OpenAiCodexHandler({ apiModelId })
+			vitest.spyOn(openAiCodexOAuthManager, "getAccessToken").mockResolvedValue("test-token")
+			vitest.spyOn(openAiCodexOAuthManager, "getAccountId").mockResolvedValue("test-account")
+			const create = vitest.fn().mockResolvedValue(createCompletedStream())
+			Reflect.set(sol, "client", { responses: { create } })
+			await collectStream(sol.createMessage("System", []))
+			expect(create.mock.calls[0][0].reasoning.effort).toBe("medium")
+			expect(create.mock.calls[0][1].headers["x-openai-internal-codex-responses-lite"]).toBe("true")
+		},
+	)
+
 	it("sends the priority service tier in streaming SDK requests when Fast is selected", async () => {
 		const handler = new OpenAiCodexHandler({
 			apiModelId: "gpt-5.6-sol",

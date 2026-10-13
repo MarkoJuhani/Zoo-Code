@@ -3,6 +3,7 @@ import * as vscode from "vscode"
 import type { PendingTaskAction, TodoItem } from "@roo-code/types"
 
 import { Task } from "../task/Task"
+import type { ClineProvider } from "../webview/ClineProvider"
 import { getModeBySlug } from "../../shared/modes"
 import { formatResponse } from "../prompts/responses"
 import { t } from "../../i18n"
@@ -11,6 +12,7 @@ import { Package } from "../../shared/package"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { toError } from "../../utils/errors"
 
 interface NewTaskParams {
 	mode: string
@@ -25,6 +27,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 		const { mode, message, todos } = params
 		const { askApproval, handleError, pushToolResult, toolCallId } = callbacks
 
+		let diagnostics: ReturnType<ClineProvider["createDelegationDiagnostics"]> | undefined
 		try {
 			// Validate required parameters.
 			if (!mode) {
@@ -116,34 +119,51 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 				task.setPendingTaskAction(pendingAction)
 			}
 
+			diagnostics = provider.createDelegationDiagnostics?.({
+				taskId: task.taskId,
+				instanceId: task.instanceId,
+				actionId: pendingActionId,
+			})
+			diagnostics?.event("approval", "begin")
 			const didApprove = await askApproval("tool", toolMessage)
-			console.info(
-				`[new_task] approval task=${task.taskId} action=${pendingActionId ?? "none"} approved=${didApprove}`,
-			)
+			diagnostics?.event("approval", "end")
 
 			if (!didApprove) {
 				return
 			}
 
+			// Native finalization can approve while the current assistant save still owns
+			// the parent fence. Await that turn outside the handoff scope, even when
+			// there are no earlier tool results for the provider to flush.
+			if (!(await task.waitForCurrentAssistantMessagePersistence())) {
+				return
+			}
+			// The approval's own answered-ask save also holds the parent fence, and the handoff
+			// acquires it with zero wait. Await it here, outside every scope. A failed save is
+			// only logged by the task and does not block delegation.
+			await task.waitForAnsweredAskPersistence()
+			if (task.abort || task.abandoned) {
+				return
+			}
+
 			// Delegate parent and open child as sole active task
-			console.info(`[new_task] delegation_begin task=${task.taskId} action=${pendingActionId ?? "none"}`)
-			const child = await (provider as any).delegateParentAndOpenChild({
+			diagnostics?.event("tool_handoff", "begin")
+			const child = await provider.delegateParentAndOpenChild({
 				parentTaskId: task.taskId,
 				message: unescapedMessage,
 				initialTodos: todoItems,
 				mode,
 				...(pendingActionId && { pendingActionId }),
+				...(diagnostics && { diagnostics }),
 			})
-			console.info(
-				`[new_task] delegation_returned task=${task.taskId} child=${child.taskId} action=${pendingActionId ?? "none"}`,
-			)
+			diagnostics?.event("tool_handoff", "end") // Provider returned; child may still fail asynchronously.
 
 			// Reflect delegation in tool result (no pause/unpause, no wait)
 			pushToolResult(`Delegated to child task ${child.taskId}`)
 			return
 		} catch (error) {
-			console.error(`[new_task] delegation_failed task=${task.taskId} action=${toolCallId ?? "none"}`, error)
-			await handleError("creating new task", error)
+			diagnostics?.event("tool_handoff", "failure", error)
+			await handleError("creating new task", toError(error))
 			return
 		}
 	}

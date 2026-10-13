@@ -1,10 +1,27 @@
 // npx vitest run __tests__/provider-delegation.spec.ts
 
-import { describe, it, expect, vi, type Mock } from "vitest"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
+
+import { afterEach, beforeEach, describe, it, expect, vi, type Mock } from "vitest"
 import type { HistoryItem } from "@roo-code/types"
 import { providerIdentifiers, RooCodeEventName } from "@roo-code/types"
 import { ClineProvider } from "../core/webview/ClineProvider"
 import { TaskScheduler } from "../core/task/TaskScheduler"
+import { TaskHistoryStore } from "../core/task-persistence/TaskHistoryStore"
+
+let storageRoot: string
+const disposableStores: TaskHistoryStore[] = []
+
+beforeEach(async () => {
+	storageRoot = await fs.mkdtemp(path.join(os.tmpdir(), "provider-delegation-fixture-"))
+})
+
+afterEach(async () => {
+	for (const store of disposableStores.splice(0)) store.dispose()
+	await fs.rm(storageRoot, { recursive: true, force: true })
+})
 
 const parentHistoryItem: HistoryItem = {
 	id: "parent-1",
@@ -37,6 +54,8 @@ function makeStoreStub(overrides: Partial<{ atomicReadAndUpdate: Mock; get: Mock
 const makeParentTask = () =>
 	({
 		taskId: "parent-1",
+		userMessageContent: [],
+		dispose: vi.fn().mockResolvedValue(undefined),
 		apiConfiguration: { apiProvider: providerIdentifiers.anthropic, anthropicApiKey: "task-local-key" },
 		getTaskMode: vi.fn().mockResolvedValue("code"),
 		getTaskApiConfigName: vi.fn().mockResolvedValue("task-local-profile"),
@@ -49,6 +68,7 @@ type ProviderFixture = {
 	[key: string]: unknown
 	taskHistoryStore?: {
 		get: (id: string) => HistoryItem | undefined
+		atomicReadAndUpdate?: Mock
 		readAuthoritative?: Mock
 		upsert?: Mock
 		delete?: Mock
@@ -57,17 +77,51 @@ type ProviderFixture = {
 	createTask?: Mock
 }
 
-function prepareProvider(stub: ProviderFixture): ClineProvider {
-	const store = stub.taskHistoryStore
-	if (store) {
-		store.readAuthoritative ??= vi.fn(async (id: string) => {
-			const item = store.get(id)
-			return item ? { kind: "found", item } : { kind: "missing" }
-		})
-		store.upsert ??= vi.fn(async (item: HistoryItem) => [item])
-		store.delete ??= vi.fn().mockResolvedValue(undefined)
-		stub.updateTaskHistory ??= vi.fn((item: HistoryItem) => store.upsert!(item))
+async function prepareProvider(stub: ProviderFixture): Promise<ClineProvider> {
+	const fixture = stub.taskHistoryStore
+	if (!fixture) throw new Error("Delegation fixture requires a store scenario")
+	const store = new TaskHistoryStore(storageRoot)
+	disposableStores.push(store)
+	await store.initialize()
+	const parent = fixture.get("parent-1")
+	if (parent && (await store.readAuthoritative(parent.id)).kind === "missing") await store.upsert(parent)
+	if (parent?.awaitingChildId) {
+		const child = fixture.get(parent.awaitingChildId)
+		if (child && (await store.readAuthoritative(child.id)).kind === "missing") await store.upsert(child)
 	}
+
+	// Keep scenario gates/failures, but every successful mutation must still cross
+	// the real store mutex, exclusion, file lock and final publication checks.
+	const beforeCommit = fixture.atomicReadAndUpdate
+	const beforeUpsert = fixture.upsert
+	const beforeDelete = fixture.delete
+	const atomicReadAndUpdate = store.atomicReadAndUpdate.bind(store)
+	const upsert = store.upsert.bind(store)
+	const deleteItem = store.delete.bind(store)
+	Object.assign(fixture, {
+		get: vi.spyOn(store, "get"),
+		readAuthoritative: vi.spyOn(store, "readAuthoritative"),
+		atomicReadAndUpdate: vi.spyOn(store, "atomicReadAndUpdate").mockImplementation(async (id, updater) => {
+			// Scenario hooks may gate or fail before the actual mutation. Their return
+			// value is never publication: the real updater must still validate disk.
+			await beforeCommit?.(id, updater)
+			return atomicReadAndUpdate(id, updater)
+		}),
+		upsert: vi.spyOn(store, "upsert").mockImplementation(async (item) => {
+			await beforeUpsert?.(item)
+			return upsert(item)
+		}),
+		delete: vi.spyOn(store, "delete").mockImplementation(async (id) => {
+			await beforeDelete?.(id)
+			return deleteItem(id)
+		}),
+	})
+	Object.assign(stub, {
+		taskHistoryStore: store,
+		contextProxy: { globalStorageUri: { fsPath: storageRoot } },
+	})
+	stub.updateTaskHistory ??= vi.fn((item: HistoryItem) => store.upsert(item))
+
 	if (stub.createTask) {
 		const create = stub.createTask.getMockImplementation()
 		stub.createTask.mockImplementation(async (...args: Parameters<ClineProvider["createTask"]>) => {
@@ -78,8 +132,22 @@ function prepareProvider(stub: ProviderFixture): ClineProvider {
 			child.cwd ??= "/workspace"
 			child.rootTaskId ??= "parent-1"
 			child.dispose ??= vi.fn().mockResolvedValue(undefined)
+			child.runScheduled ??= vi.fn(() => child.run())
 			return child
 		})
+	}
+	if (vi.isMockFunction(stub.createTaskWithHistoryItem) && vi.isMockFunction(stub.getCurrentTask)) {
+		const restore = stub.createTaskWithHistoryItem.getMockImplementation()
+		const current = stub.getCurrentTask
+		stub.createTaskWithHistoryItem.mockImplementation(
+			async (item: HistoryItem, options: { startTask?: boolean }) => {
+				const task = (await restore?.(item, options)) ?? makeParentTask()
+				task.taskId ??= item.id
+				task.emit ??= vi.fn()
+				current.mockReturnValue(task)
+				return task
+			},
+		)
 	}
 	// The fixture supplies only the provider members exercised by delegation.
 	return stub as unknown as ClineProvider
@@ -108,7 +176,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		const taskHistoryStore = makeStoreStub({
 			get: vi.fn().mockReturnValue({ ...parentHistoryItem, status: "interrupted", pendingAction }),
 		})
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			getCurrentTask: vi.fn(() => parentTask),
 			removeClineFromStack,
 			createTask,
@@ -148,7 +216,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 				},
 			}),
 		})
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			getCurrentTask: vi.fn(() => parentTask),
 			removeClineFromStack,
 			createTask,
@@ -193,7 +261,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		}
 		const parentTask = makeParentTask()
 		const child = { taskId: "child-1", run: vi.fn().mockResolvedValue(undefined) }
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -243,7 +311,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		})
 		const deleteTaskWithId = vi.fn().mockResolvedValue(undefined)
 		const createTaskWithHistoryItem = vi.fn().mockResolvedValue(undefined)
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask,
@@ -268,10 +336,19 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 				mode: "code",
 				pendingActionId: "create-action",
 			}),
-		).rejects.toThrow("Pending action mismatch for parent parent-1")
+		).rejects.toMatchObject({
+			name: "DelegationRecoverableError",
+			originalError: expect.objectContaining({
+				message: expect.stringContaining("Pending action, owner, revision or question changed before commit"),
+			}),
+		})
 
 		expect(child.run).not.toHaveBeenCalled()
-		expect(taskHistoryStore.delete).toHaveBeenCalledWith("child-1")
+		expect(taskHistoryStore.delete).not.toHaveBeenCalled()
+		expect(await provider.taskHistoryStore.readAuthoritative("child-1")).toMatchObject({
+			kind: "found",
+			item: { id: "child-1", parentTaskId: "parent-1", status: "active" },
+		})
 		expect(createTaskWithHistoryItem).toHaveBeenCalledWith(expect.objectContaining({ id: "parent-1" }), {
 			startTask: false,
 		})
@@ -287,7 +364,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		const handleModeSwitch = vi.fn().mockResolvedValue(undefined)
 		const taskHistoryStore = makeStoreStub()
 
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: providerEmit,
 			getCurrentTask: vi.fn(() => parentTask),
@@ -367,7 +444,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			getCurrentProfileName: vi.fn(),
 		}
 		const workspaceGet = vi.fn().mockReturnValue(false)
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -429,7 +506,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 				? vi.fn().mockRejectedValue(savedProfile)
 				: vi.fn().mockResolvedValue(savedProfile)
 		const log = vi.fn()
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -456,7 +533,13 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		else expect(getProfile).not.toHaveBeenCalled()
 		if (savedProfile instanceof Error) {
 			expect(
-				log.mock.calls.some(([message]) => message.includes("stale-id") && message.includes("parent parent-1")),
+				log.mock.calls.some(
+					([message]) =>
+						message.startsWith("[ordinary_delegation] ") &&
+						JSON.parse(message.slice("[ordinary_delegation] ".length)).task === "parent-1" &&
+						JSON.parse(message.slice("[ordinary_delegation] ".length)).phase === "child_prepare" &&
+						JSON.parse(message.slice("[ordinary_delegation] ".length)).stage === "failure",
+				),
 			).toBe(true)
 		}
 		expect(createTask).toHaveBeenCalledWith(
@@ -484,7 +567,8 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			get: vi.fn().mockReturnValueOnce(parentHistoryItem).mockReturnValue(updatedParent),
 		})
 
-		const provider = prepareProvider({
+		const notificationGet = taskHistoryStore.get
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -497,6 +581,9 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			recentTasksCache: undefined,
 			taskHistoryStore,
 		})
+
+		// Deliberately stale/missing UI cache; authoritative reads still use real disk.
+		vi.mocked(provider["taskHistoryStore"].get).mockImplementation(notificationGet)
 
 		await (ClineProvider.prototype as any).delegateParentAndOpenChild.call(provider, {
 			parentTaskId: "parent-1",
@@ -518,7 +605,8 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			get: vi.fn().mockReturnValueOnce(parentHistoryItem).mockReturnValue(undefined),
 		})
 
-		const provider = prepareProvider({
+		const notificationGet = taskHistoryStore.get
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -531,6 +619,9 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			recentTasksCache: undefined,
 			taskHistoryStore,
 		})
+
+		// Deliberately stale/missing UI cache; authoritative reads still use real disk.
+		vi.mocked(provider["taskHistoryStore"].get).mockImplementation(notificationGet)
 
 		await (ClineProvider.prototype as any).delegateParentAndOpenChild.call(provider, {
 			parentTaskId: "parent-1",
@@ -560,7 +651,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			}),
 		})
 
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => parentTask),
@@ -607,7 +698,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			}),
 		})
 
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => makeParentTask()),
@@ -668,7 +759,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			}),
 		})
 
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask,
@@ -706,7 +797,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		const taskHistoryStore = makeStoreStub({
 			get: vi.fn().mockReturnValue({ ...parentHistoryItem, status: "delegated" }),
 		})
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			getCurrentTask: vi.fn(() => parentTask),
 			removeClineFromStack: vi.fn(),
 			createTask: vi.fn(),
@@ -735,7 +826,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			releaseCommit = resolve
 		})
 
-		const makeProvider = (childId: string) => {
+		const makeProvider = async (childId: string) => {
 			const parent = makeParentTask()
 			const child = { taskId: childId, run: vi.fn().mockResolvedValue(undefined) }
 			const removeClineFromStack = vi.fn().mockResolvedValue(undefined)
@@ -749,7 +840,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 					return [durableParent]
 				}),
 			}
-			const provider = prepareProvider({
+			const provider = await prepareProvider({
 				taskScheduler: new TaskScheduler(),
 				emit: vi.fn(),
 				getCurrentTask: vi.fn(() => parent),
@@ -763,8 +854,8 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			return { provider, child, removeClineFromStack }
 		}
 
-		const first = makeProvider("child-1")
-		const second = makeProvider("child-2")
+		const first = await makeProvider("child-1")
+		const second = await makeProvider("child-2")
 		const firstDelegation = ClineProvider.prototype.delegateParentAndOpenChild.call(first.provider, {
 			parentTaskId: "parent-1",
 			message: "First",
@@ -790,7 +881,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		expect(durableParent.awaitingChildId).toBe("child-1")
 	})
 
-	it("rolls back the paused child and restores the parent when atomicReadAndUpdate fails", async () => {
+	it("disposes the paused child, retains its durable evidence and restores the stopped parent after commit failure", async () => {
 		const persistError = new Error("parent metadata persist failed")
 		const parentTask = makeParentTask()
 		const childRun = vi.fn().mockResolvedValue(undefined)
@@ -815,7 +906,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 			return child
 		})
 
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskScheduler: new TaskScheduler(),
 			emit: vi.fn(),
 			getCurrentTask,
@@ -838,12 +929,20 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 				initialTodos: [],
 				mode: "code",
 			}),
-		).rejects.toThrow(persistError)
+		).rejects.toMatchObject({
+			name: "DelegationRecoverableError",
+			originalError: persistError,
+			disposition: "parent_restored",
+		})
 
 		expect(childRun).not.toHaveBeenCalled()
 		expect(removeClineFromStack).toHaveBeenNthCalledWith(1, "delegation_disposal")
 		expect(removeClineFromStack).toHaveBeenNthCalledWith(2, "delegation_disposal")
-		expect(taskHistoryStore.delete).toHaveBeenCalledWith("child-1")
+		expect(taskHistoryStore.delete).not.toHaveBeenCalled()
+		expect(await provider.taskHistoryStore.readAuthoritative("child-1")).toMatchObject({
+			kind: "found",
+			item: { id: "child-1", parentTaskId: "parent-1", status: "active" },
+		})
 		expect(createTaskWithHistoryItem).toHaveBeenCalledWith(expect.objectContaining({ id: "parent-1" }), {
 			startTask: false,
 		})
@@ -851,7 +950,7 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 })
 
 describe("Provider initial-child durability regressions", () => {
-	function setup() {
+	async function setup() {
 		const parent = { ...parentHistoryItem, number: 1, ts: 1, status: "active" as const }
 		const items = new Map<string, HistoryItem>([[parent.id, parent]])
 		const order: string[] = []
@@ -865,7 +964,6 @@ describe("Provider initial-child durability regressions", () => {
 			getTaskApiConfigName: vi.fn().mockResolvedValue("child-profile"),
 			dispose: vi.fn(async () => {
 				order.push("dispose")
-				items.set("paused-child", { ...parent, id: "paused-child" })
 			}),
 			run: vi.fn(async () => {
 				order.push("run")
@@ -904,7 +1002,7 @@ describe("Provider initial-child durability regressions", () => {
 				return [...items.values()]
 			}),
 		}
-		const provider = prepareProvider({
+		const provider = await prepareProvider({
 			taskHistoryStore: store,
 			getCurrentTask: vi.fn(() => current),
 			removeClineFromStack: vi.fn(async () => {
@@ -936,22 +1034,31 @@ describe("Provider initial-child durability regressions", () => {
 	}
 
 	it("persists complete initial child metadata before parent commit and child scheduling", async () => {
-		const f = setup()
+		const f = await setup()
 		expect(await f.delegate()).toBe(f.child)
 		await vi.waitFor(() => expect(f.child.run).toHaveBeenCalledOnce())
 		expect(f.order).toEqual(["child metadata", "parent commit", "run"])
 	})
 
 	it.each(["child metadata", "parent commit"])(
-		"restores parent after %s failure and drains disposal before deletion",
+		"restores parent after %s failure, drains disposal and retains durable child evidence",
 		async (phase) => {
-			const f = setup()
+			const f = await setup()
 			const failure = new Error(phase)
 			if (phase === "child metadata") f.store.upsert.mockRejectedValueOnce(failure)
 			else f.store.atomicReadAndUpdate.mockRejectedValueOnce(failure)
-			await expect(f.delegate()).rejects.toBe(failure)
-			expect(f.order.slice(-2)).toEqual(["dispose", "delete"])
-			expect(f.items.has(f.child.taskId)).toBe(false)
+			await expect(f.delegate()).rejects.toMatchObject({
+				name: "DelegationRecoverableError",
+				originalError: failure,
+				disposition: "parent_restored",
+			})
+			expect(f.order.at(-1)).toBe("dispose")
+			expect(f.store.delete).not.toHaveBeenCalled()
+			const retained = await f.provider.taskHistoryStore.readAuthoritative(f.child.taskId)
+			expect(retained.kind).toBe(phase === "parent commit" ? "found" : "missing")
+			if (retained.kind === "found")
+				expect(retained.item).toMatchObject({ id: f.child.taskId, status: "active", parentTaskId: f.parent.id })
+			expect(f.items.has(f.child.taskId)).toBe(phase === "parent commit")
 			expect(f.items.get(f.parent.id)?.status).toBe("active")
 			expect(f.provider.createTaskWithHistoryItem).toHaveBeenCalledWith(f.parent, { startTask: false })
 			expect(f.child.run).not.toHaveBeenCalled()
@@ -959,7 +1066,7 @@ describe("Provider initial-child durability regressions", () => {
 	)
 
 	it("does not roll back committed delegation when its webview notification rejects", async () => {
-		const f = setup()
+		const f = await setup()
 		vi.mocked(f.provider.postMessageToWebview).mockRejectedValue(new Error("webview closed"))
 		expect(await f.delegate()).toBe(f.child)
 		expect(f.store.delete).not.toHaveBeenCalled()

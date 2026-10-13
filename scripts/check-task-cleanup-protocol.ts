@@ -18,8 +18,11 @@ interface TaskState {
 
 interface ModelState {
 	tasks: Record<TaskId, TaskState>
-	shutdown: "idle" | "call-abort" | "wait-abort" | "wait-disposal" | "done"
+	shutdown: "idle" | "call-abort" | "wait-abort" | "wait-disposal" | "wait-interruption" | "blocked" | "done"
 	shutdownIndex: number
+	providerDisposalCalls: Record<TaskId, number>
+	interrupted: Record<TaskId, boolean>
+	ownership: "owned" | "lost"
 	drained: Record<TaskId, boolean>
 }
 
@@ -47,6 +50,10 @@ const expectedActions = [
 	"shutdown-abort",
 	"shutdown-dispose",
 	"advance-shutdown",
+	"interrupt-evicted-child",
+	"lose-eviction-ownership",
+	"block-shutdown",
+	"reject-eviction-interruption",
 ] as const
 
 function task(): TaskState {
@@ -66,6 +73,9 @@ function initialState(): ModelState {
 		tasks: { A: task(), B: task() },
 		shutdown: "idle",
 		shutdownIndex: 0,
+		providerDisposalCalls: { A: 0, B: 0 },
+		interrupted: { A: false, B: false },
+		ownership: "owned",
 		drained: { A: false, B: false },
 	}
 }
@@ -175,19 +185,39 @@ function transitions(state: ModelState): Step[] {
 		const next = clone(state)
 		next.shutdown = "call-abort"
 		result.push({ action: "start-shutdown()", state: next })
-	} else if (state.shutdown !== "done") {
+	} else if (state.shutdown !== "done" && state.shutdown !== "blocked") {
 		const taskId = taskIds[state.shutdownIndex]
 		if (taskId) {
 			const current = state.tasks[taskId]
+			if (state.ownership === "lost") {
+				const next = clone(state)
+				next.shutdown = "blocked"
+				result.push({ action: `block-shutdown(${taskId})`, state: next })
+				return result
+			}
+			if (state.shutdown === "wait-disposal" || state.shutdown === "wait-interruption") {
+				const next = clone(state)
+				next.ownership = "lost"
+				result.push({ action: `lose-eviction-ownership(${taskId})`, state: next })
+			}
 			if (state.shutdown === "call-abort") {
 				const next = callAbort(state, taskId)
 				next.shutdown = "wait-abort"
 				result.push({ action: `shutdown-abort(${taskId})`, state: next })
 			} else if (state.shutdown === "wait-abort" && isTerminal(current.abort)) {
 				const next = callDispose(state, taskId)
+				next.providerDisposalCalls[taskId] += 1
 				next.shutdown = "wait-disposal"
 				result.push({ action: `shutdown-dispose(${taskId})`, state: next })
 			} else if (state.shutdown === "wait-disposal" && isTerminal(current.disposal)) {
+				const failed = clone(state)
+				failed.shutdown = "blocked"
+				result.push({ action: `reject-eviction-interruption(${taskId})`, state: failed })
+				const next = clone(state)
+				next.shutdown = "wait-interruption"
+				next.interrupted[taskId] = true
+				result.push({ action: `interrupt-evicted-child(${taskId})`, state: next })
+			} else if (state.shutdown === "wait-interruption") {
 				const next = clone(state)
 				next.drained[taskId] = true
 				next.shutdownIndex += 1
@@ -203,6 +233,11 @@ function invariantViolations(state: ModelState): string[] {
 	const violations: string[] = []
 	for (const taskId of taskIds) {
 		const current = state.tasks[taskId]
+		if (state.providerDisposalCalls[taskId] > 1)
+			violations.push(`${taskId}: provider disposal called more than once`)
+		if (state.drained[taskId] && (!state.interrupted[taskId] || state.providerDisposalCalls[taskId] !== 1)) {
+			violations.push(`${taskId}: eviction must dispose once and preserve interruption before advancing`)
+		}
 		if (current.abortStarts > 1 || current.disposalStarts > 1) {
 			violations.push(`${taskId}: abort and disposal may each start at most once`)
 		}
@@ -263,6 +298,12 @@ function runModelCheck(): { states: number; actions: number; landmarks: number }
 
 	for (let index = 0; index < queue.length; index++) {
 		const node = queue[index]!
+		if (node.state.shutdown === "blocked" && node.state.ownership === "owned")
+			reachedLandmarks.add("interruption-persistence-failure-blocks-shutdown")
+		if (node.state.shutdown === "blocked" && node.state.ownership === "lost")
+			reachedLandmarks.add("ownership-loss-blocks-shutdown")
+		if (node.state.drained.A && node.state.tasks.A.disposal === "rejected" && node.state.interrupted.A)
+			reachedLandmarks.add("eviction-rejection-preserves-interruption")
 		const violations = invariantViolations(node.state)
 		if (violations.length) {
 			throw new Error(
@@ -323,6 +364,9 @@ function runModelCheck(): { states: number; actions: number; landmarks: number }
 		"shutdown-continues-after-abort-rejection",
 		"history-task-final-save-skip",
 		"multi-task-shutdown-drained",
+		"ownership-loss-blocks-shutdown",
+		"interruption-persistence-failure-blocks-shutdown",
+		"eviction-rejection-preserves-interruption",
 	]
 	const missingLandmarks = expectedLandmarks.filter((landmark) => !reachedLandmarks.has(landmark))
 	assert.deepEqual(missingLandmarks, [], `Cleanup protocol has unreachable landmarks: ${missingLandmarks.join(", ")}`)
@@ -332,5 +376,5 @@ function runModelCheck(): { states: number; actions: number; landmarks: number }
 runRepresentativeMemoizationChecks()
 const result = runModelCheck()
 console.log(
-	`Task cleanup protocol model check passed: ${result.states} reachable states, ${result.actions}/${expectedActions.length} actions reachable, ${result.landmarks}/8 landmarks reached, depth <= ${MAX_DEPTH}, tasks=${taskIds.length}`,
+	`Task cleanup protocol model check passed: ${result.states} reachable states, ${result.actions}/${expectedActions.length} actions reachable, ${result.landmarks}/11 landmarks reached, depth <= ${MAX_DEPTH}, tasks=${taskIds.length}`,
 )

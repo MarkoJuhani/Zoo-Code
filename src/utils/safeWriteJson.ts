@@ -25,6 +25,9 @@ export interface SafeWriteJsonOptions {
 	 * cannot be parsed.
 	 */
 	merge?: (existing: unknown, incoming: unknown) => unknown
+
+	/** Caller holds cooperative exclusion BEFORE acquiring this file lock, through release. */
+	publicationGuard?: { check: (existing: unknown, output: unknown) => void }
 }
 
 /**
@@ -44,6 +47,7 @@ export interface SafeWriteJsonOptions {
 
 async function safeWriteJson(filePath: string, data: any, options?: SafeWriteJsonOptions): Promise<void> {
 	const absoluteFilePath = path.resolve(filePath)
+	let compromised: Error | undefined
 	let releaseLock = async () => {} // Initialized to a no-op
 
 	// For directory creation
@@ -76,7 +80,8 @@ async function safeWriteJson(filePath: string, data: any, options?: SafeWriteJso
 			},
 			onCompromised: (err) => {
 				console.error(`Lock at ${absoluteFilePath} was compromised:`, err)
-				throw err
+				if (options?.publicationGuard) compromised = err
+				else throw err
 			},
 		})
 	} catch (lockError) {
@@ -91,6 +96,25 @@ async function safeWriteJson(filePath: string, data: any, options?: SafeWriteJso
 	// Variables to hold the actual paths of temp files if they are created.
 	let actualTempNewFilePath: string | null = null
 	let actualTempBackupFilePath: string | null = null
+
+	if (options?.publicationGuard) {
+		let failure: unknown
+		try {
+			await guardedPublication(absoluteFilePath, data, options, () => {
+				if (compromised) throw compromised
+			})
+		} catch (error) {
+			failure = error
+		}
+		try {
+			await releaseLock()
+			if (compromised) throw compromised
+		} catch (error) {
+			failure ??= await publicationError(absoluteFilePath, error)
+		}
+		if (failure) throw failure
+		return
+	}
 
 	try {
 		// If a merge callback was provided, read the current file under the lock
@@ -216,6 +240,84 @@ async function safeWriteJson(filePath: string, data: any, options?: SafeWriteJso
 			// Do not re-throw here, as the originalError from the try/catch (if any) is more important.
 			console.error(`Failed to release lock for ${absoluteFilePath}:`, unlockError)
 		}
+	}
+}
+
+/** An error is never a no-commit receipt. Evidence is a strict post-effect disk observation. */
+export class GuardedPublicationError extends Error {
+	readonly outcome = "UNKNOWN/BLOCKED"
+	constructor(
+		public readonly evidence: unknown,
+		public readonly originalError: unknown,
+	) {
+		super(`Guarded publication UNKNOWN/BLOCKED: ${String(originalError)}`)
+		this.name = "GuardedPublicationError"
+	}
+}
+
+async function publicationError(file: string, error: unknown): Promise<GuardedPublicationError> {
+	try {
+		return new GuardedPublicationError(JSON.parse(await fs.readFile(file, "utf8")), error)
+	} catch (readError) {
+		return new GuardedPublicationError({ unreadable: String(readError) }, error)
+	}
+}
+
+async function guardedPublication(
+	file: string,
+	incoming: unknown,
+	options: SafeWriteJsonOptions,
+	assertLock: () => void,
+): Promise<void> {
+	const read = async (): Promise<string | undefined> => {
+		try {
+			const stat = await fs.lstat(file)
+			if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Uncertain publication identity")
+			return await fs.readFile(file, "utf8")
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+			throw error
+		}
+	}
+	const temporary = `${file}.guarded-new_${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`
+	const backup = `${temporary}.backup`
+	let attempted = false
+	try {
+		const original = await read()
+		const existing = original === undefined ? null : JSON.parse(original)
+		const output = options.merge ? options.merge(existing, incoming) : incoming
+		const check = async () => {
+			assertLock()
+			const current = await read()
+			if (current !== original) throw new Error("Authoritative publication identity changed")
+			options.publicationGuard!.check(existing, output)
+		}
+		await check()
+		await _streamDataToFile(temporary, output, options.prettyPrint)
+		await check()
+		// Unlike the ordinary branch, never remove authority for a backup rename.
+		// A failed copy leaves the original intact; ambiguous replacements never roll back.
+		if (original !== undefined) await fs.copyFile(file, backup, fsSync.constants.COPYFILE_EXCL)
+		await check()
+		attempted = true
+		await fs.rename(temporary, file)
+		assertLock()
+		options.publicationGuard!.check(existing, output)
+		const committed = await read()
+		if (committed === undefined || JSON.stringify(JSON.parse(committed)) !== JSON.stringify(output))
+			throw new Error("Publication read-back changed")
+		if (original !== undefined) await fs.unlink(backup)
+	} catch (error) {
+		// Never retry or restore a backup over a possibly committed child/owner record.
+		// Retain both candidates on an attempted replacement, including commit-then-error.
+		if (!attempted) {
+			try {
+				await fs.unlink(temporary)
+			} catch {
+				/* May not have been created. */
+			}
+		}
+		throw await publicationError(file, error)
 	}
 }
 

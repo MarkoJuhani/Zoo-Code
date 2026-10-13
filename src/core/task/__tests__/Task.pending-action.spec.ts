@@ -1,19 +1,59 @@
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
+
 import type { PendingTaskAction } from "@roo-code/types"
 
 import { Task } from "../Task"
+import { createOrdinaryTaskPersistenceAuthority } from "../../task-persistence/targetPersistenceBoundary"
 
+type AskAnswer = Awaited<ReturnType<Task["ask"]>>
+/** A restored-task user wait: presented under the start exclusion, answered after its release. */
+type UserWait = { kind: "user_wait"; wait: () => Promise<AskAnswer>; resolve: (answer: AskAnswer) => Promise<unknown> }
 type PendingActionAccess = {
-	resumePendingTaskAction(action: PendingTaskAction): Promise<void>
+	resumePendingTaskAction(action: PendingTaskAction): Promise<UserWait>
 }
 
-const getPendingActionAccess = (task: Task) => task as unknown as PendingActionAccess
+const isUserWait = (value: unknown): value is UserWait =>
+	typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "user_wait"
+
+/**
+ * Present, wait and resolve in order, as resumeTaskFromHistory does around its exclusion scopes.
+ * The scope and ownership re-check belong to resumeTaskFromHistory and are covered elsewhere.
+ */
+const getPendingActionAccess = (task: Task) => ({
+	async resumePendingTaskAction(action: PendingTaskAction): Promise<void> {
+		// Private member access on a prototype-built Task; no public seam exists.
+		let next: unknown = await (task as unknown as PendingActionAccess).resumePendingTaskAction(action)
+		while (isUserWait(next)) next = await next.resolve(await next.wait())
+	},
+})
+
+/** Real disposable storage: clearing a resolved action runs under ordinary persistence and its fence. */
+let globalStoragePath: string
+beforeEach(async () => {
+	globalStoragePath = await fs.mkdtemp(path.join(os.tmpdir(), "pending-action-replay-"))
+})
+afterEach(async () => {
+	await fs.rm(globalStoragePath, { recursive: true, force: true })
+})
 
 function createTask(provider?: object) {
 	const task = Object.create(Task.prototype) as Task
+	// Each presentation reads the authoritative status baseline under its scope.
+	if (provider && !("getTaskMetadata" in provider))
+		Object.assign(provider, {
+			getTaskMetadata: vi.fn().mockResolvedValue({ kind: "found", item: { id: "task-1", status: "active" } }),
+		})
 	Object.assign(task, {
 		taskId: "task-1",
+		globalStoragePath,
+		persistenceAuthority: createOrdinaryTaskPersistenceAuthority({ id: "task-1" }),
 		providerRef: { deref: () => provider },
 		ask: vi.fn(),
+		// A restored ask is presented by prepareAsk and answered by its returned wait; the `ask`
+		// mock stands for that presented ask and supplies its answer.
+		prepareAsk: vi.fn((...args: Parameters<Task["ask"]>) => Promise.resolve(() => task.ask(...args))),
 		say: vi.fn().mockResolvedValue(undefined),
 		initiateTaskLoop: vi.fn().mockResolvedValue(undefined),
 		persistQueuedFeedbackAndAcknowledge: vi.fn().mockResolvedValue(true),
@@ -183,9 +223,11 @@ describe("Task pending action replay", () => {
 
 		expect(task.persistQueuedFeedbackAndAcknowledge).toHaveBeenCalledWith("queued-1", "Revise this", undefined)
 		const initiateTaskLoop = (task as unknown as { initiateTaskLoop: ReturnType<typeof vi.fn> }).initiateTaskLoop
-		expect(initiateTaskLoop).toHaveBeenCalledWith([
-			expect.objectContaining({ type: "tool_result", tool_use_id: "finish-action" }),
-		])
+		// The denied loop is prepared in the resolve phase and runs after the exclusion is released.
+		expect(initiateTaskLoop).toHaveBeenCalledWith(
+			[expect.objectContaining({ type: "tool_result", tool_use_id: "finish-action" })],
+			expect.any(Function),
+		)
 		const persist = vi.mocked(task.persistQueuedFeedbackAndAcknowledge)
 		expect(persist.mock.invocationCallOrder[0]).toBeLessThan(initiateTaskLoop.mock.invocationCallOrder[0])
 	})
@@ -229,13 +271,17 @@ describe("Task pending action replay", () => {
 		expect(provider.delegateParentAndOpenChild).not.toHaveBeenCalled()
 		expect(provider.reopenParentFromDelegation).not.toHaveBeenCalled()
 		expect(task.say).not.toHaveBeenCalled()
-		expect(initiateTaskLoop).toHaveBeenCalledWith([
-			{
-				type: "tool_result",
-				tool_use_id: "create-action",
-				content: JSON.stringify({ status: "denied", message: "The user denied this operation." }),
-			},
-		])
+		// The denied loop is prepared in the resolve phase and runs after the exclusion is released.
+		expect(initiateTaskLoop).toHaveBeenCalledWith(
+			[
+				{
+					type: "tool_result",
+					tool_use_id: "create-action",
+					content: JSON.stringify({ status: "denied", message: "The user denied this operation." }),
+				},
+			],
+			expect.any(Function),
+		)
 	})
 
 	it("fails clearly when the provider is unavailable", async () => {

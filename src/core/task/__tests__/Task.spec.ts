@@ -1,5 +1,6 @@
 // npx vitest core/task/__tests__/Task.spec.ts
 
+import { mkdtempSync, rmSync } from "fs"
 import * as os from "os"
 import * as path from "path"
 
@@ -32,6 +33,7 @@ import { ContextProxy } from "../../config/ContextProxy"
 import { processUserContentMentions } from "../../mentions/processUserContentMentions"
 import { MultiSearchReplaceDiffStrategy } from "../../diff/strategies/multi-search-replace"
 import type { ApiMessage } from "../../task-persistence"
+import { TaskHistoryStore } from "../../task-persistence/TaskHistoryStore"
 import { asyncStreamFrom } from "../../../test-utils/stream"
 import { McpHub } from "../../../services/mcp/McpHub"
 import { McpServerManager } from "../../../services/mcp/McpServerManager"
@@ -102,6 +104,8 @@ vi.mock("execa", () => ({
 	execa: vi.fn(),
 }))
 
+const disposableStorageRoots = vi.hoisted(() => new Set<string>())
+
 vi.mock("fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("fs/promises")>()
 	const mockFunctions = {
@@ -133,6 +137,19 @@ vi.mock("fs/promises", async (importOriginal) => {
 		rmdir: vi.fn().mockResolvedValue(undefined),
 		stat: vi.fn().mockRejectedValue({ code: "ENOENT" }),
 		readdir: vi.fn().mockResolvedValue([]),
+	}
+
+	// Only the guarded-start fixture uses real disk; unrelated unit fixtures keep
+	// their existing transcript doubles. Never fake the persistence boundary's I/O.
+	for (const key of Object.keys(mockFunctions) as Array<keyof typeof mockFunctions>) {
+		const fallback = mockFunctions[key].getMockImplementation()!
+		mockFunctions[key].mockImplementation((...args: unknown[]) => {
+			const file = args[0]
+			const real =
+				typeof file === "string" &&
+				[...disposableStorageRoots].some((root) => file === root || file.startsWith(`${root}${path.sep}`))
+			return Reflect.apply(real ? actual[key] : fallback, undefined, args)
+		})
 	}
 
 	return {
@@ -277,7 +294,8 @@ vi.mock("../../prompts/system", async (importOriginal) => {
 })
 
 // Mock storagePathManager to prevent dynamic import issues.
-vi.mock("../../../utils/storage", () => ({
+vi.mock("../../../utils/storage", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../utils/storage")>()),
 	getTaskDirectoryPath: vi
 		.fn()
 		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
@@ -2144,12 +2162,20 @@ describe("Cline", () => {
 			})
 
 			describe("processUserContentMentions", () => {
+				let disposeStorage: () => void
+				beforeEach(async () => {
+					disposeStorage = await prepareGuardedStartStorage()
+				})
+				afterEach(() => disposeStorage())
 				it("should process mentions in user_message tags", async () => {
 					const [cline, task] = Task.create({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
 					})
+
+					// Observe constructor rejection immediately while the mention assertions run.
+					const settledTask = task.catch(() => {})
 
 					const userContent = [
 						{
@@ -2215,7 +2241,7 @@ describe("Cline", () => {
 					)
 
 					await cline.abortTask(true)
-					await task.catch(() => {})
+					await settledTask
 				})
 			})
 		})
@@ -5604,7 +5630,28 @@ describe("Cline", () => {
 		})
 	})
 
+	async function prepareGuardedStartStorage(): Promise<() => void> {
+		const storageRoot = mkdtempSync(path.join(os.tmpdir(), "task-start-fixture-"))
+		disposableStorageRoots.add(storageRoot)
+		Object.defineProperty(mockExtensionContext.globalStorageUri, "fsPath", { value: storageRoot })
+		const store = new TaskHistoryStore(storageRoot)
+		await store.initialize()
+		mockProvider["taskHistoryStore"].dispose()
+		Object.defineProperty(mockProvider, "taskHistoryStore", { value: store })
+		return () => {
+			store.dispose()
+			rmSync(storageRoot, { recursive: true, force: true })
+			disposableStorageRoots.delete(storageRoot)
+		}
+	}
+
 	describe("startTask", () => {
+		let disposeStorage: () => void
+		beforeEach(async () => {
+			disposeStorage = await prepareGuardedStartStorage()
+		})
+		afterEach(() => disposeStorage())
+
 		it("posts a clean state immediately before adding the first task message", async () => {
 			const task = new Task({
 				provider: mockProvider,
@@ -5616,6 +5663,10 @@ describe("Cline", () => {
 
 			task.clineMessages = [{ ts: 1, type: "say", say: "text", text: "stale message" }]
 
+			let markPostStateStarted!: () => void
+			const postStateStarted = new Promise<void>((resolve) => {
+				markPostStateStarted = resolve
+			})
 			let resolvePostState: (() => void) | undefined
 			const pendingPostState = new Promise<void>((resolve) => {
 				resolvePostState = resolve
@@ -5624,6 +5675,7 @@ describe("Cline", () => {
 				.mocked(mockProvider.postStateToWebviewWithoutTaskHistory)
 				.mockImplementationOnce(async () => {
 					expect(task.clineMessages).toEqual([])
+					markPostStateStarted()
 					await pendingPostState
 				})
 			const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
@@ -5634,6 +5686,8 @@ describe("Cline", () => {
 			const initiateTaskLoopSpy = vi.spyOn(taskAccess, "initiateTaskLoop").mockResolvedValue(undefined)
 
 			const startPromise = taskAccess.startTask("new task")
+			// Observe entry after real lease acquisition, before releasing the first effect.
+			await postStateStarted
 
 			expect(postStateSpy).toHaveBeenCalledTimes(1)
 			expect(mockProvider.postStateToWebviewThrottled).not.toHaveBeenCalled()

@@ -24,11 +24,6 @@
 			"count": 4
 		}
 	},
-	"__tests__/delegation-concurrent.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 6
-		}
-	},
 	"__tests__/delegation-events.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 6
@@ -806,7 +801,7 @@
 	},
 	"core/task/__tests__/Task.persistence.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 8
+			"count": 7
 		}
 	},
 	"core/task/__tests__/Task.sticky-profile-race.spec.ts": {
@@ -831,7 +826,7 @@
 	},
 	"core/task/__tests__/flushPendingToolResultsToHistory.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 14
+			"count": 11
 		}
 	},
 	"core/task/__tests__/grace-retry-errors.spec.ts": {
@@ -880,11 +875,6 @@
 		}
 	},
 	"core/tools/GenerateImageTool.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 1
-		}
-	},
-	"core/tools/NewTaskTool.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 1
 		}

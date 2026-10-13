@@ -214,7 +214,20 @@ describe("Delegation handoff robustness - async scheduling and correlated lifecy
 			}),
 		).resolves.toMatchObject({ kind: "committed", resumeState: "failed" })
 		expect(schedule).not.toHaveBeenCalled()
-		expect(log).toHaveBeenCalledWith(expect.stringContaining("stage=failed reason=Error"))
+		const failureRecords = log.mock.calls.map(([message]) => {
+			expect(message).toMatch(/^\[ordinary_delegation\] /)
+			return JSON.parse(message.slice("[ordinary_delegation] ".length))
+		})
+		expect(failureRecords).toContainEqual(
+			expect.objectContaining({
+				task: "parent-prepare-failure",
+				child: "child-prepare-failure",
+				phase: "parent_continuation",
+				stage: "failed",
+				failure: { type: "effect_failed" },
+			}),
+		)
+		expect(JSON.stringify(log.mock.calls)).not.toContain("sensitive failure")
 		expect(emit).toHaveBeenCalledWith(
 			RooCodeEventName.TaskResumeScheduled,
 			"parent-prepare-failure",

@@ -5,7 +5,13 @@ import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
 
-import { registerPendingQuestion, answerPendingQuestion, clearPendingQuestion } from "../task-persistence/taskLifecycle"
+import {
+	registerPendingQuestion,
+	answerPendingQuestion,
+	clearPendingQuestion,
+	type HistoryItemStatus,
+	LifecycleTransitionError,
+} from "../task-persistence/taskLifecycle"
 import { AskIgnoredError } from "./AskIgnoredError"
 import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
 
@@ -95,8 +101,15 @@ import { OutputInterceptor } from "../../integrations/terminal/OutputInterceptor
 // utils
 import { calculateApiCostAnthropic, calculateApiCostOpenAI } from "../../shared/cost"
 import { getWorkspacePath } from "../../utils/path"
+import { getThrownMessage } from "../../utils/errors"
 import { sanitizeToolUseId } from "../../utils/tool-id"
 import { getTaskDirectoryPath } from "../../utils/storage"
+import {
+	assertProviderStartExclusion,
+	withProviderStartExclusion,
+	inIndependentTaskOrchestration,
+} from "../task-persistence/targetPersistenceBoundary"
+import type { PreparedTaskResume } from "./TaskScheduler"
 
 // prompts
 import { formatResponse } from "../prompts/responses"
@@ -113,6 +126,16 @@ import { type AssistantMessageContent, presentAssistantMessage } from "../assist
 import { NativeToolCallParser } from "../assistant-message/NativeToolCallParser"
 import { manageContext, willManageContext } from "../context-management"
 import { ClineProvider } from "../webview/ClineProvider"
+import {
+	createOrdinaryTaskPersistenceAuthority,
+	OrdinaryPersistenceAuthorityError,
+	assertUnprotectedQuestionWait,
+	withOrdinaryTaskPersistence,
+	isPersistenceAuthorityError,
+	isPersistenceContentionError,
+	isStickyPersistenceRefusal,
+	type OrdinaryTaskPersistenceAuthority,
+} from "../task-persistence/targetPersistenceBoundary"
 import { MultiSearchReplaceDiffStrategy } from "../diff/strategies/multi-search-replace"
 import {
 	type ApiMessage,
@@ -152,6 +175,8 @@ import {
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
+/** Delay before the single deferred retry of a usage save skipped on fence contention. */
+const USAGE_SAVE_RETRY_DELAY_MS = 1_000
 // Upper bound on awaiting lazily loaded model metadata. Some model-catalog
 // fetchers (e.g. OpenRouter's bare axios GET) have no request timeout, so a
 // hung endpoint must not stall streaming, condense, or context-window
@@ -166,6 +191,31 @@ export const MODEL_FETCH_TIMEOUT_MS = 5_000
 const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
 
 type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boolean }
+
+type ResumeAskAnswer = { response: ClineAskResponse; text?: string; images?: string[]; queuedMessageId?: string }
+/**
+ * A restored-task user wait. The ask was presented under the start exclusion, the wait runs
+ * outside every scope, and the answer is applied under a NEW bounded exclusion after `verify`.
+ */
+type ResumeUserWait = {
+	readonly kind: "user_wait"
+	readonly wait: () => Promise<ResumeAskAnswer>
+	/** Releases the presentation's queued claim if the wait is dropped before it starts. */
+	readonly releaseUnstartedClaim: () => void
+	/** Re-checks, before any effect, that the answer still belongs to the presented ask and owner. */
+	readonly verify: () => Promise<void>
+	readonly resolve: (answer: ResumeAskAnswer) => Promise<ResumeContinuation>
+	/** Re-checks the owner, then presents the same ask again under the caller's exclusion. */
+	readonly represent: () => Promise<ResumeUserWait>
+}
+/** `true`: pending question; function: a prepared loop that runs after release; void: done. */
+type ResumeContinuation = true | (() => Promise<void>) | ResumeUserWait | void
+const RESUME_OWNERSHIP_CHANGED = "Pending action ownership changed"
+/** A presented ask dropped before its wait started returns its queued claim. */
+function releaseUnstartedResumeAsks(asks: Set<ResumeUserWait> | undefined): void {
+	for (const pending of asks ?? []) pending.releaseUnstartedClaim()
+	asks?.clear()
+}
 
 function queuedResponseForAsk(type: ClineAsk, text?: string): QueuedAskResolution | undefined {
 	if (type === "command_output") {
@@ -331,6 +381,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private taskApiConfigReady: Promise<void>
 
 	providerRef: WeakRef<ClineProvider>
+	private readonly persistenceAuthority: OrdinaryTaskPersistenceAuthority
+	private pendingToolFlush?: Promise<boolean>
+	private pendingToolFlushMessageId?: string
 	private readonly globalStoragePath: string
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
@@ -413,6 +466,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private telemetryMessageCountsBaseline: { user: number; assistant: number } = { user: 0, assistant: 0 }
 	private abortPromise?: Promise<void>
 	private disposalPromise?: Promise<void>
+	/** Monotonic id of the UI-message snapshot each save takes, and of the newest one persisted. */
+	private uiMessagesSnapshotSeq = 0
+	private uiMessagesPersistedSeq = 0
+	/** At most one pending deferred usage save; it is never rescheduled by its own failure. */
+	private usageSaveRetryTimer?: ReturnType<typeof setTimeout>
 	private diffReversionPromise: Promise<void> = Promise.resolve()
 
 	// Checkpoints
@@ -462,6 +520,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private resolveAssistantMessagePersistence!: (result: AssistantMessagePersistenceResult) => void
 	private assistantMessagePersistenceCancellation?: AssistantMessagePersistenceCancellation
 	private completionPersistenceReadyPromise?: Promise<void>
+	/** Settles after every answered-tool-ask save started so far; never rejects. */
+	private answeredAskPersistence: Promise<void> = Promise.resolve()
 
 	/**
 	 * Fire-and-forget wrapper around `presentAssistantMessage` that swallows the
@@ -540,6 +600,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	// Initial status for the task's history item (set at creation time to avoid race conditions)
 	private readonly initialStatus?: "active" | "delegated" | "completed" | "interrupted" | "blocked_protocol_error"
+	// Persisted status observed when a user resume restored this instance; supersedes initialStatus.
+	private resumedStatus?: HistoryItemStatus
+
+	/** Instance view of the persisted status: the creation-time status until a resume restores it. */
+	private get liveStatus(): HistoryItemStatus | undefined {
+		return this.resumedStatus ?? this.initialStatus
+	}
 	public pendingQuestion?: PendingQuestion
 	private questionResultDelivered = false
 	private acceptingQuestionAnswer = false
@@ -553,8 +620,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private async mutatePendingQuestion(update: (item: HistoryItem) => HistoryItem): Promise<void> {
 		const provider = this.providerRef.deref()
 		if (!provider) throw new Error("Question persistence requires a task provider")
-		const written = await provider.taskHistoryStore.updateQuestion(this.taskId, update)
-		this.pendingQuestion = written.pendingQuestion
+		await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+			const written = await provider.taskHistoryStore.updateQuestion(this.taskId, update)
+			this.pendingQuestion = written.pendingQuestion
+		})
 	}
 
 	public async registerQuestion(text: string, toolCallId: string): Promise<boolean> {
@@ -584,6 +653,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	public async deliverQuestionResult(): Promise<ReturnType<typeof formatResponse.toolResult>> {
 		const question = this.pendingQuestion
 		if (!question?.answer) throw new Error("Question has no owned answer")
+		let result!: ReturnType<typeof formatResponse.toolResult>
+		await this.withStartExclusion(() =>
+			withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				this.pendingQuestion = await this.readOwnedPendingQuestion(question)
+				await this.assertStartExclusion()
+				result = await this.deliverQuestionResultUnprotected()
+			}),
+		)
+		return result
+	}
+
+	private async deliverQuestionResultUnprotected(): Promise<ReturnType<typeof formatResponse.toolResult>> {
+		const question = this.pendingQuestion
+		if (!question?.answer) throw new Error("Question has no owned answer")
 		if (
 			!this.clineMessages.some((message) => message.say === "user_feedback" && message.questionId === question.id)
 		) {
@@ -605,10 +688,54 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		)
 	}
 
+	private async readOwnedPendingQuestion(question: PendingQuestion): Promise<PendingQuestion> {
+		const stored = await this.providerRef.deref()?.taskHistoryStore.readAuthoritative(this.taskId)
+		const current = stored?.kind === "found" ? stored.item.pendingQuestion : undefined
+		if (
+			!current ||
+			current.id !== question.id ||
+			current.taskId !== question.taskId ||
+			current.toolCallId !== question.toolCallId ||
+			current.text !== question.text ||
+			this.pendingQuestion?.id !== question.id
+		)
+			throw new OrdinaryPersistenceAuthorityError("Pending question ownership changed")
+		return current
+	}
+
 	private async resumePendingQuestion(): Promise<void> {
-		const question = this.pendingQuestion
-		if (!question) return
-		this.isInitialized = true
+		let question = this.pendingQuestion
+		if (!question || this.abort || this.abandoned) return
+		if (!question.answer) await assertUnprotectedQuestionWait(this.globalStoragePath)
+		let waitForAnswer: (() => ReturnType<Task["ask"]>) | undefined
+		await this.withStartExclusion(() =>
+			withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				question = await this.readOwnedPendingQuestion(question!)
+				this.pendingQuestion = question
+				this.isInitialized = true
+				if (!question.answer)
+					waitForAnswer = await this.prepareAsk("followup", question.text, false, undefined, undefined, true)
+			}),
+		)
+		if (waitForAnswer) {
+			// Preparation has settled and released every scope owned by this workflow.
+			// A surrounding arbitrary effect must retain its lease: refuse, never renew it.
+			await assertUnprotectedQuestionWait(this.globalStoragePath)
+			await waitForAnswer()
+		}
+		if (this.abort || this.abandoned) return
+		const continueRun = await this.withStartExclusion(() =>
+			withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				this.pendingQuestion = await this.readOwnedPendingQuestion(question!)
+				if (!this.pendingQuestion.answer) return
+				await this.assertStartExclusion()
+				return this.continuePendingQuestion(this.pendingQuestion)
+			}),
+		)
+		if (continueRun) await continueRun()
+	}
+
+	private async continuePendingQuestion(question: PendingQuestion): Promise<(() => Promise<void>) | void> {
 		const existingResult = this.apiConversationHistory.some(
 			(message) =>
 				message.role === "user" &&
@@ -620,11 +747,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		)
 		if (question.answer && existingResult) {
 			await this.mutatePendingQuestion((item) => clearPendingQuestion(item, question.id, "durable_result"))
-			await this.initiateTaskLoop([{ type: "text", text: "Continue from the recorded answer." }])
-			return
+			await this.restoreLiveStatusOnResume()
+			await this.assertStartExclusion()
+			return this.prepareTaskLoop([{ type: "text", text: "Continue from the recorded answer." }])
 		}
-		// Only explicit runtime state is restored; old unanswered chat rows are not evidence.
-		if (!question.answer) await this.ask("followup", question.text, false)
 		if (this.abort || this.abandoned || !this.pendingQuestion?.answer) return
 		const content = await this.deliverQuestionResult()
 		const last = this.apiConversationHistory.at(-1)
@@ -662,7 +788,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			)
 		}
 		if (last?.role === "user") await this.overwriteApiConversationHistory(this.apiConversationHistory.slice(0, -1))
-		await this.initiateTaskLoop(results)
+		await this.assertStartExclusion()
+		// Commit the exact correlated result before leaving the capable phase.
+		await this.addToApiConversationHistory({ role: "user", content: results })
+		await this.restoreLiveStatusOnResume()
+		await this.assertStartExclusion()
+		return this.prepareTaskLoop([{ type: "text", text: "Continue from the recorded answer." }])
 	}
 
 	private pendingAction?: PendingTaskAction
@@ -749,6 +880,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.consecutiveMistakeLimit = consecutiveMistakeLimit ?? DEFAULT_CONSECUTIVE_MISTAKE_LIMIT
 		this.providerRef = new WeakRef(provider)
 		this.globalStoragePath = provider.context.globalStorageUri.fsPath
+		this.persistenceAuthority = createOrdinaryTaskPersistenceAuthority(
+			historyItem ?? {
+				id: this.taskId,
+				parentTaskId: this.parentTaskId,
+				rootTaskId: this.rootTaskId,
+			},
+		)
 		this.diffViewProvider = new DiffViewProvider(this.cwd, this)
 		this.enableCheckpoints = enableCheckpoints
 		this.checkpointTimeout = checkpointTimeout
@@ -1134,7 +1272,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		const provider = this.providerRef.deref()
-		const cleared = await provider?.clearPendingTaskAction(this.taskId, actionId)
+		const cleared = await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () =>
+			provider?.clearPendingTaskAction(this.taskId, actionId),
+		)
 		if (cleared) {
 			if (this.pendingAction?.actionId === actionId) {
 				this.pendingAction = undefined
@@ -1339,6 +1479,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * So we usually only need to flush the pending user message with tool_results.
 	 */
 	public async flushPendingToolResultsToHistory(): Promise<boolean> {
+		if (this.pendingToolFlush) return this.pendingToolFlush
+		const attempt = this.flushPendingToolResultsToHistoryCore()
+		this.pendingToolFlush = attempt
+		try {
+			return await attempt
+		} finally {
+			if (this.pendingToolFlush === attempt) this.pendingToolFlush = undefined
+		}
+	}
+
+	private async flushPendingToolResultsToHistoryCore(): Promise<boolean> {
 		// Only flush if there's actually pending content to save
 		if (this.userMessageContent.length === 0) {
 			return true
@@ -1380,24 +1531,55 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// Save the user message with tool_result blocks
-		const userMessage: Anthropic.MessageParam = {
-			role: "user",
-			content: this.userMessageContent,
-		}
+		const pendingContent = structuredClone(this.userMessageContent)
+		const userMessage: Anthropic.MessageParam = { role: "user", content: pendingContent }
 
 		// Validate and fix tool_result IDs when the previous *effective* message is an assistant message.
 		const effectiveHistoryForValidation = getEffectiveApiHistory(this.apiConversationHistory)
 		const lastEffective = effectiveHistoryForValidation[effectiveHistoryForValidation.length - 1]
 		const historyForValidation = lastEffective?.role === "assistant" ? effectiveHistoryForValidation : []
 		const validatedMessage = validateAndFixToolResultIds(userMessage, historyForValidation)
-		const userMessageWithTs = { ...validatedMessage, messageId: crypto.randomUUID(), ts: Date.now() }
-		this.apiConversationHistory.push(userMessageWithTs as ApiMessage)
+		const pendingTurn = this.apiConversationHistory.find(
+			(message) =>
+				this.pendingToolFlushMessageId !== undefined && message.messageId === this.pendingToolFlushMessageId,
+		)
+		if (pendingTurn) {
+			pendingTurn.content = validatedMessage.content
+		} else {
+			this.pendingToolFlushMessageId = crypto.randomUUID()
+			this.apiConversationHistory.push({
+				...validatedMessage,
+				messageId: this.pendingToolFlushMessageId,
+				ts: Date.now(),
+			} as ApiMessage)
+		}
 
 		const saved = await this.saveApiConversationHistory()
 
 		if (saved) {
-			// Clear the pending content since it's now saved
-			this.userMessageContent = []
+			if (
+				this.pendingAction &&
+				this.hasResolvedPendingActionResult(validatedMessage, this.pendingAction.actionId)
+			)
+				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
+			const question = this.pendingQuestion
+			if (
+				question?.answer &&
+				this.questionResultDelivered &&
+				Array.isArray(validatedMessage.content) &&
+				validatedMessage.content.some(
+					(block) =>
+						block.type === "tool_result" && block.tool_use_id === question.toolCallId && !block.is_error,
+				)
+			)
+				await this.mutatePendingQuestion((item) => clearPendingQuestion(item, question.id, "durable_result"))
+			// Acknowledge only after API publication and corresponding metadata clears succeed.
+			if (
+				JSON.stringify(this.userMessageContent.slice(0, pendingContent.length)) ===
+				JSON.stringify(pendingContent)
+			)
+				this.userMessageContent = this.userMessageContent.slice(pendingContent.length)
+			this.pendingToolFlushMessageId = undefined
 		} else {
 			console.warn(
 				`[Task#${this.taskId}] flushPendingToolResultsToHistory: save failed, retaining pending tool results in memory`,
@@ -1410,14 +1592,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/** Persists the current API conversation history to disk, returning false on I/O errors. */
 	private async saveApiConversationHistory(merge = true): Promise<boolean> {
 		try {
-			await saveApiMessages({
-				messages: structuredClone(this.apiConversationHistory),
-				taskId: this.taskId,
-				globalStoragePath: this.globalStoragePath,
-				merge,
+			return await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				await saveApiMessages({
+					messages: structuredClone(this.apiConversationHistory),
+					taskId: this.taskId,
+					globalStoragePath: this.globalStoragePath,
+					merge,
+				})
+				return true
 			})
-			return true
 		} catch (error) {
+			if (isPersistenceAuthorityError(error)) throw error
 			console.error("Failed to save API conversation history:", error)
 			return false
 		}
@@ -1564,45 +1749,92 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/** Persists Cline messages and updates task metadata in the history store. Returns false on failure. */
 	private async saveClineMessages(merge = true): Promise<boolean> {
 		try {
-			await saveTaskMessages({
-				messages: structuredClone(this.clineMessages),
-				taskId: this.taskId,
-				globalStoragePath: this.globalStoragePath,
-				merge,
+			return await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				const snapshotSeq = ++this.uiMessagesSnapshotSeq
+				await saveTaskMessages({
+					messages: structuredClone(this.clineMessages),
+					taskId: this.taskId,
+					globalStoragePath: this.globalStoragePath,
+					merge,
+				})
+
+				if (this._taskApiConfigName === undefined) {
+					await this.taskApiConfigReady
+				}
+
+				const { historyItem, tokenUsage } = await taskMetadata({
+					taskId: this.taskId,
+					rootTaskId: this.rootTaskId,
+					parentTaskId: this.parentTaskId,
+					taskNumber: this.taskNumber,
+					messages: this.clineMessages,
+					globalStoragePath: this.globalStoragePath,
+					workspace: this.cwd,
+					mode: this._taskMode || defaultModeSlug, // Use the task's own mode, not the current provider mode.
+					apiConfigName: this._taskApiConfigName, // Use the task's own provider profile, not the current provider profile.
+					initialStatus: this.liveStatus,
+				})
+
+				// Emit token/tool usage updates using debounced function
+				// The debounce with maxWait ensures:
+				// - Immediate first emit (leading: true)
+				// - At most one emit per interval during rapid updates (maxWait)
+				// - Final state is emitted when updates stop (trailing: true)
+				this.debouncedEmitTokenUsage(tokenUsage, this.toolUsage)
+
+				const provider = this.providerRef.deref()
+				const existingStatus = provider?.taskHistoryStore.get(this.taskId)?.status
+				await provider?.updateTaskHistory({
+					...historyItem,
+					...(existingStatus ? { status: existingStatus } : {}),
+					ordinaryPersistenceRevision: this.persistenceAuthority.revision,
+				} as HistoryItem)
+				this.uiMessagesPersistedSeq = Math.max(this.uiMessagesPersistedSeq, snapshotSeq)
+				return true
 			})
-
-			if (this._taskApiConfigName === undefined) {
-				await this.taskApiConfigReady
-			}
-
-			const { historyItem, tokenUsage } = await taskMetadata({
-				taskId: this.taskId,
-				rootTaskId: this.rootTaskId,
-				parentTaskId: this.parentTaskId,
-				taskNumber: this.taskNumber,
-				messages: this.clineMessages,
-				globalStoragePath: this.globalStoragePath,
-				workspace: this.cwd,
-				mode: this._taskMode || defaultModeSlug, // Use the task's own mode, not the current provider mode.
-				apiConfigName: this._taskApiConfigName, // Use the task's own provider profile, not the current provider profile.
-				initialStatus: this.initialStatus,
-			})
-
-			// Emit token/tool usage updates using debounced function
-			// The debounce with maxWait ensures:
-			// - Immediate first emit (leading: true)
-			// - At most one emit per interval during rapid updates (maxWait)
-			// - Final state is emitted when updates stop (trailing: true)
-			this.debouncedEmitTokenUsage(tokenUsage, this.toolUsage)
-
-			const provider = this.providerRef.deref()
-			const existingStatus = provider?.taskHistoryStore.get(this.taskId)?.status
-			await provider?.updateTaskHistory(existingStatus ? { ...historyItem, status: existingStatus } : historyItem)
-			return true
 		} catch (error) {
+			if (isPersistenceAuthorityError(error)) throw error
 			console.error("Failed to save Roo messages:", error)
 			return false
 		}
+	}
+
+	/**
+	 * After a usage save was skipped on contention, the usage exists only in memory. Schedule ONE
+	 * deferred save. It is skipped when a save that snapshotted the messages after this point has
+	 * persisted, or when the instance is aborted, disposed or refused. A failed retry is logged and
+	 * the usage may be lost; it is never rescheduled.
+	 */
+	private scheduleUsageSaveRetry(): void {
+		if (this.usageSaveRetryTimer) return // The pending retry saves the whole current message list.
+		const skippedAt = this.uiMessagesSnapshotSeq
+		this.usageSaveRetryTimer = setTimeout(() => {
+			this.usageSaveRetryTimer = undefined
+			void this.retrySkippedUsageSave(skippedAt)
+		}, USAGE_SAVE_RETRY_DELAY_MS)
+	}
+
+	private async retrySkippedUsageSave(skippedAt: number): Promise<void> {
+		if (this.uiMessagesPersistedSeq > skippedAt) return
+		if (this.abort || this.abandoned || this.disposalPromise || this.persistenceAuthority.refused) {
+			console.warn(
+				`[Background Usage Collection] Usage for task ${this.taskId} was not persisted: the instance ended before the deferred save`,
+			)
+			return
+		}
+		let saved = false
+		try {
+			saved = await this.saveClineMessages()
+		} catch (error) {
+			console.warn(
+				`[Background Usage Collection] Deferred usage save for task ${this.taskId} failed; usage metrics may be lost: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return
+		}
+		if (!saved)
+			console.warn(
+				`[Background Usage Collection] Deferred usage save for task ${this.taskId} failed; usage metrics may be lost`,
+			)
 	}
 
 	private findMessageByTimestamp(ts: number): ClineMessage | undefined {
@@ -1625,6 +1857,30 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		progressStatus?: ToolProgressStatus,
 		isProtected?: boolean,
 	): Promise<{ response: ClineAskResponse; text?: string; images?: string[]; queuedMessageId?: string }> {
+		if (type !== "followup" || partial === true || !this.pendingQuestion)
+			return (await this.prepareAsk(type, text, partial, progressStatus, isProtected))()
+		await assertUnprotectedQuestionWait(this.globalStoragePath)
+		const question = this.pendingQuestion
+		let wait!: () => ReturnType<Task["ask"]>
+		await this.withStartExclusion(() =>
+			withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				await this.readOwnedPendingQuestion(question)
+				wait = await this.prepareAsk(type, text, partial, progressStatus, isProtected, true)
+			}),
+		)
+		await assertUnprotectedQuestionWait(this.globalStoragePath)
+		return wait()
+	}
+
+	/** Presentation is capable work; the returned wait is invoked by its caller's orchestration context. */
+	private async prepareAsk(
+		type: ClineAsk,
+		text?: string,
+		partial?: boolean,
+		progressStatus?: ToolProgressStatus,
+		isProtected?: boolean,
+		independentQuestionWait = false,
+	): Promise<() => ReturnType<Task["ask"]>> {
 		// If this Cline instance was aborted by the provider, then the only
 		// thing keeping us alive is a promise still running in the background,
 		// in which case we don't want to send its result to the webview as it
@@ -1659,7 +1915,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			partial === true || type === "command_output" ? undefined : this.messageQueueService.claimNextMessage()
 		const queuedAskResolution = queuedMessage
 			? type === "resume_task" &&
-				this.initialStatus === "interrupted" &&
+				this.liveStatus === "interrupted" &&
 				this.pendingAction?.kind === "create_subtask"
 				? { response: "messageResponse" as const, requiresDurableAck: true }
 				: queuedResponseForAsk(type, text)
@@ -1714,9 +1970,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// the `RooCodeEventName.Message` emit can synchronously throw
 					// if any consumer-attached listener does, which would surface
 					// here as an unhandled rejection. Log it instead.
-					this.updateClineMessage(lastMessage).catch((error) => {
-						console.error("[Task#ask] updateClineMessage failed:", error)
-					})
+					if (independentQuestionWait) {
+						await this.assertStartExclusion()
+						await this.updateClineMessage(lastMessage)
+					} else {
+						this.updateClineMessage(lastMessage).catch((error) => {
+							console.error("[Task#ask] updateClineMessage failed:", error)
+						})
+					}
 					// console.log("Task#ask: current ask promise was ignored (#1)")
 					throw new AskIgnoredError("updating existing partial")
 				} else {
@@ -1761,9 +2022,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					await this.saveClineMessages()
 					// Fire-and-forget: see updateClineMessage call above for the
 					// rationale on the .catch arm.
-					this.updateClineMessage(lastMessage).catch((error) => {
-						console.error("[Task#ask] updateClineMessage failed:", error)
-					})
+					if (independentQuestionWait) {
+						await this.assertStartExclusion()
+						await this.updateClineMessage(lastMessage)
+					} else {
+						this.updateClineMessage(lastMessage).catch((error) => {
+							console.error("[Task#ask] updateClineMessage failed:", error)
+						})
+					}
 				} else {
 					// This is a new and complete message, so add it like normal.
 					this.askResponse = undefined
@@ -1802,177 +2068,219 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			})
 		}
 
-		const timeouts: NodeJS.Timeout[] = []
-		if (ownedQuestion) this.activeQuestionWaitId = ownedQuestion.id
+		let waitStarted = false
+		const wait = async () => {
+			waitStarted = true
+			const publish = async (effect: () => Promise<void>) => {
+				if (!independentQuestionWait) return effect()
+				await this.withStartExclusion(
+					() =>
+						withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+							if (this.abort || this.abandoned) return
+							await this.readOwnedPendingQuestion(ownedQuestion!)
+							await this.assertStartExclusion()
+							await effect()
+						}),
+					true,
+				)
+			}
+			const timeouts: NodeJS.Timeout[] = []
+			if (ownedQuestion) this.activeQuestionWaitId = ownedQuestion.id
 
-		if (approval.decision === "approve") {
-			this.approveAsk()
-		} else if (approval.decision === "deny") {
-			this.denyAsk()
-		} else if (approval.decision === "timeout") {
-			// Store the auto-approval timeout so it can be cancelled if user interacts
-			this.autoApprovalTimeoutRef = setTimeout(() => {
-				const { askResponse, text, images } = approval.fn()
-				if (
-					!this.abort &&
-					!this.abandoned &&
-					this.lastMessageTs === askTs &&
-					(!ownedQuestion || this.pendingQuestion?.id === ownedQuestion.id)
-				) {
-					this.handleWebviewAskResponse(
-						askResponse,
-						text,
-						images,
-						ownedQuestion
-							? { taskId: this.taskId, questionId: ownedQuestion.id, explicitAnswer: true }
-							: undefined,
+			if (approval.decision === "approve") {
+				this.approveAsk()
+			} else if (approval.decision === "deny") {
+				this.denyAsk()
+			} else if (approval.decision === "timeout") {
+				// Store the auto-approval timeout so it can be cancelled if user interacts
+				this.autoApprovalTimeoutRef = setTimeout(() => {
+					const { askResponse, text, images } = approval.fn()
+					if (
+						!this.abort &&
+						!this.abandoned &&
+						this.lastMessageTs === askTs &&
+						(!ownedQuestion || this.pendingQuestion?.id === ownedQuestion.id)
+					) {
+						this.handleWebviewAskResponse(
+							askResponse,
+							text,
+							images,
+							ownedQuestion
+								? { taskId: this.taskId, questionId: ownedQuestion.id, explicitAnswer: true }
+								: undefined,
+						)
+					}
+					this.autoApprovalTimeoutRef = undefined
+				}, approval.timeout)
+				timeouts.push(this.autoApprovalTimeoutRef)
+			}
+
+			// The state is mutable if the message is complete and the task will
+			// block (via the `pWaitFor`).
+			const isBlocking = !(this.askResponse !== undefined || this.lastMessageTs !== askTs)
+			const isMessageQueued = !this.messageQueueService.isEmpty()
+			// Keep queued user messages intact during command_output asks. Those asks
+			// are terminal flow-control, not conversational turns.
+			const shouldDrainQueuedMessageForAsk = type !== "command_output"
+			const isStatusMutable = !partial && isBlocking && !isMessageQueued && approval.decision === "ask"
+
+			let queuedMessageId: string | undefined
+			if (isStatusMutable) {
+				const statusMutationTimeout = 2_000
+
+				if (isInteractiveAsk(type)) {
+					timeouts.push(
+						setTimeout(() => {
+							if (independentQuestionWait && this.pendingQuestion?.answer) return
+							void publish(async () => {
+								if (independentQuestionWait && this.pendingQuestion?.answer) return
+								const message = this.findMessageByTimestamp(askTs)
+
+								if (message) {
+									this.interactiveAsk = message
+									this.emit(RooCodeEventName.TaskInteractive, this.taskId)
+									/* v8 ignore next 3 -- fires inside 2s timer after ask() resolves; not reachable in unit tests */
+									const posted = provider?.postMessageToWebview({ type: "interactionRequired" })
+									if (independentQuestionWait) await posted
+									else
+										void posted?.catch((error) => {
+											console.error(
+												"[Task#ask] postMessageToWebview interactionRequired failed:",
+												error,
+											)
+										})
+								}
+							}).catch((error) => console.error("Question interaction publication refused:", error))
+						}, statusMutationTimeout),
+					)
+				} else if (isResumableAsk(type)) {
+					timeouts.push(
+						setTimeout(() => {
+							const message = this.findMessageByTimestamp(askTs)
+
+							if (message) {
+								this.resumableAsk = message
+								this.emit(RooCodeEventName.TaskResumable, this.taskId)
+							}
+						}, statusMutationTimeout),
+					)
+				} else if (isIdleAsk(type)) {
+					timeouts.push(
+						setTimeout(() => {
+							const message = this.findMessageByTimestamp(askTs)
+
+							if (message) {
+								this.idleAsk = message
+								this.emit(RooCodeEventName.TaskIdle, this.taskId)
+							}
+						}, statusMutationTimeout),
 					)
 				}
-				this.autoApprovalTimeoutRef = undefined
-			}, approval.timeout)
-			timeouts.push(this.autoApprovalTimeoutRef)
-		}
-
-		// The state is mutable if the message is complete and the task will
-		// block (via the `pWaitFor`).
-		const isBlocking = !(this.askResponse !== undefined || this.lastMessageTs !== askTs)
-		const isMessageQueued = !this.messageQueueService.isEmpty()
-		// Keep queued user messages intact during command_output asks. Those asks
-		// are terminal flow-control, not conversational turns.
-		const shouldDrainQueuedMessageForAsk = type !== "command_output"
-		const isStatusMutable = !partial && isBlocking && !isMessageQueued && approval.decision === "ask"
-
-		let queuedMessageId: string | undefined
-		if (isStatusMutable) {
-			const statusMutationTimeout = 2_000
-
-			if (isInteractiveAsk(type)) {
-				timeouts.push(
-					setTimeout(() => {
-						const message = this.findMessageByTimestamp(askTs)
-
-						if (message) {
-							this.interactiveAsk = message
-							this.emit(RooCodeEventName.TaskInteractive, this.taskId)
-							/* v8 ignore next 3 -- fires inside 2s timer after ask() resolves; not reachable in unit tests */
-							void provider?.postMessageToWebview({ type: "interactionRequired" }).catch((error) => {
-								console.error("[Task#ask] postMessageToWebview interactionRequired failed:", error)
-							})
-						}
-					}, statusMutationTimeout),
-				)
-			} else if (isResumableAsk(type)) {
-				timeouts.push(
-					setTimeout(() => {
-						const message = this.findMessageByTimestamp(askTs)
-
-						if (message) {
-							this.resumableAsk = message
-							this.emit(RooCodeEventName.TaskResumable, this.taskId)
-						}
-					}, statusMutationTimeout),
-				)
-			} else if (isIdleAsk(type)) {
-				timeouts.push(
-					setTimeout(() => {
-						const message = this.findMessageByTimestamp(askTs)
-
-						if (message) {
-							this.idleAsk = message
-							this.emit(RooCodeEventName.TaskIdle, this.taskId)
-						}
-					}, statusMutationTimeout),
-				)
+			} else if (isMessageQueued && shouldDrainQueuedMessageForAsk && queuedMessage && queuedAskResolution) {
+				queuedMessageId = this.handleQueuedAskResponse(queuedMessage, queuedAskResolution)
 			}
-		} else if (isMessageQueued && shouldDrainQueuedMessageForAsk && queuedMessage && queuedAskResolution) {
-			queuedMessageId = this.handleQueuedAskResponse(queuedMessage, queuedAskResolution)
-		}
 
-		try {
-			// Wait for askResponse to be set
-			await pWaitFor(
-				() => {
-					if (
-						this.abort ||
-						this.askResponse !== undefined ||
-						(!ownedQuestion && this.lastMessageTs !== askTs)
-					) {
-						return true
+			try {
+				// Wait for askResponse to be set
+				await pWaitFor(
+					() => {
+						if (
+							this.abort ||
+							(ownedQuestion && (this.abandoned || this.persistenceAuthority.refused)) ||
+							this.askResponse !== undefined ||
+							(!ownedQuestion && this.lastMessageTs !== askTs)
+						) {
+							return true
+						}
+
+						// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
+						// suggestion click that was incorrectly queued due to UI state), consume it
+						// immediately so the task doesn't hang.
+						if (
+							shouldDrainQueuedMessageForAsk &&
+							!this.acceptingQuestionAnswer &&
+							!queuedMessageId &&
+							!this.messageQueueService.isEmpty()
+						) {
+							const message = this.messageQueueService.claimNextMessage()
+							const resolution = message
+								? type === "resume_task" &&
+									this.liveStatus === "interrupted" &&
+									this.pendingAction?.kind === "create_subtask"
+									? { response: "messageResponse" as const, requiresDurableAck: true }
+									: queuedResponseForAsk(type, text)
+								: undefined
+							if (message && resolution) {
+								queuedMessageId = this.handleQueuedAskResponse(message, resolution)
+							}
+						}
+
+						return false
+					},
+					{ interval: 100 },
+				)
+
+				if (ownedQuestion && this.persistenceAuthority.refused)
+					throw new OrdinaryPersistenceAuthorityError("Question answer instance was refused")
+
+				/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
+				if (this.abort || (ownedQuestion && this.abandoned)) {
+					if (queuedMessageId) {
+						this.messageQueueService.releaseMessage(queuedMessageId)
+					}
+					throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
+				}
+
+				if (!ownedQuestion && this.lastMessageTs !== askTs) {
+					// Could happen if we send multiple asks in a row i.e. with
+					// command_output. It's important that when we know an ask could
+					// fail, it is handled gracefully.
+					if (queuedMessageId) {
+						this.messageQueueService.releaseMessage(queuedMessageId)
+					}
+					throw new AskIgnoredError("superseded")
+				}
+
+				const result = {
+					response: this.askResponse!,
+					text: this.askResponseText,
+					images: this.askResponseImages,
+					queuedMessageId,
+				}
+				this.askResponse = undefined
+				this.askResponseText = undefined
+				this.askResponseImages = undefined
+
+				// Cancel the timeouts if they are still running.
+				timeouts.forEach((timeout) => clearTimeout(timeout))
+
+				await publish(async () => {
+					// Switch back to an active state.
+					if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
+						this.idleAsk = undefined
+						this.resumableAsk = undefined
+						this.interactiveAsk = undefined
+						this.emit(RooCodeEventName.TaskActive, this.taskId)
 					}
 
-					// If a queued message arrives while we're blocked on an ask (e.g. a follow-up
-					// suggestion click that was incorrectly queued due to UI state), consume it
-					// immediately so the task doesn't hang.
-					if (
-						shouldDrainQueuedMessageForAsk &&
-						!this.acceptingQuestionAnswer &&
-						!queuedMessageId &&
-						!this.messageQueueService.isEmpty()
-					) {
-						const message = this.messageQueueService.claimNextMessage()
-						const resolution = message
-							? type === "resume_task" &&
-								this.initialStatus === "interrupted" &&
-								this.pendingAction?.kind === "create_subtask"
-								? { response: "messageResponse" as const, requiresDurableAck: true }
-								: queuedResponseForAsk(type, text)
-							: undefined
-						if (message && resolution) {
-							queuedMessageId = this.handleQueuedAskResponse(message, resolution)
-						}
-					}
-
-					return false
-				},
-				{ interval: 100 },
-			)
-
-			/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
-			if (this.abort) {
-				if (queuedMessageId) {
-					this.messageQueueService.releaseMessage(queuedMessageId)
-				}
-				throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
+					this.emit(RooCodeEventName.TaskAskResponded)
+				})
+				return result
+			} finally {
+				if (this.activeQuestionWaitId === ownedQuestion?.id) this.activeQuestionWaitId = undefined
+				timeouts.forEach((timeout) => clearTimeout(timeout))
 			}
-
-			if (!ownedQuestion && this.lastMessageTs !== askTs) {
-				// Could happen if we send multiple asks in a row i.e. with
-				// command_output. It's important that when we know an ask could
-				// fail, it is handled gracefully.
-				if (queuedMessageId) {
-					this.messageQueueService.releaseMessage(queuedMessageId)
-				}
-				throw new AskIgnoredError("superseded")
-			}
-
-			const result = {
-				response: this.askResponse!,
-				text: this.askResponseText,
-				images: this.askResponseImages,
-				queuedMessageId,
-			}
-			this.askResponse = undefined
-			this.askResponseText = undefined
-			this.askResponseImages = undefined
-
-			// Cancel the timeouts if they are still running.
-			timeouts.forEach((timeout) => clearTimeout(timeout))
-
-			// Switch back to an active state.
-			if (this.idleAsk || this.resumableAsk || this.interactiveAsk) {
-				this.idleAsk = undefined
-				this.resumableAsk = undefined
-				this.interactiveAsk = undefined
-				this.emit(RooCodeEventName.TaskActive, this.taskId)
-			}
-
-			this.emit(RooCodeEventName.TaskAskResponded)
-			return result
-		} finally {
-			if (this.activeQuestionWaitId === ownedQuestion?.id) this.activeQuestionWaitId = undefined
-			timeouts.forEach((timeout) => clearTimeout(timeout))
 		}
+		// Presentation claimed `queuedMessage`; only the wait consumes it. A dropped wait returns it.
+		if (queuedMessage)
+			(this.unstartedAskClaims ??= new WeakMap()).set(wait, () => {
+				if (!waitStarted) this.messageQueueService.releaseMessage(queuedMessage.id)
+			})
+		return wait
 	}
+
+	/** Queued claims held by presented asks, keyed by their wait, released if a wait never starts. */
+	private unstartedAskClaims?: WeakMap<() => ReturnType<Task["ask"]>, () => void>
 
 	handleWebviewAskResponse(
 		askResponse: ClineAskResponse,
@@ -1995,28 +2303,31 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				return
 			this.acceptingQuestionAnswer = true
 			this.cancelAutoApprovalTimeout()
-			void this.mutatePendingQuestion((item) =>
-				answerPendingQuestion(item, question.id, { text: text ?? "", images }),
-			)
-				.then(() => {
-					if (
-						this.abort ||
-						this.abandoned ||
-						this.pendingQuestion?.id !== question.id ||
-						!this.pendingQuestion.answer
-					)
-						return
-					if (this.questionQueuedMessageId) {
-						this.messageQueueService.removeMessage(this.questionQueuedMessageId)
-						this.questionQueuedMessageId = undefined
-					}
-					this.askResponse = "messageResponse"
-					this.askResponseText = this.pendingQuestion.answer.text
-					this.askResponseImages = this.pendingQuestion.answer.images
-					for (const message of this.clineMessages)
-						if (message.questionId === question.id && message.ask === "followup") message.isAnswered = true
-					return this.saveClineMessages()
-				})
+			void withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+				await this.readOwnedPendingQuestion(question)
+				await this.mutatePendingQuestion((item) =>
+					answerPendingQuestion(item, question.id, { text: text ?? "", images }),
+				)
+				if (
+					this.abort ||
+					this.abandoned ||
+					this.pendingQuestion?.id !== question.id ||
+					!this.pendingQuestion.answer
+				)
+					return
+				for (const message of this.clineMessages)
+					if (message.questionId === question.id && message.ask === "followup") message.isAnswered = true
+				if (!(await this.saveClineMessages())) throw new Error("Question answer UI could not be persisted")
+				const current = await this.readOwnedPendingQuestion(question)
+				if (this.abort || this.abandoned || this.persistenceAuthority.refused || !current.answer) return
+				if (this.questionQueuedMessageId) {
+					this.messageQueueService.removeMessage(this.questionQueuedMessageId)
+					this.questionQueuedMessageId = undefined
+				}
+				this.askResponse = "messageResponse"
+				this.askResponseText = current.answer.text
+				this.askResponseImages = current.answer.images
+			})
 				.catch((error) => console.error("Failed to persist question answer:", error))
 				.finally(() => {
 					this.acceptingQuestionAnswer = false
@@ -2025,7 +2336,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 		if (ownership?.questionId) return
 		if (
-			this.initialStatus === "interrupted" &&
+			this.liveStatus === "interrupted" &&
 			this.pendingAction?.kind === "create_subtask" &&
 			this.clineMessages.at(-1)?.ask === "resume_task" &&
 			askResponse !== "messageResponse"
@@ -2058,11 +2369,23 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				void this.updateClineMessage(this.clineMessages[lastToolAskIndex]).catch((error) => {
 					console.error("[Task#handleWebviewAskResponse] updateClineMessage failed:", error)
 				})
-				this.saveClineMessages().catch((error) => {
+				const saved = this.saveClineMessages().catch((error) => {
 					console.error("Failed to save answered tool-ask state:", error)
 				})
+				// Chain, so a waiter covers every answered-ask save started up to its call.
+				this.answeredAskPersistence = this.answeredAskPersistence.then(() => saved).then(() => undefined)
 			}
 		}
+	}
+
+	/**
+	 * Waits for the answered-tool-ask saves started by `handleWebviewAskResponse("yesButtonClicked")`
+	 * so far. Those saves hold this task's persistence fence, so a zero-wait handoff must await this
+	 * outside every scope. Never rejects: a failed save is logged only, because `isAnswered` is UI
+	 * state, not delegation state.
+	 */
+	public waitForAnsweredAskPersistence(): Promise<void> {
+		return this.answeredAskPersistence.catch(() => undefined)
 	}
 
 	/**
@@ -2528,7 +2851,82 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return this._runPromise
 	}
 
+	/** Scheduler admission uses the existing fresh-acquisition policy for a bounded preflight only. */
+	public async runScheduled(): Promise<void> {
+		await this.withStartExclusion(
+			() => withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {}),
+			true,
+		)
+		await this.run()
+	}
+
+	/** Prepare capable effects under Task ownership; authorize through the exact loop invocation only. */
+	public async runScheduledResume(authorize: PreparedTaskResume["authorize"]): Promise<boolean> {
+		let run: Promise<void> | undefined
+		const authorized = await authorize(() =>
+			this.withStartExclusion(() =>
+				withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
+					const loop = await this.prepareTaskLoop([])
+					if (!loop) throw new Error("Prepared resume unavailable")
+					return () => {
+						run = inIndependentTaskOrchestration(() => {
+							this.emit(RooCodeEventName.TaskActive, this.taskId)
+							return loop()
+						})
+						// Observe immediately while authorization releases its bounded scope.
+						void run.catch(() => {})
+					}
+				}),
+			),
+		)
+		if (!authorized || !run) return false
+		await run
+		return true
+	}
+
+	/** A permit or fire-and-forget callback takes a NEW lease, never the enqueuer's context. */
+	private withStartExclusion<T>(effect: () => Promise<T>, fresh = false): Promise<T> {
+		// Set once both exclusions are held; a timeout after that may follow a partial write.
+		let effectStarted = false
+		const started = () => {
+			effectStarted = true
+			return effect()
+		}
+		const own = () => withProviderStartExclusion(this.globalStoragePath, this.taskId, started, { fresh })
+		const attempt =
+			this.parentTaskId && this.parentTaskId !== this.taskId
+				? withProviderStartExclusion(this.globalStoragePath, this.parentTaskId, own, { fresh })
+				: own()
+		return attempt.catch((error) => {
+			// Contention while acquiring (before the effect) refuses this attempt only.
+			if (isStickyPersistenceRefusal(error, effectStarted)) this.persistenceAuthority.refused = true
+			throw error
+		})
+	}
+
+	private async assertStartExclusion(): Promise<void> {
+		await assertProviderStartExclusion(this.globalStoragePath, this.taskId)
+		if (this.parentTaskId && this.parentTaskId !== this.taskId) {
+			await assertProviderStartExclusion(this.globalStoragePath, this.parentTaskId)
+		}
+	}
+
+	public runWithStartExclusion(effect: () => Promise<void>): Promise<void> {
+		return this.withStartExclusion(
+			() => withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, effect),
+			true,
+		)
+	}
+
 	private async startTask(task?: string, images?: string[]): Promise<void> {
+		const continueRun = await this.withStartExclusion(async () => {
+			await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {})
+			return this.startTaskUnprotected(task, images)
+		})
+		if (continueRun) await continueRun()
+	}
+
+	private async startTaskUnprotected(task?: string, images?: string[]): Promise<(() => Promise<void>) | void> {
 		try {
 			// `conversationHistory` (for API) and `clineMessages` (for webview)
 			// need to be in sync.
@@ -2567,21 +2965,27 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			const imageBlocks: Anthropic.ImageBlockParam[] = formatResponse.imageBlocks(images)
 
-			// Task starting
-			await this.initiateTaskLoop([
+			// Initialization can await arbitrary provider work; recheck before the loop.
+			await this.assertStartExclusion()
+			const continueRun = await this.prepareTaskLoop([
 				{
 					type: "text",
 					text: `<user_message>\n${task}\n</user_message>`,
 				},
 				...imageBlocks,
-			]).catch((error) => {
-				// Swallow loop rejection when the task was intentionally abandoned/aborted
-				// during delegation or user cancellation to prevent unhandled rejections.
-				if (this.abandoned === true || this.abortReason === "user_cancelled") {
-					return
-				}
-				throw error
-			})
+			])
+			return (
+				continueRun &&
+				(() =>
+					continueRun().catch((error) => {
+						// Swallow loop rejection when the task was intentionally abandoned/aborted
+						// during delegation or user cancellation to prevent unhandled rejections.
+						if (this.abandoned === true || this.abortReason === "user_cancelled") {
+							return
+						}
+						throw error
+					}))
+			)
 		} catch (error) {
 			// In tests and some UX flows, tasks can be aborted while `startTask` is still
 			// initializing. Treat abort/abandon as expected and avoid unhandled rejections.
@@ -2592,7 +2996,191 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
-	private async resumeTaskFromHistory() {
+	private async resumeTaskFromHistory(): Promise<void> {
+		let continuation: ResumeContinuation = await this.withStartExclusion(async () => {
+			await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {})
+			return this.resumeTaskFromHistoryUnprotected()
+		}).catch((error: unknown) => {
+			// The scope can reject on exit after presenting (lease check, joined-effect drain).
+			releaseUnstartedResumeAsks(this.unstartedResumeAsks)
+			throw error
+		})
+		// Every user wait runs here, after the scope that presented its ask released its leases.
+		while (typeof continuation === "object") continuation = await this.answerResumeWait(continuation)
+		if (continuation === true) await this.resumePendingQuestion()
+		else if (typeof continuation === "function") await continuation()
+	}
+
+	/** Presented resume asks whose wait has not started; each holds any queued claim of its presentation. */
+	private unstartedResumeAsks?: Set<ResumeUserWait>
+
+	/** Wait outside every scope; apply the answer only under a NEW bounded exclusion, after re-checking it. */
+	private async answerResumeWait(pending: ResumeUserWait): Promise<ResumeContinuation> {
+		// Until `resolve` takes it over, a claimed queued message is released on every refusal.
+		let unresolved: ResumeAskAnswer | undefined
+		const release = () => {
+			if (unresolved?.queuedMessageId) this.messageQueueService.releaseMessage(unresolved.queuedMessageId)
+			unresolved = undefined
+		}
+		try {
+			const answer = await pending.wait()
+			unresolved = answer
+			if (this.abort || this.abandoned) return release()
+			try {
+				// Fresh (bounded): the answer's own un-awaited save, e.g. handleWebviewAskResponse
+				// ("yesButtonClicked"), may still hold the lease. Zero-wait would refuse the answer.
+				return await this.withStartExclusion(async () => {
+					await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {})
+					if (this.abort || this.abandoned) return release()
+					await pending.verify()
+					await this.assertStartExclusion()
+					unresolved = undefined
+					return pending.resolve(answer)
+				}, true)
+			} catch (error) {
+				// Only contention while acquiring, which applied nothing and left authority intact, is retried.
+				if (unresolved !== answer || !isPersistenceContentionError(error) || this.persistenceAuthority.refused)
+					throw error
+				if (this.abort || this.abandoned) return release()
+				console.warn(
+					`[Task#resumeTaskFromHistory] start exclusion contended for ${this.taskId}; the answer was not applied, re-presenting the ask for a new user action`,
+				)
+				// Never re-delivered: the answer's content goes back to the user, then the same ask is
+				// presented again and only a NEW user action answers it.
+				unresolved = undefined
+				await this.restoreResumeAnswerToInput(answer)
+				return await this.withStartExclusion(async () => {
+					await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {})
+					if (this.abort || this.abandoned) return
+					return pending.represent()
+				}, true)
+			}
+		} catch (error) {
+			release()
+			releaseUnstartedResumeAsks(this.unstartedResumeAsks)
+			// Same tolerance as the guarded resume: an intentional abort/abandon is not a failure.
+			if (this.abandoned === true || this.abort === true || this.abortReason === "user_cancelled") return
+			throw error
+		}
+	}
+
+	/** Present under the caller's exclusion; return its wait with the answer's ownership re-check. */
+	private async presentResumeAsk(
+		present: () => Promise<() => Promise<ResumeAskAnswer>>,
+		owned: () => Promise<void>,
+		resolve: ResumeUserWait["resolve"],
+	): Promise<ResumeUserWait> {
+		const wait = await present()
+		const askTs = this.lastMessageTs
+		const pending: ResumeUserWait = {
+			kind: "user_wait",
+			wait: () => {
+				this.unstartedResumeAsks?.delete(pending)
+				return wait()
+			},
+			releaseUnstartedClaim: () => this.unstartedAskClaims?.get(wait)?.(),
+			verify: async () => {
+				// Any later ask or interactive say supersedes the presented ask and its answer.
+				if (this.lastMessageTs !== askTs) throw new OrdinaryPersistenceAuthorityError(RESUME_OWNERSHIP_CHANGED)
+				await owned()
+			},
+			resolve,
+			represent: async () => {
+				// The contention holder may have moved the owner: refuse (typed, sticky) before showing
+				// a stale ask, exactly as `verify` refuses its answer.
+				await owned()
+				return this.presentResumeAsk(present, owned, resolve)
+			},
+		}
+		;(this.unstartedResumeAsks ??= new Set()).add(pending)
+		return pending
+	}
+
+	/**
+	 * Returns an unapplied answer's content to the user: text and images go back to the chat input.
+	 * A durable-ack queued message (still in the queue, claimed) is removed only after the hand-back,
+	 * so no later ask consumes it with another meaning. A non-durable queued message was removed at
+	 * drain and is restored like a typed answer.
+	 */
+	private async restoreResumeAnswerToInput({ text, images, queuedMessageId }: ResumeAskAnswer): Promise<void> {
+		if (!text && !images?.length) {
+			if (queuedMessageId) this.messageQueueService.removeMessage(queuedMessageId)
+			return
+		}
+		const provider = this.providerRef.deref()
+		if (!provider?.isViewLaunched) {
+			// No input to restore into: a durable-ack queued message stays claimed (kept, not consumable).
+			console.warn(
+				`[Task#resumeTaskFromHistory] no webview to restore an unapplied answer for ${this.taskId}${queuedMessageId ? "; its durable-ack queued message stays claimed" : "; its text and images (typed, or a non-durable queued message removed at drain) are lost"}`,
+			)
+			return
+		}
+		await provider.postMessageToWebview({ type: "invoke", invoke: "setChatBoxMessage", text: text ?? "", images })
+		if (queuedMessageId) this.messageQueueService.removeMessage(queuedMessageId)
+	}
+
+	/**
+	 * Authoritative re-check for a restored action answer: the shown action (or, after it was
+	 * resolved, its absence) still owns this task, and the status did not move to a terminal state.
+	 */
+	private async assertResumeActionOwned(actionId: string | undefined, status: HistoryItem["status"]): Promise<void> {
+		const read = await this.providerRef.deref()?.getTaskMetadata(this.taskId)
+		const item = read?.kind === "found" ? read.item : undefined
+		const statusMoved = item?.status !== status && (item?.status === "interrupted" || item?.status === "completed")
+		if (
+			!item ||
+			statusMoved ||
+			item.pendingAction?.actionId !== actionId ||
+			this.pendingAction?.actionId !== actionId
+		)
+			throw new OrdinaryPersistenceAuthorityError(RESUME_OWNERSHIP_CHANGED)
+	}
+
+	/**
+	 * Resumed interrupted task: persist `active` before the loop starts, so a resumed delegated
+	 * child can delegate again. Call only under the resolve/continue scope that will start the
+	 * loop: after an applied resume answer, or when opening the chat auto-continues a pending
+	 * question whose answer was already durably saved. Showing the Resume ask never restores.
+	 * A refusal (the parent now awaits a different child) or a busy parent delegation lock
+	 * past its bound leaves the task interrupted, and the resume proceeds as before.
+	 */
+	private async restoreLiveStatusOnResume(): Promise<void> {
+		if (this.liveStatus !== "interrupted") return
+		const provider = this.providerRef.deref()
+		if (!provider) throw new Error(`[Task#restoreLiveStatusOnResume] Provider unavailable for task ${this.taskId}`)
+		try {
+			const current = await provider.resumeInterruptedTask(
+				this.taskId,
+				this.persistenceAuthority,
+				() => !this.abort && !this.abandoned,
+			)
+			// Undefined: this instance was stopped first; its interruption stands.
+			if (current) this.resumedStatus = current.status ?? "active"
+		} catch (error) {
+			if (!(error instanceof LifecycleTransitionError)) throw error
+			console.warn(`[Task#restoreLiveStatusOnResume] ${this.taskId} stays interrupted: ${error.message}`)
+		}
+	}
+
+	private async readResumeStatus(): Promise<HistoryItem["status"]> {
+		const read = await this.providerRef.deref()?.getTaskMetadata(this.taskId)
+		if (read?.kind !== "found") throw new OrdinaryPersistenceAuthorityError(RESUME_OWNERSHIP_CHANGED)
+		return read.item.status
+	}
+
+	/** A loop that formerly ran inside the guarded resume keeps its abort/cancel tolerance after release. */
+	private toleratingAbort(loop: (() => Promise<void>) | void): (() => Promise<void>) | void {
+		return (
+			loop &&
+			(() =>
+				loop().catch((error) => {
+					if (this.abandoned === true || this.abort === true || this.abortReason === "user_cancelled") return
+					throw error
+				}))
+		)
+	}
+
+	private async resumeTaskFromHistoryUnprotected(): Promise<ResumeContinuation> {
 		try {
 			const modifiedClineMessages = [...(await this.getSavedClineMessages())]
 
@@ -2681,12 +3269,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
 			}
 
-			if (this.pendingQuestion) {
-				await this.resumePendingQuestion()
-				return
-			}
+			// Return to the owning orchestrator before entering an external-answer wait.
+			if (this.pendingQuestion) return true
 
-			if (this.pendingAction?.kind === "create_subtask" && this.initialStatus === "interrupted") {
+			if (this.pendingAction?.kind === "create_subtask" && this.liveStatus === "interrupted") {
 				// Keep the saved approval/action and history intact. Replaying it here
 				// would dispose this chat before an interrupted parent can delegate.
 				this.isInitialized = true
@@ -2697,14 +3283,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				void vscode.window.showErrorMessage(
 					"This interrupted chat has an unfinished subtask handoff. No child will start; send a message to continue the chat without completing that handoff.",
 				)
-				await this.resumeInterruptedCreateSubtask(this.pendingAction)
-				return
+				return await this.resumeInterruptedCreateSubtask(this.pendingAction)
 			}
 
 			if (this.pendingAction) {
 				this.isInitialized = true
-				await this.resumePendingTaskAction(this.pendingAction)
-				return
+				return await this.resumePendingTaskAction(this.pendingAction)
 			}
 
 			if (this.abort || this.abandoned) {
@@ -2725,171 +3309,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.isInitialized = true
 
-			const { response, text, images } = await this.ask(askType) // Calls `postStateToWebview`.
-
-			let responseText: string | undefined
-			let responseImages: string[] | undefined
-
-			if (response === "messageResponse") {
-				await this.say("user_feedback", text, images)
-				responseText = text
-				responseImages = images
-			}
-
-			// Make sure that the api conversation history can be resumed by the API,
-			// even if it goes out of sync with cline messages.
-			const existingApiConversationHistory: ApiMessage[] = await this.getSavedApiConversationHistory()
-
-			// Tool blocks are always preserved; native tool calling only.
-
-			// if the last message is an assistant message, we need to check if there's tool use since every tool use has to have a tool response
-			// if there's no tool use and only a text block, then we can just add a user message
-			// (note this isn't relevant anymore since we use custom tool prompts instead of tool use blocks, but this is here for legacy purposes in case users resume old tasks)
-
-			// if the last message is a user message, we can need to get the assistant message before it to see if it made tool calls, and if so, fill in the remaining tool responses with 'interrupted'
-
-			let modifiedOldUserContent: Anthropic.Messages.ContentBlockParam[] // either the last message if its user message, or the user message before the last (assistant) message
-			let modifiedApiConversationHistory: ApiMessage[] // need to remove the last user message to replace with new modified user message
-			if (existingApiConversationHistory.length > 0) {
-				const lastMessage = existingApiConversationHistory[existingApiConversationHistory.length - 1]
-
-				if (lastMessage.isSummary) {
-					// IMPORTANT: If the last message is a condensation summary, we must preserve it
-					// intact. The summary message carries critical metadata (isSummary, condenseId)
-					// that getEffectiveApiHistory() uses to filter out condensed messages.
-					// Removing or merging it would destroy this metadata, causing all condensed
-					// messages to become "orphaned" and restored to active status — effectively
-					// undoing the condensation and sending the full history to the API.
-					// See: https://github.com/RooCodeInc/Roo-Code/issues/11487
-					modifiedApiConversationHistory = [...existingApiConversationHistory]
-					modifiedOldUserContent = []
-				} else if (lastMessage.role === "assistant") {
-					const content = Array.isArray(lastMessage.content)
-						? lastMessage.content
-						: [{ type: "text", text: lastMessage.content }]
-					const hasToolUse = content.some((block) => block.type === "tool_use")
-
-					if (hasToolUse) {
-						const toolUseBlocks = content.filter(
-							(block) => block.type === "tool_use",
-						) as Anthropic.Messages.ToolUseBlock[]
-						// Mark the synthetic results as errors (is_error: true) so the persisted
-						// history cannot be misread as a successful completion of the interrupted
-						// tool calls (e.g. attempt_completion). The task list already records the
-						// task as interrupted; the API history must agree.
-						// See: https://github.com/Zoo-Code-Org/Zoo-Code/issues/1283
-						const toolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map((block) => ({
-							type: "tool_result",
-							tool_use_id: block.id,
-							content: "Task was interrupted before this tool call could be completed.",
-							is_error: true,
-						}))
-						modifiedApiConversationHistory = [...existingApiConversationHistory] // no changes
-						modifiedOldUserContent = [...toolResponses]
-					} else {
-						modifiedApiConversationHistory = [...existingApiConversationHistory]
-						modifiedOldUserContent = []
-					}
-				} else if (lastMessage.role === "user") {
-					const previousAssistantMessage: ApiMessage | undefined =
-						existingApiConversationHistory[existingApiConversationHistory.length - 2]
-
-					const existingUserContent: Anthropic.Messages.ContentBlockParam[] = Array.isArray(
-						lastMessage.content,
-					)
-						? lastMessage.content
-						: [{ type: "text", text: lastMessage.content }]
-					if (previousAssistantMessage && previousAssistantMessage.role === "assistant") {
-						const assistantContent = Array.isArray(previousAssistantMessage.content)
-							? previousAssistantMessage.content
-							: [{ type: "text", text: previousAssistantMessage.content }]
-
-						const toolUseBlocks = assistantContent.filter(
-							(block) => block.type === "tool_use",
-						) as Anthropic.Messages.ToolUseBlock[]
-
-						if (toolUseBlocks.length > 0) {
-							const existingToolResults = existingUserContent.filter(
-								(block) => block.type === "tool_result",
-							) as Anthropic.ToolResultBlockParam[]
-
-							const missingToolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks
-								.filter(
-									(toolUse) =>
-										!existingToolResults.some((result) => result.tool_use_id === toolUse.id),
-								)
-								// is_error: true — same rationale as the assistant-last case above.
-								// See: https://github.com/Zoo-Code-Org/Zoo-Code/issues/1283
-								.map((toolUse) => ({
-									type: "tool_result",
-									tool_use_id: toolUse.id,
-									content: "Task was interrupted before this tool call could be completed.",
-									is_error: true,
-								}))
-
-							modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1) // removes the last user message
-							modifiedOldUserContent = [...existingUserContent, ...missingToolResponses]
-						} else {
-							modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1)
-							modifiedOldUserContent = [...existingUserContent]
-						}
-					} else {
-						modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1)
-						modifiedOldUserContent = [...existingUserContent]
-					}
-				} else {
-					throw new Error("Unexpected: Last message is not a user or assistant message")
-				}
-			} else {
-				throw new Error("Unexpected: No existing API conversation history")
-			}
-
-			const newUserContent: Anthropic.Messages.ContentBlockParam[] = [...modifiedOldUserContent]
-
-			const agoText = ((): string => {
-				const timestamp = lastClineMessage?.ts ?? Date.now()
-				const now = Date.now()
-				const diff = now - timestamp
-				const minutes = Math.floor(diff / 60000)
-				const hours = Math.floor(minutes / 60)
-				const days = Math.floor(hours / 24)
-
-				if (days > 0) {
-					return `${days} day${days > 1 ? "s" : ""} ago`
-				}
-				if (hours > 0) {
-					return `${hours} hour${hours > 1 ? "s" : ""} ago`
-				}
-				if (minutes > 0) {
-					return `${minutes} minute${minutes > 1 ? "s" : ""} ago`
-				}
-				return "just now"
-			})()
-
-			if (responseText) {
-				newUserContent.push({
-					type: "text",
-					text: `<user_message>\n${responseText}\n</user_message>`,
-				})
-			}
-
-			if (responseImages && responseImages.length > 0) {
-				newUserContent.push(...formatResponse.imageBlocks(responseImages))
-			}
-
-			// Ensure we have at least some content to send to the API.
-			// If newUserContent is empty, add a minimal resumption message.
-			if (newUserContent.length === 0) {
-				newUserContent.push({
-					type: "text",
-					text: "[TASK RESUMPTION] Resuming task...",
-				})
-			}
-
-			await this.overwriteApiConversationHistory(modifiedApiConversationHistory)
-
-			// Task resuming from history item.
-			await this.initiateTaskLoop(newUserContent)
+			return await this.presentResumeAsk(
+				() => this.prepareAsk(askType), // Calls `postStateToWebview`.
+				// The fresh resolve scope's entry check is this path's authority re-check.
+				async () => {},
+				(answer) => this.resolveHistoryResume(answer, lastClineMessage),
+			)
 		} catch (error) {
 			// Resume and cancellation can race when users issue repeated cancels.
 			// Treat intentional abort/abandon flows as expected and avoid process-level crashes.
@@ -2900,8 +3325,192 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
-	private async resumeInterruptedCreateSubtask(action: PendingTaskAction): Promise<void> {
-		const { response, text, images, queuedMessageId } = await this.ask("resume_task")
+	/** Generic Resume Task answer, applied in the resolve phase; the loop runs after release. */
+	private async resolveHistoryResume(
+		{ response, text, images }: ResumeAskAnswer,
+		lastClineMessage: ClineMessage | undefined,
+	): Promise<(() => Promise<void>) | void> {
+		let responseText: string | undefined
+		let responseImages: string[] | undefined
+
+		if (response === "messageResponse") {
+			await this.say("user_feedback", text, images)
+			responseText = text
+			responseImages = images
+		}
+
+		// Make sure that the api conversation history can be resumed by the API,
+		// even if it goes out of sync with cline messages.
+		const existingApiConversationHistory: ApiMessage[] = await this.getSavedApiConversationHistory()
+
+		// Tool blocks are always preserved; native tool calling only.
+
+		// if the last message is an assistant message, we need to check if there's tool use since every tool use has to have a tool response
+		// if there's no tool use and only a text block, then we can just add a user message
+		// (note this isn't relevant anymore since we use custom tool prompts instead of tool use blocks, but this is here for legacy purposes in case users resume old tasks)
+
+		// if the last message is a user message, we can need to get the assistant message before it to see if it made tool calls, and if so, fill in the remaining tool responses with 'interrupted'
+
+		let modifiedOldUserContent: Anthropic.Messages.ContentBlockParam[] // either the last message if its user message, or the user message before the last (assistant) message
+		let modifiedApiConversationHistory: ApiMessage[] // need to remove the last user message to replace with new modified user message
+		if (existingApiConversationHistory.length > 0) {
+			const lastMessage = existingApiConversationHistory[existingApiConversationHistory.length - 1]
+
+			if (lastMessage.isSummary) {
+				// IMPORTANT: If the last message is a condensation summary, we must preserve it
+				// intact. The summary message carries critical metadata (isSummary, condenseId)
+				// that getEffectiveApiHistory() uses to filter out condensed messages.
+				// Removing or merging it would destroy this metadata, causing all condensed
+				// messages to become "orphaned" and restored to active status — effectively
+				// undoing the condensation and sending the full history to the API.
+				// See: https://github.com/RooCodeInc/Roo-Code/issues/11487
+				modifiedApiConversationHistory = [...existingApiConversationHistory]
+				modifiedOldUserContent = []
+			} else if (lastMessage.role === "assistant") {
+				const content = Array.isArray(lastMessage.content)
+					? lastMessage.content
+					: [{ type: "text", text: lastMessage.content }]
+				const hasToolUse = content.some((block) => block.type === "tool_use")
+
+				if (hasToolUse) {
+					const toolUseBlocks = content.filter(
+						(block) => block.type === "tool_use",
+					) as Anthropic.Messages.ToolUseBlock[]
+					// Mark the synthetic results as errors (is_error: true) so the persisted
+					// history cannot be misread as a successful completion of the interrupted
+					// tool calls (e.g. attempt_completion). The task list already records the
+					// task as interrupted; the API history must agree.
+					// See: https://github.com/Zoo-Code-Org/Zoo-Code/issues/1283
+					const toolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map((block) => ({
+						type: "tool_result",
+						tool_use_id: block.id,
+						content: "Task was interrupted before this tool call could be completed.",
+						is_error: true,
+					}))
+					modifiedApiConversationHistory = [...existingApiConversationHistory] // no changes
+					modifiedOldUserContent = [...toolResponses]
+				} else {
+					modifiedApiConversationHistory = [...existingApiConversationHistory]
+					modifiedOldUserContent = []
+				}
+			} else if (lastMessage.role === "user") {
+				const previousAssistantMessage: ApiMessage | undefined =
+					existingApiConversationHistory[existingApiConversationHistory.length - 2]
+
+				const existingUserContent: Anthropic.Messages.ContentBlockParam[] = Array.isArray(lastMessage.content)
+					? lastMessage.content
+					: [{ type: "text", text: lastMessage.content }]
+				if (previousAssistantMessage && previousAssistantMessage.role === "assistant") {
+					const assistantContent = Array.isArray(previousAssistantMessage.content)
+						? previousAssistantMessage.content
+						: [{ type: "text", text: previousAssistantMessage.content }]
+
+					const toolUseBlocks = assistantContent.filter(
+						(block) => block.type === "tool_use",
+					) as Anthropic.Messages.ToolUseBlock[]
+
+					if (toolUseBlocks.length > 0) {
+						const existingToolResults = existingUserContent.filter(
+							(block) => block.type === "tool_result",
+						) as Anthropic.ToolResultBlockParam[]
+
+						const missingToolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks
+							.filter(
+								(toolUse) => !existingToolResults.some((result) => result.tool_use_id === toolUse.id),
+							)
+							// is_error: true — same rationale as the assistant-last case above.
+							// See: https://github.com/Zoo-Code-Org/Zoo-Code/issues/1283
+							.map((toolUse) => ({
+								type: "tool_result",
+								tool_use_id: toolUse.id,
+								content: "Task was interrupted before this tool call could be completed.",
+								is_error: true,
+							}))
+
+						modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1) // removes the last user message
+						modifiedOldUserContent = [...existingUserContent, ...missingToolResponses]
+					} else {
+						modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1)
+						modifiedOldUserContent = [...existingUserContent]
+					}
+				} else {
+					modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1)
+					modifiedOldUserContent = [...existingUserContent]
+				}
+			} else {
+				throw new Error("Unexpected: Last message is not a user or assistant message")
+			}
+		} else {
+			throw new Error("Unexpected: No existing API conversation history")
+		}
+
+		const newUserContent: Anthropic.Messages.ContentBlockParam[] = [...modifiedOldUserContent]
+
+		const agoText = ((): string => {
+			const timestamp = lastClineMessage?.ts ?? Date.now()
+			const now = Date.now()
+			const diff = now - timestamp
+			const minutes = Math.floor(diff / 60000)
+			const hours = Math.floor(minutes / 60)
+			const days = Math.floor(hours / 24)
+
+			if (days > 0) {
+				return `${days} day${days > 1 ? "s" : ""} ago`
+			}
+			if (hours > 0) {
+				return `${hours} hour${hours > 1 ? "s" : ""} ago`
+			}
+			if (minutes > 0) {
+				return `${minutes} minute${minutes > 1 ? "s" : ""} ago`
+			}
+			return "just now"
+		})()
+
+		if (responseText) {
+			newUserContent.push({
+				type: "text",
+				text: `<user_message>\n${responseText}\n</user_message>`,
+			})
+		}
+
+		if (responseImages && responseImages.length > 0) {
+			newUserContent.push(...formatResponse.imageBlocks(responseImages))
+		}
+
+		// Ensure we have at least some content to send to the API.
+		// If newUserContent is empty, add a minimal resumption message.
+		if (newUserContent.length === 0) {
+			newUserContent.push({
+				type: "text",
+				text: "[TASK RESUMPTION] Resuming task...",
+			})
+		}
+
+		await this.overwriteApiConversationHistory(modifiedApiConversationHistory)
+		// The user resumed: an interrupted task is live again before its loop starts.
+		await this.restoreLiveStatusOnResume()
+
+		// Task resuming from history item: admission is capable, the loop is not.
+		await this.assertStartExclusion()
+		return this.prepareTaskLoop(newUserContent)
+	}
+
+	/** Present phase: the recovery ask is shown under the caller's exclusion; the wait is returned. */
+	private async resumeInterruptedCreateSubtask(action: PendingTaskAction): Promise<ResumeUserWait> {
+		return this.presentResumeAsk(
+			() => this.prepareAsk("resume_task"),
+			// Ownership (action id, `interrupted`, API boundary) is the unchanged read-back in
+			// resolve, after the no-op answers return; it runs before any effect.
+			async () => {},
+			(answer) => this.resolveInterruptedCreateSubtask(action, answer),
+		)
+	}
+
+	/** Resolve phase: no child ever starts; the recovery loop runs after release. */
+	private async resolveInterruptedCreateSubtask(
+		action: PendingTaskAction,
+		{ response, text, images, queuedMessageId }: ResumeAskAnswer,
+	): Promise<(() => Promise<void>) | void> {
 		if (this.abort || this.abandoned || response !== "messageResponse") {
 			if (queuedMessageId) this.messageQueueService.releaseMessage(queuedMessageId)
 			return
@@ -2968,62 +3577,93 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			if (queuedMessageId) this.messageQueueService.releaseMessage(queuedMessageId)
 			throw error
 		}
-		await this.initiateTaskLoop([
-			{ type: "text", text: `<user_message>\n${text ?? ""}\n</user_message>` },
-			...formatResponse.imageBlocks(images),
-		])
+		// Only after the durable recovery result and action clear: the checks above require `interrupted`.
+		await this.restoreLiveStatusOnResume()
+		return this.toleratingAbort(
+			await this.prepareTaskLoop([
+				{ type: "text", text: `<user_message>\n${text ?? ""}\n</user_message>` },
+				...formatResponse.imageBlocks(images),
+			]),
+		)
 	}
 
-	private async resumePendingTaskAction(action: PendingTaskAction): Promise<void> {
+	/**
+	 * Present phase: the restored approval is shown under the caller's exclusion and its wait is
+	 * returned. The status baseline is read authoritatively under that scope.
+	 */
+	private async resumePendingTaskAction(action: PendingTaskAction): Promise<ResumeUserWait> {
+		if (!this.providerRef.deref()) {
+			throw new Error(`[Task#resumePendingTaskAction] Provider unavailable for task ${this.taskId}`)
+		}
+		const status = await this.readResumeStatus()
+		return this.presentResumeAsk(
+			() => this.prepareAsk("tool", action.approvalText, false),
+			() => this.assertResumeActionOwned(action.actionId, status),
+			(answer) => this.resolvePendingTaskAction(action, answer),
+		)
+	}
+
+	/** Resolve phase for the restored approval. Provider handoffs inherit this scope's guard. */
+	private async resolvePendingTaskAction(
+		action: PendingTaskAction,
+		answer: ResumeAskAnswer,
+	): Promise<ResumeContinuation> {
 		const provider = this.providerRef.deref()
 		if (!provider) {
 			throw new Error(`[Task#resumePendingTaskAction] Provider unavailable for task ${this.taskId}`)
 		}
+		if (answer.response !== "yesButtonClicked") return this.resolvePendingActionDenial(action, answer)
 
-		let { response, text, images, queuedMessageId } = await this.ask("tool", action.approvalText, false)
-
-		if (response === "yesButtonClicked") {
-			if (action.kind === "create_subtask") {
-				await provider.delegateParentAndOpenChild({
-					parentTaskId: this.taskId,
-					message: action.message,
-					initialTodos: action.todos,
-					mode: action.mode,
-					pendingActionId: action.actionId,
-				})
-				return
-			}
-
-			const outcome = normalizeDelegationHandoffOutcome(
-				await provider.reopenParentFromDelegation({
-					parentTaskId: action.parentTaskId,
-					childTaskId: this.taskId,
-					completionResultSummary: action.result,
-					pendingActionId: action.actionId,
-				}),
-			)
-			if (outcome.kind === "committed" || outcome.kind === "pending") {
-				return
-			}
-			if (outcome.kind === "recoverable_failure") {
-				await provider.markDelegatedChildProtocolBlocked?.({
-					parentTaskId: action.parentTaskId,
-					childTaskId: this.taskId,
-				})
-				throw new Error(`[Task#resumePendingTaskAction] Delegated completion handoff failed: ${outcome.reason}`)
-			}
-
-			await this.clearPendingActionAfterDurableResult(action.actionId)
-			if (this.pendingAction) {
-				await this.resumePendingTaskAction(this.pendingAction)
-				return
-			}
-			;({ response, text, images, queuedMessageId } = await this.ask("completion_result", "", false))
-			if (response === "yesButtonClicked") {
-				return
-			}
+		if (action.kind === "create_subtask") {
+			await provider.delegateParentAndOpenChild({
+				parentTaskId: this.taskId,
+				message: action.message,
+				initialTodos: action.todos,
+				mode: action.mode,
+				pendingActionId: action.actionId,
+			})
+			return
 		}
 
+		const outcome = normalizeDelegationHandoffOutcome(
+			await provider.reopenParentFromDelegation({
+				parentTaskId: action.parentTaskId,
+				childTaskId: this.taskId,
+				completionResultSummary: action.result,
+				pendingActionId: action.actionId,
+			}),
+		)
+		if (outcome.kind === "committed" || outcome.kind === "pending") {
+			return
+		}
+		if (outcome.kind === "recoverable_failure") {
+			await provider.markDelegatedChildProtocolBlocked?.({
+				parentTaskId: action.parentTaskId,
+				childTaskId: this.taskId,
+			})
+			throw new Error(`[Task#resumePendingTaskAction] Delegated completion handoff failed: ${outcome.reason}`)
+		}
+
+		await this.clearPendingActionAfterDurableResult(action.actionId)
+		// The next wait is presented under this resolve scope and answered after it is released.
+		if (this.pendingAction) return this.resumePendingTaskAction(this.pendingAction)
+		const status = await this.readResumeStatus()
+		return this.presentResumeAsk(
+			() => this.prepareAsk("completion_result", "", false),
+			// The resolved action stays resolved: no pending action may appear before the answer.
+			() => this.assertResumeActionOwned(undefined, status),
+			async (completion) =>
+				completion.response === "yesButtonClicked"
+					? undefined
+					: this.resolvePendingActionDenial(action, completion),
+		)
+	}
+
+	/** Denial or feedback: persist it in the resolve phase; the denied loop runs after release. */
+	private async resolvePendingActionDenial(
+		action: PendingTaskAction,
+		{ text, images, queuedMessageId }: ResumeAskAnswer,
+	): Promise<(() => Promise<void>) | void> {
 		if (queuedMessageId) {
 			const persisted = await this.persistQueuedFeedbackAndAcknowledge(queuedMessageId, text, images)
 			if (!persisted) {
@@ -3036,13 +3676,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		const deniedContent = text ? formatResponse.toolDeniedWithFeedback(text) : formatResponse.toolDenied()
-		await this.initiateTaskLoop([
-			{
-				type: "tool_result",
-				tool_use_id: action.actionId,
-				content: formatResponse.toolResult(deniedContent, images),
-			},
-		])
+		// The user resumed through the restored approval: the denied loop runs as a live task.
+		await this.restoreLiveStatusOnResume()
+		return this.toleratingAbort(
+			await this.prepareTaskLoop([
+				{
+					type: "tool_result",
+					tool_use_id: action.actionId,
+					content: formatResponse.toolResult(deniedContent, images),
+				},
+			]),
+		)
 	}
 
 	/**
@@ -3150,6 +3794,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private async disposeOnce(): Promise<void> {
 		console.log(`[Task#dispose] disposing task ${this.taskId}.${this.instanceId}`)
 		this.cancelAssistantMessagePersistence()
+		clearTimeout(this.usageSaveRetryTimer)
+		this.usageSaveRetryTimer = undefined
 
 		// Stop the idle telemetry check and report any unflushed activity as a
 		// shutdown installment, so a task torn down mid-work (panel closed, task
@@ -3355,19 +4001,39 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	// Task Loop
 
-	private async initiateTaskLoop(userContent: Anthropic.Messages.ContentBlockParam[]): Promise<void> {
-		// Kicks off the checkpoints initialization process in the background.
-		// `getCheckpointService` wraps its full body in a try/catch and returns
-		// `undefined` on failure (see src/core/checkpoints/index.ts), so the
-		// returned promise cannot reject. `void` is sufficient — no `.catch`
-		// arm needed.
-		void getCheckpointService(this)
+	/** Admit under the caller's capable phase, then return the idle loop to its orchestrator. */
+	private async prepareTaskLoop(
+		userContent: Anthropic.Messages.ContentBlockParam[],
+	): Promise<(() => Promise<void>) | void> {
+		const prepared: { run?: () => Promise<void> } = {}
+		await this.initiateTaskLoop(userContent, (run) => {
+			prepared.run = run
+		})
+		return prepared.run
+	}
 
+	private async initiateTaskLoop(
+		userContent: Anthropic.Messages.ContentBlockParam[],
+		prepared?: (run: () => Promise<void>) => void,
+	): Promise<void> {
+		// Checkpoint initialization is capable work: join it before admission
+		// releases its phase. The service returns undefined on failure.
+		await getCheckpointService(this)
+
+		if (prepared) {
+			prepared(() => {
+				this.emit(RooCodeEventName.TaskStarted)
+				return this.taskLoopBody(userContent)
+			})
+			return
+		}
+		this.emit(RooCodeEventName.TaskStarted)
+		await this.taskLoopBody(userContent)
+	}
+
+	private async taskLoopBody(userContent: Anthropic.Messages.ContentBlockParam[]): Promise<void> {
 		let nextUserContent = userContent
 		let includeFileDetails = true
-
-		this.emit(RooCodeEventName.TaskStarted)
-
 		while (!this.abort && !this.isDelegatedCompletionStopped && !this.hasPendingQuestion) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
 			includeFileDetails = false // We only need file details the first time.
@@ -3993,7 +4659,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 								// Update the API request message with the latest usage data
 								updateApiReqMsg()
-								await this.saveClineMessages()
+								try {
+									await this.saveClineMessages()
+								} catch (error) {
+									if (!isPersistenceContentionError(error)) throw error
+									// Another save holds this task's fence. The usage stays in the
+									// in-memory message; one deferred save (or any newer save) persists it.
+									console.warn(
+										`[Background Usage Collection] Skipped usage save for task ${this.taskId}: persistence fence busy (${error instanceof Error ? error.message : String(error)})`,
+									)
+									this.scheduleUsageSaveRetry()
+								}
 
 								// Update the specific message in the webview
 								const apiReqMessage = this.clineMessages[messageIndex]
@@ -4134,7 +4810,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						// Determine cancellation reason
 						const cancelReason: ClineApiReqCancelReason = this.abort ? "user_cancelled" : "streaming_failed"
 
-						const rawErrorMessage = error.message ?? JSON.stringify(serializeError(error), null, 2)
+						const rawErrorMessage =
+							getThrownMessage(error) ?? JSON.stringify(serializeError(error), null, 2)
 						const streamingFailedMessage = this.abort
 							? undefined
 							: `${t("common:interruption.streamTerminatedByProvider")}: ${rawErrorMessage}`
@@ -4339,7 +5016,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				const hasWorkerEnvelope = !!this.parentTaskId && isRecognizableWorkerEnvelope(assistantMessage)
 				const suppressDelegatedText = !!this.parentTaskId && (hasWorkerEnvelope || hasValidAttemptCompletion)
 				if (this.parentTaskId && hasTextContent && !suppressDelegatedText) {
-					await this.say("text", assistantMessage, undefined, false)
+					// A native tool may already be waiting for approval. Publishing the
+					// child's final text must not supersede that tool's owned ask.
+					await this.say("text", assistantMessage, undefined, false, undefined, undefined, {
+						isNonInteractive: true,
+					})
 				}
 				if (this.parentTaskId && !hasToolUses) {
 					this.userMessageContentReady = true
@@ -5486,7 +6167,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} else {
 				const { response } = await this.ask(
 					"api_req_failed",
-					error.message ?? JSON.stringify(serializeError(error), null, 2),
+					getThrownMessage(error) ?? JSON.stringify(serializeError(error), null, 2),
 				)
 
 				if (response !== "yesButtonClicked") {

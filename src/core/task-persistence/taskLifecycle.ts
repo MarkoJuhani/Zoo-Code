@@ -1,5 +1,53 @@
 import type { HistoryItem } from "@roo-code/types"
 
+/** Internal on-disk revision; the public HistoryItem schema deliberately does not own it. */
+export type OrdinaryAuthorityHistoryItem = HistoryItem & { ordinaryPersistenceRevision?: string }
+export interface OrdinaryPersistenceIdentity {
+	readonly id: string
+	readonly parentTaskId?: string
+	readonly rootTaskId?: string
+	readonly revision?: string
+}
+
+/** Capture once per Task instance. A new lease or refreshed cache does not renew this identity. */
+export function ordinaryPersistenceIdentity(
+	item: Pick<OrdinaryAuthorityHistoryItem, "id" | "parentTaskId" | "rootTaskId" | "ordinaryPersistenceRevision">,
+): OrdinaryPersistenceIdentity {
+	return {
+		id: item.id,
+		parentTaskId: item.parentTaskId,
+		rootTaskId: item.rootTaskId,
+		revision: item.ordinaryPersistenceRevision,
+	}
+}
+
+export function matchesOrdinaryPersistenceAuthority(
+	authority: OrdinaryPersistenceIdentity,
+	item: OrdinaryAuthorityHistoryItem,
+): boolean {
+	return (
+		item.id === authority.id &&
+		item.parentTaskId === authority.parentTaskId &&
+		item.rootTaskId === authority.rootTaskId &&
+		item.ordinaryPersistenceRevision === authority.revision
+	)
+}
+
+/** An explicit instance revision is comparison evidence, not permission to advance authority. */
+export function matchesOrdinaryHistorySnapshot(item: HistoryItem, disk: OrdinaryAuthorityHistoryItem | null): boolean {
+	if (!Object.prototype.hasOwnProperty.call(item, "ordinaryPersistenceRevision")) return true
+	const snapshot = item as OrdinaryAuthorityHistoryItem
+	return (
+		snapshot.ordinaryPersistenceRevision === disk?.ordinaryPersistenceRevision &&
+		(!disk || (snapshot.parentTaskId === disk.parentTaskId && snapshot.rootTaskId === disk.rootTaskId))
+	)
+}
+
+/** Pure publication transform; the runtime supplies a new crypto UUID on each abandonment side. */
+export function advanceOrdinaryPersistenceRevision(item: HistoryItem, revision: string): OrdinaryAuthorityHistoryItem {
+	return { ...item, ordinaryPersistenceRevision: revision }
+}
+
 /** Valid status values for a task's HistoryItem. */
 export type HistoryItemStatus = NonNullable<HistoryItem["status"]>
 
@@ -15,6 +63,17 @@ export class LifecycleTransitionError extends Error {
 	constructor(message: string) {
 		super(message)
 		this.name = "LifecycleTransitionError"
+	}
+}
+
+/**
+ * The transition was not applied because its serialization point stayed busy past its
+ * bound. Like any refusal, nothing was written; the caller keeps the prior status.
+ */
+export class LifecycleTransitionContentionError extends LifecycleTransitionError {
+	constructor(message: string) {
+		super(message)
+		this.name = "LifecycleTransitionContentionError"
 	}
 }
 
@@ -156,6 +215,34 @@ export function abandonDelegatedChild(
 			protocolErrorChildId: undefined,
 		},
 	}
+}
+
+/**
+ * A user resume makes an interrupted task live again (`interrupted → active`). Allowed only
+ * for the child its parent still awaits (parent `delegated` or `blocked_protocol_error`), or
+ * for a task with no parent link (never delegated, or abandoned). A child superseded by
+ * re-delegation stays interrupted: an active linked child must be the one its parent awaits.
+ *
+ * `interrupted → active` is intentionally absent from VALID_TASK_STATUS_TRANSITIONS, which
+ * keeps stale ordinary saves from undoing an interruption. Only this reducer's result,
+ * persisted by TaskHistoryStore.resumeInterruptedTask, may make that transition.
+ */
+export function resumeInterruptedTask(task: HistoryItem, parent?: HistoryItem): HistoryItem {
+	if (task.status !== "interrupted") {
+		throw new LifecycleTransitionError(`Cannot resume task ${task.id} with status ${task.status ?? "active"}`)
+	}
+	if (task.awaitingChildId !== undefined || task.delegatedToId !== undefined) {
+		throw new LifecycleTransitionError(`Cannot resume task ${task.id}: it still points to an awaited child`)
+	}
+	if (
+		task.parentTaskId !== undefined &&
+		(parent?.id !== task.parentTaskId ||
+			(parent.status !== "delegated" && parent.status !== "blocked_protocol_error") ||
+			parent.awaitingChildId !== task.id)
+	) {
+		throw new LifecycleTransitionError(`Task ${task.parentTaskId} no longer awaits interrupted child ${task.id}`)
+	}
+	return { ...task, status: "active" }
 }
 
 /** A question is not resolved by interruption, approval, or synthetic tool feedback. */

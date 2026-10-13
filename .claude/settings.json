@@ -1,0 +1,49 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-settings.json",
+	"permissions": {
+		"defaultMode": "default",
+		"allow": [
+			"Bash(git status *)",
+			"Bash(git log *)",
+			"Bash(git diff *)",
+			"Bash(git rev-parse *)",
+			"Bash(git show *)",
+			"Bash(ls *)",
+			"Bash(cat *)",
+			"Bash(grep *)",
+			"Bash(wc *)",
+			"Bash(head *)",
+			"Bash(tail *)",
+			"Bash(md5sum *)",
+			"Bash(date)",
+			"Bash(fold *)",
+			"Bash(node .claude/skills/zoo-verify/scripts/verify.mjs *)",
+			"Bash(pnpm exec vitest run *)",
+			"Bash(npx vitest run *)",
+			"Bash(npx prettier --check *)",
+			"Bash(pnpm lifecycle:model-check)"
+		],
+		"ask": [
+			"Edit(./CLAUDE.md)",
+			"Write(./CLAUDE.md)",
+			"Edit(./AGENTS.md)",
+			"Write(./AGENTS.md)",
+			"Edit(./.claude/**)",
+			"Write(./.claude/**)",
+			"Edit(./.roomodes)",
+			"Write(./.roomodes)",
+			"Edit(./.roo/**)",
+			"Write(./.roo/**)"
+		],
+		"deny": [
+			"Read(./.env)",
+			"Read(./.env.*)",
+			"Read(./**/.env)",
+			"Read(./**/.env.*)",
+			"Read(./**/*.pem)",
+			"Read(./**/*.key)",
+			"Read(./.mcp.json)",
+			"Read(./.claude/settings.local.json)"
+		]
+	}
+}

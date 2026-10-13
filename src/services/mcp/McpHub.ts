@@ -36,6 +36,7 @@ import { GlobalFileNames } from "../../shared/globalFileNames"
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
 
 import { fileExistsAtPath } from "../../utils/fs"
+import { getErrorCode } from "../../utils/errors"
 import { TOKEN_EXPIRY_BUFFER_MS, OAUTH_FLOW_TIMEOUT_MS } from "./constants"
 import { SecretStorageService } from "./SecretStorageService"
 import { McpOAuthClientProvider } from "./McpOAuthClientProvider"
@@ -359,7 +360,7 @@ export class McpHub {
 			await this.updateServerConnections(result.data.mcpServers || {}, source)
 		} catch (error) {
 			// Check if the error is because the file doesn't exist
-			if (error.code === "ENOENT" && source === "project") {
+			if (getErrorCode(error) === "ENOENT" && source === "project") {
 				// File was deleted, clean up project MCP servers
 				await this.cleanupProjectMcpServers()
 				await this.notifyWebviewOfServerChanges()

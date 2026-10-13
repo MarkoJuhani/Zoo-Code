@@ -2,6 +2,12 @@ import type { HistoryItem } from "../packages/types/src/history"
 
 import {
 	abandonDelegatedChild,
+	advanceOrdinaryPersistenceRevision,
+	matchesOrdinaryPersistenceAuthority,
+	matchesOrdinaryHistorySnapshot,
+	ordinaryPersistenceIdentity,
+	type OrdinaryAuthorityHistoryItem,
+	type OrdinaryPersistenceIdentity,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
@@ -720,4 +726,612 @@ if (missingLandmarks.length) {
 
 console.log(
 	`Shared-store model check passed: ${totalStates} states, ${scenarios.length} scenarios, ${commonInvariantNames.length} invariants, ${expectedPhases.length}/${expectedPhases.length} phases reachable, ${Object.keys(semanticLandmarks).length}/${Object.keys(semanticLandmarks).length} landmarks reached`,
+)
+
+// ORDINARY-PERSISTENCE-1021-20261007: independent current-protocol refinement.
+// The historical explorer above intentionally retains both old-protocol witnesses.
+type OrdinarySaveId = "save" | "peer"
+type OrdinaryOwner = OrdinarySaveId | "abandon"
+type OrdinaryRecords = Partial<Record<TaskId, OrdinaryAuthorityHistoryItem>>
+interface OrdinarySaveState {
+	phase: "idle" | "read" | "acquired" | "checked" | "prepared" | "revalidated" | "done" | "rejected" | "failed"
+	snapshot?: OrdinaryAuthorityHistoryItem
+	authority?: OrdinaryPersistenceIdentity
+	incoming?: OrdinaryAuthorityHistoryItem
+	delta?: Partial<OrdinaryAuthorityHistoryItem>
+	candidate?: OrdinaryAuthorityHistoryItem
+	generation?: number
+	refreshedBeforeAcquire?: boolean
+	refused: boolean
+	lateAttempt: boolean
+	postRefreshAttempt?: boolean
+	reason?: "fence" | "authority" | "snapshot" | "delta" | "contention"
+	/** Attempt number of the current try (unset = 1). A contention refusal ends one attempt. */
+	attempt?: number
+	/** The attempt refused by one bounded fence-wait timeout: unpublished and not sticky. */
+	contendedAttempt?: number
+}
+interface OrdinaryProtocolState {
+	disk: OrdinaryRecords
+	caches: Record<Host, OrdinaryRecords>
+	saves: Record<OrdinarySaveId, OrdinarySaveState>
+	exclusions: Partial<Record<TaskId, OrdinaryOwner>>
+	generations: Partial<Record<TaskId, number>>
+	mutexes: Partial<Record<Host, OrdinaryOwner>>
+	fileLocks: Partial<Record<TaskId, OrdinaryOwner>>
+	abandon: {
+		phase: "idle" | "acquired" | "read" | "prepared" | "revalidated" | "done" | "failed"
+		index: number
+		snapshot?: OrdinaryRecords
+		writes?: OrdinaryAuthorityHistoryItem[]
+		candidate?: OrdinaryAuthorityHistoryItem
+	}
+	commits: Array<{
+		owner: OrdinaryOwner
+		taskId: TaskId
+		previous: OrdinaryAuthorityHistoryItem
+		next: OrdinaryAuthorityHistoryItem
+		delta: Partial<OrdinaryAuthorityHistoryItem>
+		authority?: OrdinaryPersistenceIdentity
+		incoming: OrdinaryAuthorityHistoryItem
+		parentExcludedBy?: OrdinaryOwner
+		attempt?: number
+	}>
+}
+interface OrdinaryScenario {
+	name: string
+	kind: "child-instance" | "parent-instance" | "explicit-snapshot" | "fresh-instance"
+	revision: "legacy" | "versioned"
+}
+const ordinaryInvariantNames = [
+	"immutable captured authority",
+	"current authority and explicit snapshot at publication",
+	"monotonic detached lineage",
+	"both abandonment revisions advance in file order",
+	"sticky typed refusal and non-sticky contention without publication",
+	"exclusion before mutex/file ownership",
+	"delta preservation and failure prefix",
+] as const
+const ordinaryPhases = [
+	"read",
+	"acquire",
+	"check",
+	"prepare",
+	"revalidate",
+	"commit",
+	"refresh",
+	"reject",
+	"fail",
+	"sticky-reject",
+	"post-refresh-reject",
+]
+const ordinaryLandmarkNames = [
+	"old-snapshot-survives-cache-refresh",
+	"old-child-refused-after-fresh-lease",
+	"old-parent-refused-by-revision-alone",
+	"explicit-snapshot-refused-at-publication",
+	"sticky-refusal-blocks-late-attempt",
+	"child-prefix-survives-parent-failure",
+	"fresh-rehydrated-child-progress",
+	"unrelated-progress-while-parent-excluded",
+	"matching-old-instance-progress-before-abandonment",
+	"save-failure-preserves-metadata",
+	"contention-refusal-then-later-save-succeeds",
+] as const
+
+function ordinaryTarget(scenario: OrdinaryScenario, save: OrdinarySaveId): TaskId {
+	return save === "peer" ? "child-b" : scenario.kind === "parent-instance" ? "parent" : "child-a"
+}
+function ordinaryHost(save: OrdinarySaveId): Host {
+	return save === "save" ? "A" : "B"
+}
+function ordinaryScope(state: OrdinaryProtocolState, save: OrdinarySaveId): TaskId[] {
+	const identity = state.saves[save].authority!
+	const current = state.disk[identity.id as TaskId]!
+	return [
+		...new Set(
+			[identity.id, identity.parentTaskId, identity.rootTaskId, current.parentTaskId, current.rootTaskId].filter(
+				(id): id is TaskId => !!id,
+			),
+		),
+	].sort()
+}
+function releaseOrdinaryOwner(state: OrdinaryProtocolState, owner: OrdinaryOwner): void {
+	for (const key of Object.keys(state.exclusions) as TaskId[])
+		if (state.exclusions[key] === owner) delete state.exclusions[key]
+	for (const key of Object.keys(state.fileLocks) as TaskId[])
+		if (state.fileLocks[key] === owner) delete state.fileLocks[key]
+	for (const host of hosts) if (state.mutexes[host] === owner) delete state.mutexes[host]
+}
+function ordinaryNext(
+	state: OrdinaryProtocolState,
+	scenario: OrdinaryScenario,
+): Array<{ action: string; state: OrdinaryProtocolState }> {
+	const steps: Array<{ action: string; state: OrdinaryProtocolState }> = []
+	const step = (action: string, mutate: (next: OrdinaryProtocolState) => void) => {
+		const next = clone(state)
+		mutate(next)
+		steps.push({ action, state: next })
+	}
+	for (const save of ["save", "peer"] as const) {
+		const operation = state.saves[save],
+			taskId = ordinaryTarget(scenario, save),
+			host = ordinaryHost(save)
+		const instanceBoundary = save === "peer" || scenario.kind !== "explicit-snapshot"
+		if (
+			operation.phase === "idle" &&
+			(save !== "save" ||
+				scenario.kind !== "fresh-instance" ||
+				(state.abandon.index > 0 && ["done", "failed"].includes(state.abandon.phase)))
+		) {
+			step(`${save}.read`, (next) => {
+				const record =
+					save === "save" && scenario.kind === "fresh-instance"
+						? next.disk[taskId]!
+						: next.caches[host][taskId]!
+				next.saves[save] = {
+					...next.saves[save],
+					phase: "read",
+					snapshot: clone(record),
+					authority: ordinaryPersistenceIdentity(record),
+				}
+			})
+		} else if (operation.phase === "read") {
+			const scope = ordinaryScope(state, save)
+			if (scope.every((id) => !state.exclusions[id]))
+				step(`${save}.acquire`, (next) => {
+					for (const id of scope) {
+						next.exclusions[id] = save
+						next.generations[id] = (next.generations[id] ?? 0) + 1
+					}
+					next.saves[save].refreshedBeforeAcquire = deepEqual(next.caches[host][taskId], next.disk[taskId])
+					next.saves[save].generation = next.generations[taskId]
+					next.saves[save].phase = "acquired"
+				})
+			// Contention: the bounded wait expires while another owner holds part of the scope.
+			// The attempt publishes nothing and the instance stays unrefused; the same captured
+			// authority may try again later. One timeout per save bounds the graph; no retry
+			// loop, age theft or longer wait is modeled.
+			if (
+				operation.contendedAttempt === undefined &&
+				scope.some((id) => state.exclusions[id] && state.exclusions[id] !== save)
+			)
+				step(`${save}.reject(contention)`, (next) => {
+					const target = next.saves[save]
+					target.contendedAttempt = target.attempt ?? 1
+					target.attempt = target.contendedAttempt + 1
+					target.reason = "contention"
+				})
+			// Bounded environment refusal stays sticky: a typed filesystem/bootstrap failure, or an
+			// unrecoverable lock (no usable owner for the whole wait, e.g. a legacy holderless owner).
+			step(`${save}.reject(fence)`, (next) => {
+				next.saves[save].phase = "rejected"
+				next.saves[save].reason = "fence"
+				next.saves[save].refused = instanceBoundary
+			})
+		} else if (operation.phase === "acquired") {
+			const allowed =
+				!instanceBoundary || matchesOrdinaryPersistenceAuthority(operation.authority!, state.disk[taskId]!)
+			step(`${save}.${allowed ? "check" : "reject(authority)"}`, (next) => {
+				if (allowed) next.saves[save].phase = "checked"
+				else {
+					next.saves[save].phase = "rejected"
+					next.saves[save].reason = "authority"
+					next.saves[save].refused = true
+					releaseOrdinaryOwner(next, save)
+				}
+			})
+		} else if (operation.phase === "checked" && !state.mutexes[host]) {
+			step(`${save}.prepare`, (next) => {
+				const target = next.saves[save],
+					cached = next.caches[host][taskId]!
+				next.mutexes[host] = save
+				target.incoming = {
+					...target.snapshot!,
+					status: cached.status,
+					tokensOut: target.snapshot!.tokensOut + 1,
+					ordinaryPersistenceRevision: target.authority!.revision,
+				}
+				target.delta = { id: taskId, ...computeHistoryDelta(cached, target.incoming) }
+				target.phase = "prepared"
+			})
+		} else if (operation.phase === "prepared" && !state.fileLocks[taskId]) {
+			const allowed = matchesOrdinaryHistorySnapshot(operation.incoming!, state.disk[taskId]!)
+			step(`${save}.${allowed ? "revalidate" : "reject(snapshot)"}`, (next) => {
+				const target = next.saves[save]
+				if (!allowed) {
+					target.phase = "rejected"
+					target.reason = "snapshot"
+					target.refused = instanceBoundary
+					releaseOrdinaryOwner(next, save)
+					return
+				}
+				try {
+					target.candidate = mergeHistoryDelta(next.disk[taskId], target.incoming!, target.delta!)
+					next.fileLocks[taskId] = save
+					target.phase = "revalidated"
+				} catch (error) {
+					if (!(error instanceof DeltaRejectedError)) throw error
+					target.phase = "rejected"
+					target.reason = "delta"
+					releaseOrdinaryOwner(next, save)
+				}
+			})
+		} else if (operation.phase === "revalidated") {
+			step(`${save}.commit`, (next) => {
+				const target = next.saves[save]
+				next.commits.push({
+					owner: save,
+					taskId,
+					previous: next.disk[taskId]!,
+					next: target.candidate!,
+					delta: target.delta!,
+					authority: target.authority,
+					incoming: target.incoming!,
+					parentExcludedBy: next.exclusions.parent,
+					attempt: target.attempt ?? 1,
+				})
+				next.disk[taskId] = target.candidate!
+				next.caches[host][taskId] = target.candidate!
+				target.candidate = undefined
+				target.phase = "done"
+				releaseOrdinaryOwner(next, save)
+			})
+			step(`${save}.fail`, (next) => {
+				next.saves[save].candidate = undefined
+				next.saves[save].phase = "failed"
+				releaseOrdinaryOwner(next, save)
+			})
+		}
+		if (operation.refused && !operation.lateAttempt)
+			step(`${save}.sticky-reject`, (next) => {
+				next.saves[save].lateAttempt = true
+			})
+		if (
+			operation.refused &&
+			!operation.postRefreshAttempt &&
+			["done", "failed"].includes(state.abandon.phase) &&
+			!matchesOrdinaryPersistenceAuthority(operation.authority!, state.disk[taskId]!) &&
+			deepEqual(state.caches[host][taskId], state.disk[taskId])
+		) {
+			step(`${save}.post-refresh-reject`, (next) => {
+				next.saves[save].postRefreshAttempt = true
+			})
+		}
+	}
+	const abandon = state.abandon
+	if (abandon.phase === "idle" && !state.exclusions.parent && !state.exclusions["child-a"])
+		step("abandon.acquire", (next) => {
+			for (const id of ["parent", "child-a"] as const) {
+				next.exclusions[id] = "abandon"
+				next.generations[id] = (next.generations[id] ?? 0) + 1
+			}
+			next.abandon.phase = "acquired"
+		})
+	else if (abandon.phase === "acquired" && !state.mutexes.B)
+		step("abandon.read", (next) => {
+			next.mutexes.B = "abandon"
+			next.abandon.snapshot = clone(next.disk)
+			next.abandon.phase = "read"
+		})
+	else if (abandon.phase === "read")
+		step("abandon.prepare", (next) => {
+			const result = abandonDelegatedChild(next.abandon.snapshot!.parent!, next.abandon.snapshot!["child-a"]!)
+			// UUID equality abstraction: one distinct token for each actual file publication, not a transaction revision.
+			next.abandon.writes = [
+				advanceOrdinaryPersistenceRevision(result.child, "child-next"),
+				advanceOrdinaryPersistenceRevision(result.parent, "parent-next"),
+			]
+			next.abandon.phase = "prepared"
+		})
+	else if (abandon.phase === "prepared") {
+		const id = abandon.writes![abandon.index]!.id as TaskId
+		if (!state.fileLocks[id])
+			step(`abandon.revalidate(${id})`, (next) => {
+				const incoming = next.abandon.writes![next.abandon.index]!
+				const delta = { id, ...computeHistoryDelta(next.abandon.snapshot![id]!, incoming) }
+				next.abandon.candidate = mergeHistoryDelta(next.disk[id], incoming, delta)
+				next.fileLocks[id] = "abandon"
+				next.abandon.phase = "revalidated"
+			})
+	} else if (abandon.phase === "revalidated") {
+		const id = abandon.writes![abandon.index]!.id as TaskId
+		step(`abandon.commit(${id})`, (next) => {
+			const target = next.abandon,
+				incoming = target.writes![target.index]!
+			next.commits.push({
+				owner: "abandon",
+				taskId: id,
+				previous: next.disk[id]!,
+				next: target.candidate!,
+				incoming,
+				delta: { id, ...computeHistoryDelta(target.snapshot![id]!, incoming) },
+			})
+			next.disk[id] = target.candidate!
+			delete next.fileLocks[id]
+			target.candidate = undefined
+			target.index++
+			target.phase = target.index === 2 ? "done" : "prepared"
+			if (target.phase === "done") {
+				for (const commit of next.commits.filter((entry) => entry.owner === "abandon"))
+					next.caches.B[commit.taskId] = commit.next
+				releaseOrdinaryOwner(next, "abandon")
+			}
+		})
+		if (abandon.index === 1)
+			step(`abandon.fail(${id})`, (next) => {
+				for (const commit of next.commits.filter((entry) => entry.owner === "abandon"))
+					next.caches.B[commit.taskId] = commit.next
+				next.abandon.candidate = undefined
+				next.abandon.phase = "failed"
+				releaseOrdinaryOwner(next, "abandon")
+			})
+	}
+	for (const host of hosts)
+		if (!state.mutexes[host] && canonical(state.caches[host]) !== canonical(state.disk))
+			step(`${host}.refresh`, (next) => {
+				next.caches[host] = clone(next.disk)
+			})
+	return steps
+}
+
+function ordinaryViolations(state: OrdinaryProtocolState, scenario: OrdinaryScenario): string[] {
+	const errors: string[] = []
+	for (const save of ["save", "peer"] as const) {
+		const operation = state.saves[save],
+			id = ordinaryTarget(scenario, save)
+		if (operation.authority && !deepEqual(operation.authority, ordinaryPersistenceIdentity(operation.snapshot!)))
+			errors.push("captured authority changed")
+		if (
+			operation.refused &&
+			(operation.phase !== "rejected" || state.commits.some((commit) => commit.owner === save))
+		)
+			errors.push("refused instance published metadata")
+		// Evaluated on outcomes in every phase: a sticky refusal must carry a non-contention reason,
+		// and no commit may belong to the attempt that contention refused.
+		if (operation.refused && operation.reason === "contention") errors.push("contention refusal became sticky")
+		if (
+			operation.contendedAttempt !== undefined &&
+			state.commits.some(
+				(commit) => commit.owner === save && (commit.attempt ?? 1) === operation.contendedAttempt,
+			)
+		)
+			errors.push("contended attempt published metadata")
+		if (["acquired", "checked", "prepared", "revalidated"].includes(operation.phase)) {
+			if (ordinaryScope(state, save).some((key) => state.exclusions[key] !== save))
+				errors.push("save lost ancestry exclusion")
+		}
+		if (operation.phase === "revalidated" && state.fileLocks[id] !== save) errors.push("save lost file lock")
+	}
+	for (const [host, owner] of Object.entries(state.mutexes) as Array<[Host, OrdinaryOwner]>) {
+		if (
+			owner === "abandon"
+				? !["read", "prepared", "revalidated"].includes(state.abandon.phase)
+				: !["prepared", "revalidated"].includes(state.saves[owner].phase) || ordinaryHost(owner) !== host
+		)
+			errors.push("mutex outside write phase")
+	}
+	for (const [id, owner] of Object.entries(state.fileLocks) as Array<[TaskId, OrdinaryOwner]>) {
+		if (state.exclusions[id] !== owner || state.mutexes[owner === "abandon" ? "B" : ordinaryHost(owner)] !== owner)
+			errors.push("file lock without exclusion and mutex")
+	}
+	if (
+		["acquired", "read", "prepared", "revalidated"].includes(state.abandon.phase) &&
+		(state.exclusions.parent !== "abandon" || state.exclusions["child-a"] !== "abandon")
+	)
+		errors.push("abandonment lost pair exclusion")
+	const abandonmentCommits = state.commits.filter((commit) => commit.owner === "abandon")
+	if (
+		abandonmentCommits.some(
+			(commit, index) =>
+				commit.taskId !== (["child-a", "parent"] as const)[index] ||
+				commit.next.ordinaryPersistenceRevision === commit.previous.ordinaryPersistenceRevision ||
+				commit.next.ordinaryPersistenceRevision !== (index === 0 ? "child-next" : "parent-next"),
+		)
+	)
+		errors.push("abandonment revision/file order changed")
+	for (const commit of state.commits) {
+		if (
+			commit.owner !== "abandon" &&
+			(!matchesOrdinaryPersistenceAuthority(commit.authority!, commit.previous) ||
+				!matchesOrdinaryHistorySnapshot(commit.incoming, commit.previous))
+		)
+			errors.push("old snapshot published after authority changed")
+		if (
+			commit.taskId === "child-a" &&
+			!commit.previous.parentTaskId &&
+			(commit.next.parentTaskId || commit.next.rootTaskId)
+		)
+			errors.push("abandoned lineage restored")
+		for (const [key, value] of Object.entries(commit.previous))
+			if (!(key in commit.delta) && !deepEqual(value, commit.next[key as keyof OrdinaryAuthorityHistoryItem]))
+				errors.push(`disk field lost: ${key}`)
+	}
+	if (
+		state.abandon.phase === "failed" &&
+		(abandonmentCommits.length !== 1 ||
+			state.disk["child-a"]!.parentTaskId ||
+			state.disk.parent!.awaitingChildId !== "child-a" ||
+			state.caches.B["child-a"]!.ordinaryPersistenceRevision !== "child-next")
+	)
+		errors.push("failed pair lost committed child prefix")
+	return errors
+}
+
+function ordinaryLandmarks(state: OrdinaryProtocolState, scenario: OrdinaryScenario): string[] {
+	const reached: string[] = [],
+		save = state.saves.save,
+		id = ordinaryTarget(scenario, "save")
+	const stale = !!save.authority && !matchesOrdinaryPersistenceAuthority(save.authority, state.disk[id]!)
+	if (stale && save.phase === "read" && deepEqual(state.caches.A[id], state.disk[id]))
+		reached.push("old-snapshot-survives-cache-refresh")
+	if (save.reason === "authority" && id === "child-a" && save.refreshedBeforeAcquire && (save.generation ?? 0) > 1)
+		reached.push("old-child-refused-after-fresh-lease")
+	if (
+		save.reason === "authority" &&
+		id === "parent" &&
+		save.refreshedBeforeAcquire &&
+		save.authority!.parentTaskId === state.disk.parent!.parentTaskId &&
+		save.authority!.rootTaskId === state.disk.parent!.rootTaskId
+	)
+		reached.push("old-parent-refused-by-revision-alone")
+	if (save.reason === "snapshot" && scenario.kind === "explicit-snapshot")
+		reached.push("explicit-snapshot-refused-at-publication")
+	if (save.refused && save.postRefreshAttempt && stale) reached.push("sticky-refusal-blocks-late-attempt")
+	if (state.abandon.phase === "failed") reached.push("child-prefix-survives-parent-failure")
+	if (scenario.kind === "fresh-instance" && save.phase === "done") reached.push("fresh-rehydrated-child-progress")
+	if (state.commits.some((commit) => commit.owner === "peer" && commit.parentExcludedBy === "abandon"))
+		reached.push("unrelated-progress-while-parent-excluded")
+	if (scenario.kind !== "fresh-instance" && save.phase === "done" && state.abandon.phase === "done")
+		reached.push("matching-old-instance-progress-before-abandonment")
+	if (save.phase === "failed" && !state.commits.some((commit) => commit.owner === "save"))
+		reached.push("save-failure-preserves-metadata")
+	if (
+		save.contendedAttempt !== undefined &&
+		save.phase === "done" &&
+		!save.refused &&
+		state.commits.filter((commit) => commit.owner === "save").length === 1
+	)
+		reached.push("contention-refusal-then-later-save-succeeds")
+	return reached
+}
+
+function formatOrdinaryTrace(
+	scenario: OrdinaryScenario,
+	message: string,
+	actions: string[],
+	start: OrdinaryProtocolState,
+): string {
+	let state = start
+	const details = actions.map((action, index) => {
+		if (index > 0) {
+			const next = ordinaryNext(state, scenario).find((step) => step.action === action)
+			if (!next) throw new Error(`Current ordinary trace cannot replay ${action}`)
+			state = next.state
+		}
+		return `${index}. ${action}\n${JSON.stringify(state, null, 2)}`
+	})
+	return [
+		`Current ordinary model ${scenario.name}: ${message}`,
+		`Bounds: depth=${MAX_DEPTH}, states=${MAX_STATES}`,
+		...details,
+	].join("\n")
+}
+
+function runOrdinaryScenario(scenario: OrdinaryScenario) {
+	const disk: OrdinaryRecords = {
+		...baseRecords(),
+		"child-b": item("child-b"),
+		"child-a": item("child-a", { status: "interrupted", parentTaskId: "parent", rootTaskId: "parent" }),
+	}
+	if (scenario.revision === "versioned")
+		for (const id of Object.keys(disk) as TaskId[])
+			disk[id] = advanceOrdinaryPersistenceRevision(disk[id]!, `${id}-initial`)
+	const start: OrdinaryProtocolState = {
+		disk,
+		caches: { A: clone(disk), B: clone(disk) },
+		saves: {
+			save: { phase: "idle", refused: false, lateAttempt: false },
+			peer: { phase: "idle", refused: false, lateAttempt: false },
+		},
+		exclusions: {},
+		generations: {},
+		mutexes: {},
+		fileLocks: {},
+		abandon: { phase: "idle", index: 0 },
+		commits: [],
+	}
+	const queue = [{ state: start, trace: ["initial"] }],
+		visited = new Set([canonical(start)])
+	const phases = new Set<string>(),
+		landmarks = new Map<string, string[]>(),
+		actions = new Set<string>(),
+		frontier: OrdinaryProtocolState[] = []
+	for (let index = 0; index < queue.length; index++) {
+		const node = queue[index]!,
+			violations = ordinaryViolations(node.state, scenario)
+		if (violations.length) throw new Error(formatOrdinaryTrace(scenario, violations.join("; "), node.trace, start))
+		for (const landmark of ordinaryLandmarks(node.state, scenario))
+			if (!landmarks.has(landmark)) landmarks.set(landmark, node.trace.slice(1))
+		if (node.trace.length - 1 === MAX_DEPTH) {
+			frontier.push(node.state)
+			continue
+		}
+		for (const step of ordinaryNext(node.state, scenario)) {
+			actions.add(step.action)
+			phases.add(step.action.endsWith(".refresh") ? "refresh" : step.action.split(".")[1]!.split("(")[0]!)
+			const key = canonical(step.state)
+			if (visited.has(key)) continue
+			visited.add(key)
+			queue.push({ state: step.state, trace: [...node.trace, step.action] })
+			if (visited.size > MAX_STATES)
+				throw new Error(`Current ordinary scenario ${scenario.name} exceeded ${MAX_STATES} states`)
+		}
+	}
+	if (frontier.some((state) => ordinaryNext(state, scenario).some((step) => !visited.has(canonical(step.state)))))
+		throw new Error(`Current ordinary scenario ${scenario.name} truncated at depth ${MAX_DEPTH}`)
+	const required = [
+		"save.read",
+		"save.acquire",
+		"save.reject(fence)",
+		"save.check",
+		"save.prepare",
+		"save.revalidate",
+		"save.commit",
+		"save.fail",
+		"peer.read",
+		"peer.acquire",
+		"peer.reject(fence)",
+		"peer.check",
+		"peer.prepare",
+		"peer.revalidate",
+		"peer.commit",
+		"peer.fail",
+		"peer.sticky-reject",
+		"abandon.acquire",
+		"abandon.read",
+		"abandon.prepare",
+		"abandon.revalidate(child-a)",
+		"abandon.commit(child-a)",
+		"abandon.revalidate(parent)",
+		"abandon.commit(parent)",
+		"abandon.fail(parent)",
+		"A.refresh",
+		"B.refresh",
+	]
+	if (scenario.kind !== "explicit-snapshot") required.push("save.sticky-reject")
+	// A fresh instance reads only after abandonment releases its scope, so it never contends.
+	if (scenario.kind !== "fresh-instance") required.push("save.reject(contention)")
+	if (scenario.kind === "explicit-snapshot") required.push("save.reject(snapshot)")
+	if (scenario.kind === "child-instance" || scenario.kind === "parent-instance")
+		required.push("save.reject(authority)", "save.post-refresh-reject")
+	const missing = required.filter((action) => !actions.has(action))
+	if (missing.length) throw new Error(`${scenario.name} has unreachable actions: ${missing.join(", ")}`)
+	return { states: visited.size, phases, landmarks, actions: actions.size }
+}
+
+let ordinaryStates = 0
+const ordinaryReachedPhases = new Set<string>(),
+	ordinaryReachedLandmarks = new Map<string, string[]>()
+let ordinaryScenarioCount = 0
+for (const revision of ["legacy", "versioned"] as const)
+	for (const kind of ["child-instance", "parent-instance", "explicit-snapshot", "fresh-instance"] as const) {
+		const scenario = { name: `${kind}/${revision}`, kind, revision },
+			result = runOrdinaryScenario(scenario)
+		ordinaryScenarioCount++
+		ordinaryStates += result.states
+		for (const phase of result.phases) ordinaryReachedPhases.add(phase)
+		for (const [landmark, trace] of result.landmarks)
+			if (!ordinaryReachedLandmarks.has(landmark)) ordinaryReachedLandmarks.set(landmark, trace)
+		console.log(`Current ordinary scenario ${scenario.name}: ${result.states} states, ${result.actions} actions`)
+	}
+const ordinaryMissing = [
+	...ordinaryPhases.filter((phase) => !ordinaryReachedPhases.has(phase)),
+	...ordinaryLandmarkNames.filter((landmark) => !ordinaryReachedLandmarks.has(landmark)),
+]
+if (ordinaryMissing.length) throw new Error(`Current ordinary coverage missing: ${ordinaryMissing.join(", ")}`)
+for (const [name, trace] of ordinaryReachedLandmarks)
+	console.log(`Current ordinary landmark ${name}: ${trace.join(" -> ")}`)
+console.log(
+	`Current ordinary authority model check passed: ${ordinaryStates} states, ${ordinaryScenarioCount} scenarios, ${ordinaryInvariantNames.length} invariants, ${ordinaryPhases.length}/${ordinaryPhases.length} phases, ${ordinaryLandmarkNames.length}/${ordinaryLandmarkNames.length} landmarks; bounds depth=${MAX_DEPTH}, states=${MAX_STATES} per scenario`,
 )

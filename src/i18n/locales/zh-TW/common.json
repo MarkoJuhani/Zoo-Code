@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "您確定要刪除此 {scope} 模式嗎？\n\n這也將刪除位於以下位置的關聯規則資料夾：\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "任務歷史已載入，但已略過啟動修復：啟動鎖正在使用中。如果沒有其他 Zoo Code 視窗開啟，則它是當機的程序遺留的；請將此資料夾移到別處後重新載入：{{lockPath}}",
+		"task_history_startup_generation_invalid": "任務歷史已載入，但已略過啟動修復：啟動鎖的世代檔案無效。請關閉其他 Zoo Code 視窗，將此檔案和資料夾 {{lockPath}} 移到別處後重新載入：{{generationPath}}",
+		"task_history_startup_fence_unusable": "任務歷史已載入，但已略過啟動修復：無法使用鎖資料夾（{{code}}）。請確認它是可寫入的資料夾，然後重新載入：{{fencePath}}",
 		"invalid_data_uri": "資料 URI 格式無效",
 		"error_copying_image": "複製圖片時發生錯誤：{{errorMessage}}",
 		"error_saving_image": "儲存圖片時發生錯誤：{{errorMessage}}",

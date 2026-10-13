@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "您确定要删除此 {scope} 模式吗？\n\n这也将删除位于以下位置的关联规则文件夹：\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "任务历史已加载，但已跳过启动修复：启动锁正在使用中。如果没有其他 Zoo Code 窗口打开，则它是崩溃的进程遗留的；请将此文件夹移到别处后重新加载：{{lockPath}}",
+		"task_history_startup_generation_invalid": "任务历史已加载，但已跳过启动修复：启动锁的代数文件无效。请关闭其他 Zoo Code 窗口，将此文件和文件夹 {{lockPath}} 移到别处后重新加载：{{generationPath}}",
+		"task_history_startup_fence_unusable": "任务历史已加载，但已跳过启动修复：无法使用锁文件夹（{{code}}）。请确认它是可写的文件夹，然后重新加载：{{fencePath}}",
 		"invalid_mcp_config": "项目MCP配置格式无效",
 		"invalid_mcp_settings_format": "MCP设置JSON格式无效。请确保您的设置遵循正确的JSON格式。",
 		"invalid_mcp_settings_syntax": "MCP设置JSON格式无效。请检查您的设置文件是否有语法错误。",

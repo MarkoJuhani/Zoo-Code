@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Bu {scope} modunu silmek istediğinizden emin misiniz?\n\nBu işlem, ilişkili kurallar klasörünü de şu konumdan silecektir:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "Görev geçmişi yüklendi ancak başlangıç onarımları atlandı: başlangıç kilidi kullanımda. Başka Zoo Code penceresi açık değilse, kilit çöken bir işlemden kalmıştır; bu klasörü başka bir yere taşıyıp yeniden yükle: {{lockPath}}",
+		"task_history_startup_generation_invalid": "Görev geçmişi yüklendi ancak başlangıç onarımları atlandı: başlangıç kilidinin nesil dosyası geçersiz. Diğer Zoo Code pencerelerini kapat, bu dosyayı ve {{lockPath}} klasörünü başka bir yere taşı ve yeniden yükle: {{generationPath}}",
+		"task_history_startup_fence_unusable": "Görev geçmişi yüklendi ancak başlangıç onarımları atlandı: kilit klasörü kullanılamıyor ({{code}}). Yazılabilir bir klasör olduğunu kontrol et ve yeniden yükle: {{fencePath}}",
 		"invalid_data_uri": "Geçersiz veri URI formatı",
 		"error_copying_image": "Resim kopyalanırken hata oluştu: {{errorMessage}}",
 		"error_saving_image": "Resim kaydedilirken hata oluştu: {{errorMessage}}",

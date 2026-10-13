@@ -11,6 +11,7 @@ import type { ClineMessage, HistoryItem } from "@roo-code/types"
 
 import type { ApiMessage } from "../core/task-persistence"
 import type { Task } from "../core/task/Task"
+import type { TaskScheduleObserver } from "../core/task/TaskScheduler"
 
 /* vscode mock for Task/Provider imports */
 vi.mock("vscode", () => {
@@ -139,8 +140,13 @@ function makeStatefulTaskHistoryStore(...items: HistoryItem[]) {
 }
 
 describe("History resume delegation - parent metadata transitions", () => {
-	beforeEach(() => {
+	let storage: string
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		storage = await fs.mkdtemp(path.join(os.tmpdir(), "history-resume-delegation-"))
+	})
+	afterEach(async () => {
+		await fs.rm(storage, { recursive: true, force: true })
 	})
 
 	it("rejects a stale restored completion action before changing parent or child state", async () => {
@@ -382,7 +388,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "c1", status: "active" }, parentItem)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => ({ taskId: "c1" })),
@@ -421,7 +427,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 					}),
 				]),
 				taskId: "p1",
-				globalStoragePath: "/storage",
+				globalStoragePath: storage,
 				merge: true,
 			}),
 		)
@@ -442,7 +448,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 					}),
 				]),
 				taskId: "p1",
-				globalStoragePath: "/storage",
+				globalStoragePath: storage,
 				merge: true,
 			}),
 		)
@@ -471,7 +477,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		const overwriteApiConversationHistory = vi.fn()
 		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "child-merge", status: "active" }, parentItem)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => ({ taskId: "child-merge" })),
@@ -542,7 +548,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		const log = vi.fn()
 		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "child-read-failure", status: "active" }, parentItem)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			getCurrentTask: vi.fn(() => ({ taskId: "child-read-failure" })),
 			taskHistoryStore,
@@ -582,7 +588,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			parentItem,
 		)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			getCurrentTask: vi.fn(() => ({ taskId: "child-api-read-failure" })),
 			taskHistoryStore,
@@ -618,7 +624,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "c-tool", status: "active" }, parentItem)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => ({ taskId: "c-tool" })),
@@ -675,7 +681,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 					}),
 				]),
 				taskId: "p-tool",
-				globalStoragePath: "/storage",
+				globalStoragePath: storage,
 			}),
 		)
 
@@ -710,7 +716,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		}
 		const taskHistoryStore = makeTaskHistoryStoreStub({ id: "c-no-tool", status: "active" }, parentItem)
 		const provider = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/storage" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit: vi.fn(),
 			getCurrentTask: vi.fn(() => ({ taskId: "c-no-tool" })),
@@ -977,7 +983,9 @@ describe("History resume delegation - parent metadata transitions", () => {
 		).resolves.toMatchObject({ kind: "committed" })
 		await expect(scheduled).rejects.toThrow(resumeError)
 
-		expect(log).toHaveBeenCalledWith(expect.stringContaining("stage=failed reason=Error"))
+		expect(log).toHaveBeenCalledWith(expect.stringContaining('"phase":"parent_continuation","stage":"failed"'))
+		expect(log).toHaveBeenCalledWith(expect.stringContaining('"failure":{"type":"effect_failed"}'))
+		expect(JSON.stringify(log.mock.calls)).not.toContain(resumeError.message)
 		expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
 			expect.stringContaining("Open the task from history to retry"),
 		)
@@ -1014,15 +1022,21 @@ describe("History resume delegation - parent metadata transitions", () => {
 			parentItem,
 		)
 		const emit = vi.fn()
+		const log = vi.fn()
 		const provider = makeProviderStub({
 			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
 			getTaskWithId: vi.fn().mockResolvedValue({ historyItem: parentItem }),
 			emit,
+			log,
 			getCurrentTask: vi.fn(() => parentInstance),
 			removeClineFromStack: vi.fn().mockResolvedValue(undefined),
 			createTaskWithHistoryItem: vi.fn().mockResolvedValue(parentInstance),
 			taskScheduler: {
-				schedule: vi.fn().mockRejectedValue(scheduleError),
+				schedule: vi.fn((_task: Task, _run: () => Promise<void>, observe?: TaskScheduleObserver) => {
+					// Match the real scheduler observer contract before rejecting admission.
+					observe?.("failed", scheduleError)
+					return Promise.reject(scheduleError)
+				}),
 			},
 			taskHistoryStore,
 		})
@@ -1055,10 +1069,10 @@ describe("History resume delegation - parent metadata transitions", () => {
 			parentInstance.taskId,
 			"child-scheduler-rejection",
 		)
-		expect(consoleError).toHaveBeenCalledWith(
-			`[reopenParentFromDelegation] taskScheduler.schedule failed:`,
-			scheduleError,
-		)
+		expect(log).toHaveBeenCalledWith(expect.stringContaining('"phase":"parent_continuation","stage":"failed"'))
+		expect(log).toHaveBeenCalledWith(expect.stringContaining('"failure":{"type":"effect_failed"}'))
+		expect(consoleError).not.toHaveBeenCalled()
+		expect(JSON.stringify(log.mock.calls)).not.toContain(scheduleError.message)
 		consoleError.mockRestore()
 	})
 
@@ -1220,7 +1234,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 		let scheduledContinuation: Promise<void> | undefined
 		const emitA = vi.fn()
 		const providerA = makeProviderStub({
-			contextProxy: { globalStorageUri: { fsPath: "/tmp" } },
+			contextProxy: { globalStorageUri: { fsPath: storage } },
 			getTaskWithId: vi.fn(async (id: string) => ({ historyItem: taskHistoryStore.get(id)! })),
 			emit: emitA,
 			getCurrentTask: vi.fn(() => currentTaskA),
@@ -1243,6 +1257,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			getTaskApiConfigName: vi.fn().mockResolvedValue("task-local-profile"),
 			flushPendingToolResultsToHistory: vi.fn().mockResolvedValue(true),
 			retrySaveApiConversationHistory: vi.fn(),
+			dispose: vi.fn().mockResolvedValue(undefined),
 		}
 		const childC2 = {
 			taskId: "child-c2",
@@ -1257,6 +1272,8 @@ describe("History resume delegation - parent metadata transitions", () => {
 				await childRunBlocked
 			}),
 		}
+		const childRunScheduled = vi.fn(() => childC2.run())
+		Object.assign(childC2, { runScheduled: childRunScheduled })
 		let currentTaskB: object | undefined = parentInstanceB
 		let childRun: Promise<void> | undefined
 		const removeParentB = vi.fn(async () => {
@@ -1267,13 +1284,17 @@ describe("History resume delegation - parent metadata transitions", () => {
 			return childC2
 		})
 		const providerB = makeProviderStub({
+			contextProxy: { globalStorageUri: { fsPath: storage } },
+			handleModeSwitch: vi.fn().mockResolvedValue(undefined),
 			taskHistoryStore,
 			getCurrentTask: vi.fn(() => currentTaskB),
 			removeClineFromStack: removeParentB,
 			createTask: createChildC2,
 			updateTaskHistory: vi.fn((item: HistoryItem) => taskHistoryStore.upsert(item)),
 			taskScheduler: {
-				schedule: vi.fn((_task, run) => (childRun = run())),
+				schedule: vi.fn(
+					(scheduled: Task, run?: () => Promise<void>) => (childRun = run ? run() : scheduled.runScheduled()),
+				),
 			},
 			emit: vi.fn(),
 			log: vi.fn(),
@@ -1319,6 +1340,7 @@ describe("History resume delegation - parent metadata transitions", () => {
 			childIds: ["child-c1", "child-c2"],
 		})
 		await vi.waitFor(() => expect(childC2.run).toHaveBeenCalledTimes(1))
+		expect(childRunScheduled).toHaveBeenCalledOnce()
 		expect(parentInstanceA.resumeAfterDelegation).toHaveBeenCalledTimes(1)
 		expect(emitA).toHaveBeenCalledWith(RooCodeEventName.TaskDelegationResumed, parentItem.id, "child-c1")
 

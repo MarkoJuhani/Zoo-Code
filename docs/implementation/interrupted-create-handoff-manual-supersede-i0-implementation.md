@@ -1,0 +1,39 @@
+# I0 implementation report — read-only manual-supersession preflight
+
+**Disposition (2026-10-05): I0 isolated implementation and synthetic tests complete; B1/B2 BLOCKED, no integration or live-repair approval.** This report records the work authorized by the [active plan](../../../../.roo/interrupted-create-handoff-manual-supersede-proposal.md:20), informed by the [Package A audit](interrupted-create-handoff-manual-supersede-a-boundary-audit.md:1) and [B1/B2 design review](interrupted-create-handoff-manual-supersede-b1-b2-design.md:1). It is not a host, process, saved-state, provider-effective-history or writer-exclusion assessment.
+
+## Changed paths and scope
+
+- Added [I0 preflight](../../src/core/task-persistence/manualSupersedePreflight.ts:1): an unwired, side-effect-free disk diagnostic that uses the existing strict [collector and JSON reader](../../src/core/task-persistence/interruptedCreateHandoffDisk.ts:16). Its expected old action is a _comparison target_, not evidence of completeness, host exit or permission to mutate. It returns typed observed facts, BLOCKED reasons and UNKNOWN reasons; it has no write-capability return value.
+- Added [isolated temporary-file tests](../../src/core/task-persistence/__tests__/manualSupersedePreflight.spec.ts:1). This report is the only subsequent documentation addition. The prior untracked recovery documents/source/tests were preserved and unstaged; no tracked or staged files changed.
+- No production recovery hook, UI, ordinary intake, journal/binding issuance, optional fence, API/task write, queue/host operation, live Insiders inspection, child or model launch occurred. The preflight does not run a production provider projection or certify an effective tool-result format.
+
+## Tested predicates and evidence limits
+
+| Synthetic finding                                    | I0 classification / limit                                                                                                                                                                                                                                                                                                   |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Strict persisted parent/root/action and API evidence | Distinguishes missing or corrupt parent/API from a present-but-empty history; checks root lineage, interrupted status and complete saved action (including mode, message, todos and approval text) against the old `new_task` input. Caller-supplied host/completeness claims cannot make a changed action match.           |
+| Raw old call/result boundary                         | Counts matching calls; rejects missing/duplicate/wrong-role or changed input, nonterminal call, unresolved sibling, orphan/duplicate/malformed result, later turn and any result for the old call as a conflict. This is a **raw synthetic history** check, not provider-effective result correlation.                      |
+| Known or possibly masked child owner                 | Blocks awaited/delegated owner, active or unlisted child, transient metadata, registry/intent ambiguity and a completed child lacking a distinct earlier resolved delegation trail. A separately evidenced earlier completed child can remain recorded; **historical child outcome is still UNKNOWN**, never proven absent. |
+| Pending question and read-only operation             | Blocks pending question; compares parent/API bytes and directory entries before and after both unblocked and blocked fixture reads. No disk mutation by I0 is asserted in these isolated fixtures, not as a claim about concurrent production writers.                                                                      |
+
+Even when `blocked` is empty, `unknown` still contains `historical_child_outcome_unknown`, `provider_effective_history_unverified` and `host_writer_exclusion_unverified` (see [result type and function](../../src/core/task-persistence/manualSupersedePreflight.ts:35)). A clean synthetic read is **not** authorization for B1 or B2; a missing transient is not negative child evidence. A conflicting existing result is not treated as an approved supersession result.
+
+## Commands and observed exits
+
+Commands below ran from the Zoo Code repository root unless marked otherwise; the passing check sequence was re-run after the final source/test edits.
+
+1. `pnpm --dir src exec vitest run core/task-persistence/__tests__/manualSupersedePreflight.spec.ts` — exit **0**, 8/8 I0 tests passed (final focused run).
+2. `pnpm --dir src exec vitest run core/task-persistence/__tests__/manualSupersedePreflight.spec.ts core/task-persistence/__tests__/interruptedCreateHandoffDisk.spec.ts core/task-persistence/__tests__/interruptedCreateHandoffP2.spec.ts` — exit **0**, 35/35 tests across three files. Adjacent P2 tests are regressions, **not** B acceptance.
+3. `pnpm --dir src exec tsc --noEmit --pretty false` — exit **0** (final run).
+4. `(cd src && pnpm exec eslint core/task-persistence/manualSupersedePreflight.ts core/task-persistence/__tests__/manualSupersedePreflight.spec.ts --max-warnings=0)` — exit **0** (final run).
+5. `pnpm exec prettier --check src/core/task-persistence/manualSupersedePreflight.ts src/core/task-persistence/__tests__/manualSupersedePreflight.spec.ts` — exit **0**, with a non-fatal warning about the project's unknown `ignore` option. `pnpm exec prettier --write` was used only on those two new files before final checks.
+6. `git status --short --untracked-files=all && git diff --quiet && printf 'TRACKED_DIFF=none\n' && git diff --cached --quiet && printf 'STAGED_DIFF=none\n' && wc -l src/core/task-persistence/manualSupersedePreflight.ts src/core/task-persistence/__tests__/manualSupersedePreflight.spec.ts` — exit **0** before this report: 27 untracked paths (25 pre-existing plus two I0 files); tracked/staged diffs none. No `git add` was run.
+
+Earlier diagnostics were corrected before the passing sequence: `pnpm --dir src exec tsc --noEmit --pretty false` initially exited **2** on a test fixture's widened todo status; root-level `pnpm exec eslint ...` exited **2** because ESLint configuration is in `src`; a later focused test chain exited **1** when a forged extra action field was expected as `action_changed` instead of the stricter `action_corrupt`. These are not final passes for those invocations. Full build, live-state/host/queue checks and B1/B2 conditional-write/restart/lifecycle tests: **[N/A] — outside I0 and not run**.
+
+## Outstanding owner decisions
+
+- **Recovery tech lead:** decide whether accepting UNKNOWN _historical_ child outcome is safe with independently proved predecessor termination, loaded build/root and known-owner exclusion; define ambiguous-owner/old-writer and surviving equivalent queue handling. If capable same-parent write/start exclusion cannot be enforced, release A/I0 only.
+- **Independent provider/persistence owner:** approve or reject provider-effective call/result shape and stable correlation, participating conditional API append, ambiguous post-commit read-back, guarded metadata repair and one-off lifecycle/hydration/startup behavior. Neither this diagnostic nor existing P2 scaffolds prove these boundaries.
+- **Project owner:** record a reviewed B contract after those decisions and hostile tests before integration. B1/B2 writes, deployment, live-state repair and an implementation PASS remain **BLOCKED**; a separate later instruction through ordinary intake is not part of I0.

@@ -14,9 +14,16 @@ vi.mock("fs/promises", async (importOriginal) => ({
 	...(await importOriginal<typeof import("fs/promises")>()),
 	readFile: hoisted.readFileMock,
 }))
-vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: hoisted.safeWriteJsonMock,
-}))
+vi.mock("../../../utils/safeWriteJson", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../utils/safeWriteJson")>()
+	return {
+		...actual,
+		safeWriteJson: async (...args: Parameters<typeof actual.safeWriteJson>) => {
+			await hoisted.safeWriteJsonMock(...args)
+			return actual.safeWriteJson(...args)
+		},
+	}
+})
 
 // Import after mocks
 import { saveTaskMessages, readTaskMessages } from "../taskMessages"
@@ -31,9 +38,10 @@ beforeEach(async () => {
 	tmpBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "roo-test-"))
 })
 
-afterEach(() => {
+afterEach(async () => {
 	vi.useRealTimers()
 	vi.restoreAllMocks()
+	await fs.rm(tmpBaseDir, { recursive: true, force: true })
 })
 
 describe("taskMessages.saveTaskMessages", () => {
@@ -62,7 +70,10 @@ describe("taskMessages.saveTaskMessages", () => {
 		expect(hoisted.safeWriteJsonMock).toHaveBeenCalledTimes(1)
 		const [, persisted] = hoisted.safeWriteJsonMock.mock.calls[0]
 		expect(persisted).toEqual(messages)
-		expect(hoisted.safeWriteJsonMock.mock.calls[0][2]).toBeUndefined()
+		expect(hoisted.safeWriteJsonMock.mock.calls[0][2]?.publicationGuard.check).toBeTypeOf("function")
+		expect(
+			JSON.parse(await fs.readFile(path.join(tmpBaseDir, "tasks", "task-1", "ui_messages.json"), "utf8")),
+		).toEqual(messages)
 	})
 
 	it("persists messages without modification when no metadata", async () => {
@@ -81,10 +92,13 @@ describe("taskMessages.saveTaskMessages", () => {
 		expect(persisted).toEqual(messages)
 	})
 
-	it("passes the history merge callback only when requested", async () => {
+	it("merges disk history only when requested", async () => {
 		const messages: ClineMessage[] = [{ ts: 2, type: "say", say: "text", text: "incoming" }]
-		hoisted.safeWriteJsonMock.mockImplementationOnce(async (_path, data, options) =>
-			options.merge([{ ts: 1, type: "say", say: "text", text: "disk" }], data),
+		const taskDir = path.join(tmpBaseDir, "tasks", "task-merge")
+		await fs.mkdir(taskDir, { recursive: true })
+		await fs.writeFile(
+			path.join(taskDir, "ui_messages.json"),
+			JSON.stringify([{ ts: 1, type: "say", say: "text", text: "disk" }]),
 		)
 		const savedMessages = await saveTaskMessages({
 			messages,

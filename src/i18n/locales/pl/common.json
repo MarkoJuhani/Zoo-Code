@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Czy na pewno chcesz usunąć ten tryb {scope}?\n\nSpowoduje to również usunięcie powiązanego folderu reguł pod adresem:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "Historia zadań została wczytana, ale naprawy przy starcie zostały pominięte: blokada startowa jest w użyciu. Jeśli żadne inne okno Zoo Code nie jest otwarte, pozostawił ją proces, który uległ awarii; przenieś ten folder w inne miejsce i przeładuj: {{lockPath}}",
+		"task_history_startup_generation_invalid": "Historia zadań została wczytana, ale naprawy przy starcie zostały pominięte: plik generacji blokady startowej jest nieprawidłowy. Zamknij inne okna Zoo Code, przenieś ten plik i folder {{lockPath}} w inne miejsce i przeładuj: {{generationPath}}",
+		"task_history_startup_fence_unusable": "Historia zadań została wczytana, ale naprawy przy starcie zostały pominięte: nie można użyć folderu blokad ({{code}}). Sprawdź, czy jest to folder z prawem zapisu, i przeładuj: {{fencePath}}",
 		"invalid_data_uri": "Nieprawidłowy format URI danych",
 		"error_copying_image": "Błąd kopiowania obrazu: {{errorMessage}}",
 		"error_saving_image": "Błąd zapisywania obrazu: {{errorMessage}}",

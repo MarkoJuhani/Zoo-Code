@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 
-import type { HistoryItem, ProviderSettings } from "@roo-code/types"
+import { providerIdentifiers, type HistoryItem, type ProviderSettings } from "@roo-code/types"
 
 import { selectHandoffExecutionContext } from "../src/core/task/providerHandoff"
 import { completeDelegatedChild, delegateTaskToChild } from "../src/core/task-persistence/taskLifecycle"
@@ -108,8 +108,8 @@ const LEGACY_POLICIES: Array<Policy & { expectedViolation: string }> = [
 	},
 ]
 
-const parentConfiguration: ProviderSettings = { apiProvider: "anthropic", consecutiveMistakeLimit: 3 }
-const savedConfiguration: ProviderSettings = { apiProvider: "openrouter", consecutiveMistakeLimit: 7 }
+const parentConfiguration: ProviderSettings = { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 3 }
+const savedConfiguration: ProviderSettings = { apiProvider: providerIdentifiers.openrouter, consecutiveMistakeLimit: 7 }
 const parentContext = { mode: "code", apiConfigName: undefined, apiConfiguration: parentConfiguration }
 const PROFILE_SCENARIOS = [
 	{ name: "unsaved", locked: false, saved: undefined, expectedName: undefined, expectedLimit: 3 },
@@ -495,5 +495,77 @@ function formatViolation(policy: Policy, violations: string[], trace: TraceStep[
 }
 
 function task(id: string, status: HistoryItem["status"], parentTaskId?: string): HistoryItem {
-	return { id, status, parentTaskId, task: id, ts: 1, tokensIn: 0, tokensOut: 0, totalCost: 0 }
+	return { id, number: 1, status, parentTaskId, task: id, ts: 1, tokensIn: 0, tokensOut: 0, totalCost: 0 }
+}
+
+// Additive adapter model: native tool readiness precedes capable provider entry.
+// The real Task/presenter/store/scheduler regression owns the filesystem refinement.
+checkNativeDelegationReadiness()
+
+function checkNativeDelegationReadiness(): void {
+	type State = {
+		persistence: "pending" | "saving" | "durable" | "failed"
+		approved: boolean
+		cancelled: boolean
+		handoff: boolean
+	}
+	const depth = 8,
+		budget = 100
+	const start: State = { persistence: "pending", approved: false, cancelled: false, handoff: false }
+	const next = (state: State, legacy = false): Array<{ action: string; state: State }> => {
+		if (state.handoff) return []
+		const result: Array<{ action: string; state: State }> = []
+		const add = (action: string, changes: Partial<State>) =>
+			result.push({ action, state: { ...state, ...changes } })
+		if (!state.approved && !state.cancelled) add("approve", { approved: true })
+		if (!state.cancelled) add("cancel", { cancelled: true })
+		if (state.persistence === "pending" && !state.cancelled) add("save-start", { persistence: "saving" })
+		if (state.persistence === "saving") {
+			add("save-durable", { persistence: "durable" })
+			add("save-failed", { persistence: "failed" })
+		}
+		if (
+			state.approved &&
+			!state.cancelled &&
+			(state.persistence === "durable" || (legacy && state.persistence === "saving"))
+		)
+			add("handoff", { handoff: true })
+		return result
+	}
+	const explore = (legacy: boolean) => {
+		const queue = [{ state: start, trace: [] as string[] }]
+		const seen = new Set([JSON.stringify(start)]),
+			actions = new Set<string>(),
+			landmarks = new Set<string>()
+		for (let index = 0; index < queue.length; index++) {
+			const { state, trace } = queue[index]!
+			if (state.handoff && (state.persistence !== "durable" || state.cancelled)) {
+				assert.ok(legacy, `Native delegation before readiness: ${trace.join(" -> ")}`)
+				return { seen, actions, landmarks, trace }
+			}
+			if (state.approved && !state.handoff) landmarks.add(state.cancelled ? "cancelled-wait" : state.persistence)
+			if (state.handoff) landmarks.add("durable-handoff")
+			for (const step of next(state, legacy)) {
+				actions.add(step.action)
+				const key = JSON.stringify(step.state)
+				if (seen.has(key)) continue
+				assert.ok(trace.length < depth, "Native readiness depth exhausted")
+				seen.add(key)
+				assert.ok(seen.size <= budget, "Native readiness state budget exhausted")
+				queue.push({ state: step.state, trace: [...trace, step.action] })
+			}
+		}
+		return { seen, actions, landmarks, trace: undefined }
+	}
+	const fixed = explore(false),
+		legacy = explore(true)
+	assert.equal(fixed.trace, undefined)
+	for (const action of ["approve", "cancel", "save-start", "save-durable", "save-failed", "handoff"])
+		assert.ok(fixed.actions.has(action), `Native readiness action unreachable: ${action}`)
+	for (const landmark of ["pending", "saving", "durable", "failed", "cancelled-wait", "durable-handoff"])
+		assert.ok(fixed.landmarks.has(landmark), `Native readiness landmark missing: ${landmark}`)
+	assert.deepEqual(legacy.trace, ["approve", "save-start", "handoff"])
+	console.log(
+		`Native delegation readiness passed: ${fixed.seen.size} states, 6/6 actions, 6/6 landmarks, depth <= ${depth}, states <= ${budget}; legacy witness: ${legacy.trace.join(" -> ")}`,
+	)
 }

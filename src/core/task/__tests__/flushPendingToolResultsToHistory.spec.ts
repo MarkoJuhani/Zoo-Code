@@ -1,5 +1,6 @@
 // npx vitest run core/task/__tests__/flushPendingToolResultsToHistory.spec.ts
 
+import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
@@ -9,7 +10,7 @@ import { TelemetryService } from "@roo-code/telemetry"
 
 import { Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
-import { ContextProxy } from "../../config/ContextProxy"
+import { TaskHistoryStore } from "../../task-persistence"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 // Mock delay before any imports that might use it
@@ -22,24 +23,15 @@ vi.mock("execa", () => ({
 	execa: vi.fn(),
 }))
 
-vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockResolvedValue(undefined),
-}))
-
+const { beforeRename } = vi.hoisted(() => ({ beforeRename: vi.fn() }))
 vi.mock("fs/promises", async (importOriginal) => {
-	const actual = (await importOriginal()) as Record<string, any>
-	const mockFunctions = {
-		mkdir: vi.fn().mockResolvedValue(undefined),
-		writeFile: vi.fn().mockResolvedValue(undefined),
-		readFile: vi.fn().mockResolvedValue("[]"),
-		unlink: vi.fn().mockResolvedValue(undefined),
-		rmdir: vi.fn().mockResolvedValue(undefined),
-	}
-
+	const actual = await importOriginal<typeof import("fs/promises")>()
 	return {
 		...actual,
-		...mockFunctions,
-		default: mockFunctions,
+		rename: async (from: string, to: string) => {
+			await beforeRename(from, to)
+			return actual.rename(from, to)
+		},
 	}
 })
 
@@ -142,33 +134,29 @@ vi.mock("../../condense", async (importOriginal) => {
 	}
 })
 
-vi.mock("../../../utils/storage", () => ({
-	getTaskDirectoryPath: vi
-		.fn()
-		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
-	getSettingsDirectoryPath: vi
-		.fn()
-		.mockImplementation((globalStoragePath) => Promise.resolve(`${globalStoragePath}/settings`)),
-}))
-
-vi.mock("../../../utils/fs", () => ({
-	fileExistsAtPath: vi.fn().mockReturnValue(false),
-}))
-
 describe("flushPendingToolResultsToHistory", () => {
-	let mockProvider: any
+	let mockProvider: ClineProvider
 	let mockApiConfig: ProviderSettings
 	let mockOutputChannel: any
 	let mockExtensionContext: vscode.ExtensionContext
 
-	beforeEach(() => {
+	let storageRoot: string
+	const tasks: Task[] = []
+	beforeEach(async () => {
+		beforeRename.mockReset()
+		// Only external watchers/timers are disabled; initialization and publication remain real.
+		const watcherEffects = TaskHistoryStore.prototype as unknown as {
+			startWatcher: () => void
+			startPeriodicReconciliation: () => void
+		}
+		vi.spyOn(watcherEffects, "startWatcher").mockImplementation(() => {})
+		vi.spyOn(watcherEffects, "startPeriodicReconciliation").mockImplementation(() => {})
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
 		}
 
-		const storageUri = {
-			fsPath: path.join(os.tmpdir(), "test-storage"),
-		}
+		storageRoot = await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-tool-flush-"))
+		const storageUri = { fsPath: storageRoot }
 
 		mockExtensionContext = {
 			globalState: {
@@ -206,12 +194,19 @@ describe("flushPendingToolResultsToHistory", () => {
 			dispose: vi.fn(),
 		}
 
-		mockProvider = new ClineProvider(
-			mockExtensionContext,
-			mockOutputChannel,
-			"sidebar",
-			new ContextProxy(mockExtensionContext),
-		) as any
+		const store = new TaskHistoryStore(storageRoot)
+		await store.initialize()
+		// Avoid extension/MCP startup, not persistence: provider metadata updates
+		// use the production method against this initialized disposable store.
+		mockProvider = Object.assign(Object.create(ClineProvider.prototype), {
+			context: mockExtensionContext,
+			contextProxy: { globalStorageUri: storageUri },
+			taskHistoryStore: store,
+			providerSettingsManager: { getModeConfigId: async () => undefined },
+			getState: async () => ({ mode: "code", currentApiConfigName: "offline" }),
+			log: mockOutputChannel.appendLine,
+			flushPostStateToWebviewThrottled: vi.fn(),
+		}) as ClineProvider
 
 		mockApiConfig = {
 			apiProvider: providerIdentifiers.anthropic,
@@ -222,7 +217,19 @@ describe("flushPendingToolResultsToHistory", () => {
 		mockProvider.postMessageToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
-		mockProvider.updateTaskHistory = vi.fn().mockResolvedValue(undefined)
+		mockProvider.postStateToWebviewThrottled = vi.fn().mockResolvedValue(undefined)
+	})
+
+	afterEach(async () => {
+		for (const task of tasks.splice(0)) {
+			task["debouncedEmitTokenUsage"].cancel()
+			await task.waitForModeInitialization()
+			await task.waitForApiConfigInitialization()
+			await task.dispose()
+		}
+		mockProvider.taskHistoryStore.dispose()
+		vi.restoreAllMocks()
+		await fs.rm(storageRoot, { recursive: true, force: true })
 	})
 
 	it("should not save anything when userMessageContent is empty", async () => {
@@ -231,6 +238,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 
 		// Ensure userMessageContent is empty
@@ -250,6 +258,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 		task.assistantMessageSavedToHistory = true
 
@@ -281,6 +290,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 		task.assistantMessageSavedToHistory = true
 
@@ -305,6 +315,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 		task.assistantMessageSavedToHistory = true
 
@@ -338,6 +349,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 		task.assistantMessageSavedToHistory = true
 
@@ -366,6 +378,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 
 		// Set flag to true (assistant message already saved)
@@ -397,6 +410,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 
 		// Flag is false by default - assistant message not yet saved
@@ -440,6 +454,7 @@ describe("flushPendingToolResultsToHistory", () => {
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
+			onCreated: (task) => tasks.push(task),
 		})
 
 		// Flag is false - will need to wait
@@ -463,5 +478,38 @@ describe("flushPendingToolResultsToHistory", () => {
 		// Should not have saved anything since task was aborted
 		expect(task.apiConversationHistory.length).toBe(0)
 		expect(waitForPersistence).not.toHaveBeenCalled()
+	})
+	it("retains failed pending content and retries the same correlated result exactly once", async () => {
+		const task = new Task({
+			provider: mockProvider,
+			apiConfiguration: mockApiConfig,
+			task: "test task",
+			startTask: false,
+			onCreated: (task) => tasks.push(task),
+		})
+		task.assistantMessageSavedToHistory = true
+		task.userMessageContent = [{ type: "tool_result", tool_use_id: "failed-result", content: "retained" }]
+		let failNextWrite = true
+		beforeRename.mockImplementation((_from, to) => {
+			if (failNextWrite && String(to).endsWith("api_conversation_history.json")) {
+				failNextWrite = false
+				throw new Error("disk full")
+			}
+		})
+		expect(await task.flushPendingToolResultsToHistory()).toBe(false)
+		expect(task.userMessageContent).toEqual([
+			{ type: "tool_result", tool_use_id: "failed-result", content: "retained" },
+		])
+		expect(task.apiConversationHistory).toHaveLength(1)
+		const messageId = task.apiConversationHistory[0].messageId
+		expect(await task.flushPendingToolResultsToHistory()).toBe(true)
+		expect(task.userMessageContent).toEqual([])
+		expect(task.apiConversationHistory).toHaveLength(1)
+		expect(task.apiConversationHistory[0].messageId).toBe(messageId)
+		const saved = JSON.parse(
+			await fs.readFile(path.join(storageRoot, "tasks", task.taskId, "api_conversation_history.json"), "utf8"),
+		)
+		expect(saved).toHaveLength(1)
+		expect(saved[0].content).toEqual([{ type: "tool_result", tool_use_id: "failed-result", content: "retained" }])
 	})
 })

@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "Êtes-vous sûr de vouloir supprimer ce mode {scope} ?\n\nCela supprimera également le dossier de règles associé à l'adresse :\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "L'historique des tâches a été chargé, mais les réparations au démarrage ont été ignorées : le verrou de démarrage est utilisé. Si aucune autre fenêtre Zoo Code n'est ouverte, un processus planté l'a laissé ; déplace ce dossier ailleurs et recharge : {{lockPath}}",
+		"task_history_startup_generation_invalid": "L'historique des tâches a été chargé, mais les réparations au démarrage ont été ignorées : le fichier de génération du verrou de démarrage est invalide. Ferme les autres fenêtres Zoo Code, déplace ce fichier et le dossier {{lockPath}} ailleurs, puis recharge : {{generationPath}}",
+		"task_history_startup_fence_unusable": "L'historique des tâches a été chargé, mais les réparations au démarrage ont été ignorées : le dossier des verrous est inutilisable ({{code}}). Vérifie qu'il s'agit d'un dossier accessible en écriture, puis recharge : {{fencePath}}",
 		"invalid_data_uri": "Format d'URI de données invalide",
 		"error_copying_image": "Erreur lors de la copie de l'image : {{errorMessage}}",
 		"error_saving_image": "Erreur lors de l'enregistrement de l'image : {{errorMessage}}",

@@ -74,6 +74,7 @@ import { selectImages } from "../../integrations/misc/process-images"
 import { getTheme } from "../../integrations/theme/getTheme"
 import { searchWorkspaceFiles } from "../../services/search/file-search"
 import { fileExistsAtPath } from "../../utils/fs"
+import { errorMessage, getThrownMessage } from "../../utils/errors"
 import { playTts, setTtsEnabled, setTtsSpeed, stopTts } from "../../utils/tts"
 import { searchCommits } from "../../utils/git"
 import { exportSettings, importSettingsWithFeedback } from "../config/importExport"
@@ -1900,7 +1901,7 @@ export const webviewMessageHandler = async (
 					await provider.postMessageToWebview({
 						type: "vsCodeSetting",
 						setting,
-						error: `Failed to get setting: ${error.message}`,
+						error: `Failed to get setting: ${errorMessage(error)}`,
 						value: undefined,
 					})
 				}
@@ -3151,11 +3152,11 @@ export const webviewMessageHandler = async (
 					})
 				}
 			} catch (error) {
-				provider.log(`Error saving code index settings: ${error.message || error}`)
+				provider.log(`Error saving code index settings: ${getThrownMessage(error) || error}`)
 				await provider.postMessageToWebview({
 					type: "codeIndexSettingsSaved",
 					success: false,
-					error: error.message || "Failed to save settings",
+					error: getThrownMessage(error) || "Failed to save settings",
 				})
 			}
 			break

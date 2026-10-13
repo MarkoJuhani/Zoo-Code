@@ -3,29 +3,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import type { HistoryItem } from "@roo-code/types"
 
-vi.mock("fs/promises", () => ({
-	mkdir: vi.fn().mockResolvedValue(undefined),
-	readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
-	readdir: vi.fn().mockResolvedValue([]),
-	unlink: vi.fn().mockResolvedValue(undefined),
-}))
-
-vi.mock("fs", () => ({
-	default: {
-		watch: vi.fn().mockReturnValue({ on: vi.fn(), close: vi.fn() }),
-		existsSync: vi.fn().mockReturnValue(false),
-	},
-	watch: vi.fn().mockReturnValue({ on: vi.fn(), close: vi.fn() }),
-	existsSync: vi.fn().mockReturnValue(false),
-}))
-
-vi.mock("../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockResolvedValue(undefined),
-}))
-
-vi.mock("../utils/storage", () => ({
-	getStorageBasePath: vi.fn().mockResolvedValue("/tmp/test-storage"),
-}))
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
 
 import { TaskHistoryStore } from "../core/task-persistence/TaskHistoryStore"
 
@@ -46,19 +26,26 @@ const makeItem = (id: string, overrides: Partial<HistoryItem> = {}): HistoryItem
 describe("TaskHistoryStore.atomicReadAndUpdate", () => {
 	let store: TaskHistoryStore
 
-	beforeEach(() => {
+	let storage: string
+	beforeEach(async () => {
 		vi.clearAllMocks()
-		store = new TaskHistoryStore("/tmp/test-storage")
+		storage = await fs.mkdtemp(path.join(os.tmpdir(), "delegation-concurrent-"))
+		store = new TaskHistoryStore(storage)
+		await store.initialize()
+	})
+	afterEach(async () => {
+		store.dispose()
+		await fs.rm(storage, { recursive: true, force: true })
 	})
 
 	it("serializes concurrent operations — second caller reads the state written by the first", async () => {
-		// Seed the cache with an item that has no childIds yet.
+		// Seed real durable metadata with an item that has no childIds yet.
 		const item = makeItem("parent-task", { childIds: [] })
-		;(store as any).cache.set(item.id, item)
+		await store.upsert(item)
 
 		// Two concurrent delegations each append their child ID.
 		// Because they are serialized by the lock, the second caller must
-		// read the cache state that the first caller wrote — not the original.
+		// read the durable state that the first caller wrote — not the original.
 		const delegation1 = store.atomicReadAndUpdate("parent-task", (current) => ({
 			...current,
 			childIds: [...(current.childIds ?? []), "child-A"],
@@ -72,14 +59,14 @@ describe("TaskHistoryStore.atomicReadAndUpdate", () => {
 		await Promise.all([delegation1, delegation2])
 
 		// Both child IDs must be present: delegation2 saw delegation1's write.
-		const final = (store as any).cache.get("parent-task") as HistoryItem
+		const final = store.get("parent-task")!
 		expect(final.childIds).toContain("child-A")
 		expect(final.childIds).toContain("child-B")
 	})
 
 	it("two concurrent delegations produce consistent HistoryItem state (full field set)", async () => {
 		const item = makeItem("parent-task", { status: "active", childIds: [] })
-		;(store as any).cache.set(item.id, item)
+		await store.upsert(item)
 
 		// Each delegation sets awaitingChildId and appends to childIds.
 		const delegation1 = store.atomicReadAndUpdate("parent-task", (historyItem) => {
@@ -106,7 +93,7 @@ describe("TaskHistoryStore.atomicReadAndUpdate", () => {
 
 		await Promise.all([delegation1, delegation2])
 
-		const final = (store as any).cache.get("parent-task") as HistoryItem
+		const final = store.get("parent-task")!
 		// Both child IDs present — neither write clobbered the other's childIds.
 		expect(final.childIds).toContain("child-A")
 		expect(final.childIds).toContain("child-B")
@@ -119,23 +106,20 @@ describe("TaskHistoryStore.atomicReadAndUpdate", () => {
 
 	it("completes without deadlock — updater is pure and does not re-acquire the lock", async () => {
 		const item = makeItem("task-1", { childIds: [] })
-		;(store as any).cache.set(item.id, item)
+		await store.upsert(item)
 
 		// With the typed (taskId, updater) API, the updater is synchronous and
 		// cannot call upsert/withLock — no re-entrancy, no deadlock.
-		const result = await Promise.race([
-			store
-				.atomicReadAndUpdate("task-1", (current) => ({
-					...current,
-					childIds: [...(current.childIds ?? []), "child-1"],
-				}))
-				.then(() => "completed"),
-			new Promise<string>((resolve) => setTimeout(() => resolve("deadlocked"), 100)),
-		])
+		const result = await store
+			.atomicReadAndUpdate("task-1", (current) => ({
+				...current,
+				childIds: [...(current.childIds ?? []), "child-1"],
+			}))
+			.then(() => "completed")
 
 		expect(result).toBe("completed")
 
-		const final = (store as any).cache.get("task-1") as HistoryItem
+		const final = store.get("task-1")!
 		expect(final.childIds).toContain("child-1")
 	})
 

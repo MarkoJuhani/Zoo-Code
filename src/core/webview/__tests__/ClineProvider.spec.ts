@@ -1,6 +1,8 @@
 // pnpm --filter roo-cline test core/webview/__tests__/ClineProvider.spec.ts
 
 import * as path from "path"
+import * as fsReal from "fs/promises"
+import * as os from "os"
 import { TaskRegistry } from "../../task/TaskRegistry"
 
 import Anthropic from "@anthropic-ai/sdk"
@@ -47,11 +49,11 @@ vi.mock("p-wait-for", () => ({
 vi.mock("fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("fs/promises")>()
 	const mocked = {
-		mkdir: vi.fn().mockResolvedValue(undefined),
-		writeFile: vi.fn().mockResolvedValue(undefined),
-		readFile: vi.fn().mockResolvedValue(""),
-		unlink: vi.fn().mockResolvedValue(undefined),
-		rmdir: vi.fn().mockResolvedValue(undefined),
+		mkdir: vi.fn(actual.mkdir),
+		writeFile: vi.fn(actual.writeFile),
+		readFile: vi.fn(actual.readFile),
+		unlink: vi.fn(actual.unlink),
+		rmdir: vi.fn(actual.rmdir),
 	}
 
 	return {
@@ -73,7 +75,10 @@ vi.mock("axios", () => ({
 	post: vi.fn(),
 }))
 
-vi.mock("../../../utils/safeWriteJson")
+vi.mock("../../../utils/safeWriteJson", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../utils/safeWriteJson")>()
+	return { ...actual, safeWriteJson: vi.fn(actual.safeWriteJson) }
+})
 
 vi.mock("../../../utils/path", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../../utils/path")>()
@@ -84,9 +89,18 @@ vi.mock("../../../utils/path", async (importOriginal) => {
 })
 
 vi.mock("../../../utils/storage", () => ({
-	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
-	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
-	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
+	getSettingsDirectoryPath: vi.fn(async (root: string) => {
+		const directory = path.join(root, "settings")
+		await (await vi.importActual<typeof import("fs/promises")>("fs/promises")).mkdir(directory, { recursive: true })
+		return directory
+	}),
+	getTaskDirectoryPath: vi.fn(async (root: string, id: string) => {
+		const directory = path.join(root, "tasks", id)
+		await (await vi.importActual<typeof import("fs/promises")>("fs/promises")).mkdir(directory, { recursive: true })
+		return directory
+	}),
+	getGlobalStoragePath: vi.fn(async (root: string) => root),
+	getStorageBasePath: vi.fn(async (root: string) => root),
 }))
 
 vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
@@ -439,6 +453,7 @@ describe("ClineProvider", () => {
 	})
 
 	let defaultTaskOptions: TaskOptions
+	let storagePath: string
 
 	let provider: ClineProvider
 	let mockContext: vscode.ExtensionContext
@@ -447,8 +462,14 @@ describe("ClineProvider", () => {
 	let mockPostMessage: any
 	let updateGlobalStateSpy: any
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-ordinary-"))
+		const mockedFs = vi.mocked(await import("fs/promises"))
+		const realFs = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		mockedFs.mkdir.mockImplementation(realFs.mkdir)
+		mockedFs.readFile.mockImplementation(realFs.readFile)
+		mockedFs.writeFile.mockImplementation(realFs.writeFile)
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -496,7 +517,7 @@ describe("ClineProvider", () => {
 				packageJSON: { version: "1.0.0" },
 			},
 			globalStorageUri: {
-				fsPath: "/test/storage/path",
+				fsPath: storagePath,
 			},
 		} as unknown as vscode.ExtensionContext
 
@@ -537,6 +558,7 @@ describe("ClineProvider", () => {
 		}
 
 		provider = new ClineProvider(mockContext, mockOutputChannel, "sidebar", new ContextProxy(mockContext))
+		await provider.taskHistoryStore.initialized
 
 		defaultTaskOptions = {
 			provider,
@@ -559,6 +581,11 @@ describe("ClineProvider", () => {
 			readResource: vi.fn().mockResolvedValue({ contents: [] }),
 			getAllServers: vi.fn().mockReturnValue([]),
 		})
+	})
+
+	afterEach(async () => {
+		await provider.dispose()
+		await fsReal.rm(storagePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 30 })
 	})
 
 	test("constructor initializes correctly", () => {
@@ -1265,6 +1292,225 @@ describe("ClineProvider", () => {
 		expect(currentTask.dispose).toHaveBeenCalledOnce()
 		expect(remainingTask.abortTask).toHaveBeenCalledOnce()
 		expect(remainingTask.dispose).toHaveBeenCalledOnce()
+	})
+
+	test.each(["abort", "cleanup"] as const)(
+		"shutdown preserves delegated-child interruption after %s rejection",
+		async (failure) => {
+			const record = (
+				id: string,
+				extra: Partial<import("@roo-code/types").HistoryItem> = {},
+			): import("@roo-code/types").HistoryItem => ({
+				id,
+				number: 1,
+				ts: 1,
+				task: id,
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+				status: "active",
+				...extra,
+			})
+			await provider.taskHistoryStore.upsert(
+				record("shutdown-parent", {
+					status: "delegated",
+					awaitingChildId: "shutdown-child",
+					childIds: ["shutdown-child"],
+				}),
+			)
+			await provider.taskHistoryStore.upsert(
+				record("shutdown-child", { parentTaskId: "shutdown-parent", rootTaskId: "shutdown-parent" }),
+			)
+			const order: string[] = []
+			const makeTask = (id: string) => ({
+				taskId: id,
+				instanceId: id,
+				emit: vi.fn(),
+				abortTask: vi.fn(async () => {
+					order.push(`${id}:abort`)
+					if (id === "shutdown-child" && failure === "abort") throw new Error("abort failed")
+				}),
+				dispose: vi.fn(async () => {
+					order.push(`${id}:dispose`)
+					if (id === "shutdown-child" && failure === "cleanup") throw new Error("cleanup failed")
+				}),
+			})
+			const parent = makeTask("shutdown-parent")
+			const child = makeTask("shutdown-child")
+			// Non-running structural tasks isolate provider cleanup from Task execution.
+			provider["taskRegistry"].push(parent as unknown as Task)
+			provider["taskRegistry"].push(child as unknown as Task)
+			const schedule = vi.spyOn(provider["taskScheduler"], "schedule")
+			const create = vi.mocked(Task).mockClear()
+			await provider.dispose()
+			expect(order).toEqual([
+				"shutdown-child:abort",
+				"shutdown-child:dispose",
+				"shutdown-parent:abort",
+				"shutdown-parent:dispose",
+			])
+			expect(child.dispose).toHaveBeenCalledOnce()
+			expect(parent.dispose).toHaveBeenCalledOnce()
+			const read = async (id: string) =>
+				JSON.parse(
+					await (
+						await vi.importActual<typeof import("fs/promises")>("fs/promises")
+					).readFile(path.join(storagePath, "tasks", id, "history_item.json"), "utf8"),
+				)
+			expect(await read("shutdown-child")).toMatchObject({
+				status: "interrupted",
+				parentTaskId: "shutdown-parent",
+				rootTaskId: "shutdown-parent",
+			})
+			expect(await read("shutdown-parent")).toMatchObject({
+				status: "delegated",
+				awaitingChildId: "shutdown-child",
+			})
+			expect(create).not.toHaveBeenCalled()
+			expect(schedule).not.toHaveBeenCalled()
+		},
+	)
+
+	test("shutdown does not swallow exclusion refusal as cleanup rejection", async () => {
+		const { ParentHandoffFence } = await import("../../task-persistence/parentHandoffFence")
+		const lease = await new ParentHandoffFence(storagePath).acquire("shutdown-refused")
+		const task = {
+			taskId: "shutdown-refused",
+			instanceId: "refused",
+			emit: vi.fn(),
+			abortTask: vi.fn(),
+			dispose: vi.fn(),
+		}
+		provider["taskRegistry"].push(task as unknown as Task)
+		try {
+			await expect(provider.dispose()).rejects.toThrow()
+			expect(task.abortTask).not.toHaveBeenCalled()
+			expect(task.dispose).not.toHaveBeenCalled()
+			expect(provider.getCurrentTask()).toBe(task)
+		} finally {
+			await lease.release()
+			provider["_disposed"] = false
+		}
+	})
+
+	test("shutdown does not swallow ownership loss after cleanup rejection", async () => {
+		const realFs = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		const remaining = {
+			taskId: "shutdown-later",
+			instanceId: "later",
+			emit: vi.fn(),
+			abortTask: vi.fn(),
+			dispose: vi.fn(),
+		}
+		const task = {
+			taskId: "shutdown-lost",
+			instanceId: "lost",
+			emit: vi.fn(),
+			abortTask: vi.fn(),
+			dispose: vi.fn(async () => {
+				const fence = path.join(storagePath, ".handoff-fences")
+				for (const entry of await realFs.readdir(fence)) {
+					if (entry.endsWith(".generation")) await realFs.writeFile(path.join(fence, entry), "999999")
+				}
+				throw new Error("cleanup failed")
+			}),
+		}
+		provider["taskRegistry"].push(remaining as unknown as Task)
+		provider["taskRegistry"].push(task as unknown as Task)
+		await expect(provider.dispose()).rejects.toThrow()
+		expect(task.dispose).toHaveBeenCalledOnce()
+		expect(remaining.abortTask).not.toHaveBeenCalled()
+		expect(remaining.dispose).not.toHaveBeenCalled()
+		provider["_disposed"] = false
+	})
+
+	test.each(["abort", "dispose"] as const)(
+		"shutdown propagates typed ownership failure from task %s",
+		async (phase) => {
+			const { ParentHandoffFenceOwnershipError } = await import("../../task-persistence/parentHandoffFence")
+			const failure = new ParentHandoffFenceOwnershipError("typed-owner")
+			const later = {
+				taskId: "typed-later",
+				instanceId: "later",
+				emit: vi.fn(),
+				abortTask: vi.fn(),
+				dispose: vi.fn(),
+			}
+			const task = {
+				taskId: "typed-owner",
+				instanceId: "owner",
+				emit: vi.fn(),
+				abortTask: vi.fn(async () => {
+					if (phase === "abort") throw failure
+				}),
+				dispose: vi.fn(async () => {
+					if (phase === "dispose") throw failure
+				}),
+			}
+			provider["taskRegistry"].push(later as unknown as Task)
+			provider["taskRegistry"].push(task as unknown as Task)
+			await expect(provider.dispose()).rejects.toBe(failure)
+			expect(later.abortTask).not.toHaveBeenCalled()
+			expect(later.dispose).not.toHaveBeenCalled()
+			expect(task.dispose).toHaveBeenCalledTimes(phase === "abort" ? 0 : 1)
+			provider["_disposed"] = false
+		},
+	)
+
+	test("shutdown rejects failed delegated interruption persistence instead of claiming a drained child", async () => {
+		const record = (
+			id: string,
+			extra: Partial<import("@roo-code/types").HistoryItem> = {},
+		): import("@roo-code/types").HistoryItem => ({
+			id,
+			number: 1,
+			ts: 1,
+			task: id,
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+			status: "active",
+			...extra,
+		})
+		await provider.taskHistoryStore.upsert(
+			record("persist-parent", {
+				status: "delegated",
+				awaitingChildId: "persist-child",
+				childIds: ["persist-child"],
+			}),
+		)
+		await provider.taskHistoryStore.upsert(
+			record("persist-child", { parentTaskId: "persist-parent", rootTaskId: "persist-parent" }),
+		)
+		const later = {
+			taskId: "persist-parent",
+			instanceId: "parent",
+			emit: vi.fn(),
+			abortTask: vi.fn(),
+			dispose: vi.fn(),
+		}
+		const child = {
+			taskId: "persist-child",
+			instanceId: "child",
+			emit: vi.fn(),
+			abortTask: vi.fn(),
+			dispose: vi.fn(),
+		}
+		provider["taskRegistry"].push(later as unknown as Task)
+		provider["taskRegistry"].push(child as unknown as Task)
+		const failure = new Error("interruption write failed")
+		const update = vi.spyOn(provider, "updateTaskHistory").mockRejectedValueOnce(failure)
+		await expect(provider.dispose()).rejects.toBe(failure)
+		expect(child.dispose).toHaveBeenCalledOnce()
+		expect(later.abortTask).not.toHaveBeenCalled()
+		const disk = JSON.parse(
+			await (
+				await vi.importActual<typeof import("fs/promises")>("fs/promises")
+			).readFile(path.join(storagePath, "tasks", child.taskId, "history_item.json"), "utf8"),
+		)
+		expect(disk.status).toBe("active")
+		update.mockRestore()
+		provider["_disposed"] = false
 	})
 
 	test("handles webviewDidLaunch message", async () => {
@@ -2942,6 +3188,15 @@ describe("ClineProvider", () => {
 })
 
 describe("webviewMessageHandler no-floating-promises coverage", () => {
+	let storagePath: string
+	beforeEach(async () => {
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-mode-files-"))
+	})
+	afterEach(async () => {
+		await (
+			await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		).rm(storagePath, { recursive: true, force: true })
+	})
 	const createProvider = (overrides: Record<string, unknown> = {}) =>
 		Object.assign(
 			{
@@ -3089,7 +3344,7 @@ describe("webviewMessageHandler no-floating-promises coverage", () => {
 		const showSaveDialog = vi.mocked(vscode.window.showSaveDialog)
 
 		exportModeWithRules.mockResolvedValueOnce({ success: true, yaml: "mode: one" })
-		showSaveDialog.mockResolvedValueOnce({ fsPath: "/test/mode.yaml" } as vscode.Uri)
+		showSaveDialog.mockResolvedValueOnce({ fsPath: path.join(storagePath, "mode.yaml") } as vscode.Uri)
 		await webviewMessageHandler(provider, { type: "exportMode", slug: "mode-1" })
 
 		exportModeWithRules.mockResolvedValueOnce({ success: true, yaml: "mode: one" })
@@ -3120,7 +3375,10 @@ describe("webviewMessageHandler no-floating-promises coverage", () => {
 		const provider = createProvider()
 		const importModeWithRules = provider.customModesManager.importModeWithRules as ReturnType<typeof vi.fn>
 		const showOpenDialog = vi.mocked(vscode.window.showOpenDialog)
-		const selectedFile = [{ fsPath: "/test/mode.yaml" } as vscode.Uri]
+		await (
+			await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		).writeFile(path.join(storagePath, "mode.yaml"), "mode: one")
+		const selectedFile = [{ fsPath: path.join(storagePath, "mode.yaml") } as vscode.Uri]
 
 		showOpenDialog.mockResolvedValueOnce(selectedFile)
 		importModeWithRules.mockResolvedValueOnce({ success: true, slug: "mode-1" })
@@ -3339,7 +3597,10 @@ describe("Project MCP Settings", () => {
 	let mockWebviewView: any
 	let mockPostMessage: any
 
+	let storagePath: string
+
 	beforeEach(async () => {
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-storage-"))
 		vi.clearAllMocks()
 		const pathUtils = await import("../../../utils/path")
 		vi.mocked(pathUtils.getWorkspacePath).mockReturnValue("")
@@ -3367,7 +3628,7 @@ describe("Project MCP Settings", () => {
 				packageJSON: { version: "1.0.0" },
 			},
 			globalStorageUri: {
-				fsPath: "/test/storage/path",
+				fsPath: storagePath,
 			},
 		} as unknown as vscode.ExtensionContext
 
@@ -3394,21 +3655,30 @@ describe("Project MCP Settings", () => {
 		;(vscode.window as any).activeTextEditor = undefined
 		;(vscode.workspace.getWorkspaceFolder as any).mockReset()
 		provider = new ClineProvider(mockContext, mockOutputChannel, "sidebar", new ContextProxy(mockContext))
+		await provider.taskHistoryStore.initialized
+	})
+
+	afterEach(async () => {
+		await provider.dispose()
+		await (
+			await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		).rm(storagePath, { recursive: true, force: true })
 	})
 
 	test("handles openProjectMcpSettings message", async () => {
 		// Mock workspace folders first
-		;(vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: "/test/workspace" } }]
+		;(vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: storagePath } }]
 		const pathUtils = await import("../../../utils/path")
-		vi.mocked(pathUtils.getWorkspacePath).mockReturnValue("/test/workspace")
+		vi.mocked(pathUtils.getWorkspacePath).mockReturnValue(storagePath)
 
 		// Mock fs functions
 		const fs = await import("fs/promises")
 		const mockedFs = vi.mocked(fs)
 		mockedFs.mkdir.mockClear()
-		mockedFs.mkdir.mockResolvedValue(undefined)
+		const realFs = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		mockedFs.mkdir.mockImplementation(realFs.mkdir)
 		mockedFs.writeFile.mockClear()
-		mockedFs.writeFile.mockResolvedValue(undefined)
+		mockedFs.writeFile.mockImplementation(realFs.writeFile)
 
 		// Mock fileExistsAtPath to return false (file doesn't exist)
 		const fsUtils = await import("../../../utils/fs")
@@ -3431,7 +3701,7 @@ describe("Project MCP Settings", () => {
 			type: "openProjectMcpSettings",
 		})
 
-		const expectedRooDir = path.join("/test/workspace", ".roo")
+		const expectedRooDir = path.join(storagePath, ".roo")
 		const expectedMcpPath = path.join(expectedRooDir, "mcp.json")
 
 		// Check that fs.mkdir was called with the correct path
@@ -3464,14 +3734,14 @@ describe("Project MCP Settings", () => {
 		const messageHandler = (mockWebviewView.webview.onDidReceiveMessage as any).mock.calls[0][0]
 
 		// Mock workspace folders
-		;(vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: "/test/workspace" } }]
+		;(vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: storagePath } }]
 		const pathUtils = await import("../../../utils/path")
-		vi.mocked(pathUtils.getWorkspacePath).mockReturnValue("/test/workspace")
+		vi.mocked(pathUtils.getWorkspacePath).mockReturnValue(storagePath)
 
 		// Mock fs functions to fail
 		const fs = await import("fs/promises")
 		const mockedFs = vi.mocked(fs)
-		mockedFs.mkdir.mockRejectedValue(new Error("Failed to create directory"))
+		mockedFs.mkdir.mockRejectedValueOnce(new Error("Failed to create directory"))
 
 		// Trigger openProjectMcpSettings
 		await messageHandler({
@@ -3490,7 +3760,13 @@ describe("getTelemetryProperties", () => {
 	let mockOutputChannel: vscode.OutputChannel
 	let mockCline: any
 
-	beforeEach(() => {
+	let cloudInstanceDescriptor: PropertyDescriptor | undefined
+	let storagePath: string
+
+	beforeEach(async () => {
+		const { CloudService } = await import("@roo-code/cloud")
+		cloudInstanceDescriptor = Object.getOwnPropertyDescriptor(CloudService, "instance")
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-storage-"))
 		// Reset mocks
 		vi.clearAllMocks()
 
@@ -3517,12 +3793,13 @@ describe("getTelemetryProperties", () => {
 			},
 			secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
 			extensionUri: { fsPath: "/test/path" } as vscode.Uri,
-			globalStorageUri: { fsPath: "/test/path" },
+			globalStorageUri: { fsPath: storagePath },
 			extension: { packageJSON: { version: "1.0.0" } },
 		} as unknown as vscode.ExtensionContext
 
 		mockOutputChannel = { appendLine: vi.fn() } as unknown as vscode.OutputChannel
 		provider = new ClineProvider(mockContext, mockOutputChannel, "sidebar", new ContextProxy(mockContext))
+		await provider.taskHistoryStore.initialized
 
 		defaultTaskOptions = {
 			provider,
@@ -3539,6 +3816,15 @@ describe("getTelemetryProperties", () => {
 				info: { contextWindow: 200000 },
 			}),
 		}
+	})
+
+	afterEach(async () => {
+		const { CloudService } = await import("@roo-code/cloud")
+		if (cloudInstanceDescriptor) Object.defineProperty(CloudService, "instance", cloudInstanceDescriptor)
+		await provider.dispose()
+		await (
+			await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		).rm(storagePath, { recursive: true, force: true })
 	})
 
 	test("includes basic properties in telemetry", async () => {
@@ -3568,6 +3854,7 @@ describe("getTelemetryProperties", () => {
 			// Import the CloudService mock and update it
 			const { CloudService } = await import("@roo-code/cloud")
 			const mockCloudService = {
+				off: vi.fn(),
 				isAuthenticated: vi.fn().mockReturnValue(true),
 			}
 
@@ -3586,6 +3873,7 @@ describe("getTelemetryProperties", () => {
 			// Import the CloudService mock and update it
 			const { CloudService } = await import("@roo-code/cloud")
 			const mockCloudService = {
+				off: vi.fn(),
 				isAuthenticated: vi.fn().mockReturnValue(false),
 			}
 
@@ -3625,6 +3913,7 @@ describe("getTelemetryProperties", () => {
 			// Import the CloudService mock and update it
 			const { CloudService } = await import("@roo-code/cloud")
 			const mockCloudService = {
+				off: vi.fn(),
 				isAuthenticated: vi.fn().mockImplementation(() => {
 					throw new Error("Authentication check error")
 				}),
@@ -3656,7 +3945,10 @@ describe("ClineProvider - Router Models", () => {
 	let mockWebviewView: any
 	let mockPostMessage: any
 
-	beforeEach(() => {
+	let storagePath: string
+
+	beforeEach(async () => {
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-storage-"))
 		vi.clearAllMocks()
 
 		const globalState: Record<string, string | undefined> = {}
@@ -3697,7 +3989,7 @@ describe("ClineProvider - Router Models", () => {
 				packageJSON: { version: "1.0.0" },
 			},
 			globalStorageUri: {
-				fsPath: "/test/storage/path",
+				fsPath: storagePath,
 			},
 		} as unknown as vscode.ExtensionContext
 
@@ -3731,6 +4023,14 @@ describe("ClineProvider - Router Models", () => {
 		}
 
 		provider = new ClineProvider(mockContext, mockOutputChannel, "sidebar", new ContextProxy(mockContext))
+		await provider.taskHistoryStore.initialized
+	})
+
+	afterEach(async () => {
+		await provider.dispose()
+		await (
+			await vi.importActual<typeof import("fs/promises")>("fs/promises")
+		).rm(storagePath, { recursive: true, force: true })
 	})
 
 	test("handles requestRouterModels with successful responses", async () => {
@@ -4000,9 +4300,11 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 	let mockWebviewView: any
 	let mockPostMessage: any
 	let defaultTaskOptions: TaskOptions
+	let storagePath: string
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		storagePath = await fsReal.mkdtemp(path.join(os.tmpdir(), "provider-edits-"))
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -4050,7 +4352,7 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 				packageJSON: { version: "1.0.0" },
 			},
 			globalStorageUri: {
-				fsPath: "/test/storage/path",
+				fsPath: storagePath,
 			},
 		} as unknown as vscode.ExtensionContext
 
@@ -4081,6 +4383,7 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 		}
 
 		provider = new ClineProvider(mockContext, mockOutputChannel, "sidebar", new ContextProxy(mockContext))
+		await provider.taskHistoryStore.initialized
 
 		defaultTaskOptions = {
 			provider,
@@ -4097,6 +4400,11 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 			readResource: vi.fn().mockResolvedValue({ contents: [] }),
 			getAllServers: vi.fn().mockReturnValue([]),
 		})
+	})
+
+	afterEach(async () => {
+		await provider.dispose()
+		await fsReal.rm(storagePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 30 })
 	})
 
 	describe("Edit Messages with Images and Attachments", () => {
@@ -4993,13 +5301,23 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 		})
 
 		it("returns empty apiConversationHistory when file is missing", async () => {
-			const historyItem = { id: "missing-api-file-task", task: "test task", ts: Date.now() }
+			const historyItem = {
+				id: "missing-api-file-task",
+				task: "test task",
+				ts: Date.now(),
+				number: 1,
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			}
 			vi.mocked(mockContext.globalState.get).mockImplementation((key: string) => {
 				if (key === "taskHistory") {
 					return [historyItem]
 				}
 				return undefined
 			})
+
+			await provider.taskHistoryStore.upsert(historyItem)
 
 			const deleteTaskSpy = vi.spyOn(provider, "deleteTaskFromState")
 
@@ -5011,7 +5329,15 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 		})
 
 		it("returns empty apiConversationHistory when file contains invalid JSON", async () => {
-			const historyItem = { id: "corrupt-api-task", task: "test task", ts: Date.now() }
+			const historyItem = {
+				id: "corrupt-api-task",
+				task: "test task",
+				ts: Date.now(),
+				number: 1,
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			}
 			vi.mocked(mockContext.globalState.get).mockImplementation((key: string) => {
 				if (key === "taskHistory") {
 					return [historyItem]
@@ -5019,13 +5345,11 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 				return undefined
 			})
 
-			// Make fileExistsAtPath return true so the read path is exercised
-			const fsUtils = await import("../../../utils/fs")
-			vi.spyOn(fsUtils, "fileExistsAtPath").mockResolvedValue(true)
-
-			// Make readFile return corrupted JSON
-			const fsp = await import("fs/promises")
-			vi.mocked(fsp.readFile).mockResolvedValueOnce("{not valid json!!!" as never)
+			await provider.taskHistoryStore.upsert(historyItem)
+			const realFs = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+			const directory = path.join(storagePath, "tasks", historyItem.id)
+			await realFs.mkdir(directory, { recursive: true })
+			await realFs.writeFile(path.join(directory, "api_conversation_history.json"), "{not valid json!!!")
 
 			const deleteTaskSpy = vi.spyOn(provider, "deleteTaskFromState")
 
@@ -5034,9 +5358,6 @@ describe("ClineProvider - Comprehensive Edit/Delete Edge Cases", () => {
 			expect(result.historyItem).toEqual(historyItem)
 			expect(result.apiConversationHistory).toEqual([])
 			expect(deleteTaskSpy).not.toHaveBeenCalled()
-
-			// Restore the spy
-			vi.mocked(fsUtils.fileExistsAtPath).mockRestore()
 		})
 	})
 

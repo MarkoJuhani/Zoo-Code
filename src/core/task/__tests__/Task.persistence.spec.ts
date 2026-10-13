@@ -1,5 +1,6 @@
 // cd src && npx vitest run core/task/__tests__/Task.persistence.spec.ts
 
+import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
@@ -14,6 +15,7 @@ import {
 import { TelemetryService } from "@roo-code/telemetry"
 import type { Anthropic } from "@anthropic-ai/sdk"
 
+import { TaskHistoryStore } from "../../task-persistence"
 import { Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
@@ -27,14 +29,49 @@ type TaskPersistenceAccess = {
 	resolveAssistantMessagePersistence: (result: boolean) => void
 	assistantMessagePersistenceCancellation?: { resolve: () => void }
 	resumeTaskFromHistory: () => Promise<void>
-	resumeInterruptedCreateSubtask: (action: PendingTaskAction) => Promise<void>
-	resumePendingTaskAction: (action: PendingTaskAction) => Promise<void>
+	// `void` lets a replay stub stop the flow; the production presenters always return a wait.
+	resumeInterruptedCreateSubtask: (action: PendingTaskAction) => Promise<ResumeUserWait | void>
+	resumePendingTaskAction: (action: PendingTaskAction) => Promise<ResumeUserWait | void>
+	answerResumeWait: (pending: ResumeUserWait) => Promise<unknown>
+	prepareAsk: (...args: Parameters<Task["ask"]>) => Promise<() => ReturnType<Task["ask"]>>
 	saveClineMessages: () => Promise<boolean>
-	initiateTaskLoop: (userContent: Anthropic.Messages.ContentBlockParam[]) => Promise<void>
+	initiateTaskLoop: (
+		userContent: Anthropic.Messages.ContentBlockParam[],
+		prepared?: (run: () => Promise<void>) => void,
+	) => Promise<void>
+}
+
+type ResumeAskAnswer = Awaited<ReturnType<Task["ask"]>>
+/** A restored-task user wait: presented under the start exclusion, answered after its release. */
+type ResumeUserWait = {
+	kind: "user_wait"
+	wait: () => Promise<ResumeAskAnswer>
+	resolve: (answer: ResumeAskAnswer) => Promise<unknown>
 }
 
 function getTaskPersistenceAccess(task: Task): TaskPersistenceAccess {
 	return task as unknown as TaskPersistenceAccess
+}
+
+/**
+ * Resume asks are presented by prepareAsk and answered by its returned wait. Route both phases
+ * through the test's `ask` spy, which stands for the presented ask and supplies its answer.
+ */
+function routeResumeAsksThroughAsk(task: Task) {
+	const prepareAsk = vi.spyOn(getTaskPersistenceAccess(task), "prepareAsk")
+	return prepareAsk.mockImplementation(async (...args) => {
+		const wait = () => task.ask(...args)
+		return wait
+	})
+}
+
+/** Present, wait and resolve in order, as resumeTaskFromHistory does around its exclusion scopes. */
+async function settleResume(presented: Promise<ResumeUserWait | void>): Promise<void> {
+	let next: unknown = await presented
+	while (typeof next === "object" && next !== null && (next as { kind?: unknown }).kind === "user_wait") {
+		const pending = next as ResumeUserWait
+		next = await pending.resolve(await pending.wait())
+	}
 }
 
 function createDeferred<T>() {
@@ -43,6 +80,21 @@ function createDeferred<T>() {
 		resolve = resolvePromise
 	})
 	return { promise, resolve }
+}
+
+// Fake clocks do not drain kernel I/O. Advance until the actual disk-backed promise settles.
+async function settleDiskTimers<T>(promise: Promise<T>): Promise<T> {
+	let settled = false
+	void promise.then(
+		() => {
+			settled = true
+		},
+		() => {
+			settled = true
+		},
+	)
+	await vi.waitFor(() => expect(settled).toBe(true), { timeout: 5_000 })
+	return promise
 }
 
 // ─── Hoisted mocks ───────────────────────────────────────────────────────────
@@ -59,17 +111,7 @@ const {
 	mockSaveTaskMessages: vi.fn().mockResolvedValue(undefined),
 	mockReadApiMessages: vi.fn().mockResolvedValue([]),
 	mockReadTaskMessages: vi.fn().mockResolvedValue([]),
-	mockTaskMetadata: vi.fn().mockResolvedValue({
-		historyItem: { id: "test-id", ts: Date.now(), task: "test" },
-		tokenUsage: {
-			totalTokensIn: 0,
-			totalTokensOut: 0,
-			totalCacheWrites: 0,
-			totalCacheReads: 0,
-			totalCost: 0,
-			contextTokens: 0,
-		},
-	}),
+	mockTaskMetadata: vi.fn(),
 	mockPWaitFor: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -84,25 +126,6 @@ vi.mock("execa", () => ({
 	execa: vi.fn(),
 }))
 
-vi.mock("fs/promises", async (importOriginal) => {
-	const actual = (await importOriginal()) as Record<string, any>
-	return {
-		...actual,
-		mkdir: vi.fn().mockResolvedValue(undefined),
-		writeFile: vi.fn().mockResolvedValue(undefined),
-		readFile: vi.fn().mockResolvedValue("[]"),
-		unlink: vi.fn().mockResolvedValue(undefined),
-		rmdir: vi.fn().mockResolvedValue(undefined),
-		default: {
-			mkdir: vi.fn().mockResolvedValue(undefined),
-			writeFile: vi.fn().mockResolvedValue(undefined),
-			readFile: vi.fn().mockResolvedValue("[]"),
-			unlink: vi.fn().mockResolvedValue(undefined),
-			rmdir: vi.fn().mockResolvedValue(undefined),
-		},
-	}
-})
-
 vi.mock("p-wait-for", () => ({
 	default: mockPWaitFor,
 }))
@@ -111,24 +134,18 @@ vi.mock("../../task-persistence", async (importOriginal) => {
 	const mod = await importOriginal<typeof import("../../task-persistence")>()
 	return {
 		...mod,
-		saveApiMessages: mockSaveApiMessages,
-		saveTaskMessages: mockSaveTaskMessages,
+		saveApiMessages: async (options: Parameters<typeof mod.saveApiMessages>[0]) => {
+			await mockSaveApiMessages(structuredClone(options))
+			return mod.saveApiMessages(options)
+		},
+		saveTaskMessages: async (options: Parameters<typeof mod.saveTaskMessages>[0]) => {
+			await mockSaveTaskMessages(structuredClone(options))
+			return mod.saveTaskMessages(options)
+		},
 		readApiMessages: mockReadApiMessages,
 		readTaskMessages: mockReadTaskMessages,
-		taskMetadata: mockTaskMetadata,
-		TaskHistoryStore: vi.fn().mockImplementation(function () {
-			return {
-				initialize: vi.fn().mockResolvedValue(undefined),
-				dispose: vi.fn(),
-				get: vi.fn(),
-				getAll: vi.fn().mockReturnValue([]),
-				upsert: vi.fn().mockResolvedValue([]),
-				delete: vi.fn().mockResolvedValue(undefined),
-				deleteMany: vi.fn().mockResolvedValue(undefined),
-				reconcile: vi.fn().mockResolvedValue(undefined),
-				initialized: Promise.resolve(),
-			}
-		}),
+		taskMetadata: async (options: Parameters<typeof mod.taskMetadata>[0]) =>
+			(await mockTaskMetadata(options)) ?? mod.taskMetadata(options),
 	}
 })
 
@@ -221,19 +238,6 @@ vi.mock("../../condense", async (importOriginal) => {
 	}
 })
 
-vi.mock("../../../utils/storage", () => ({
-	getTaskDirectoryPath: vi
-		.fn()
-		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
-	getSettingsDirectoryPath: vi
-		.fn()
-		.mockImplementation((globalStoragePath) => Promise.resolve(`${globalStoragePath}/settings`)),
-}))
-
-vi.mock("../../../utils/fs", () => ({
-	fileExistsAtPath: vi.fn().mockReturnValue(false),
-}))
-
 // ─── Test suite ──────────────────────────────────────────────────────────────
 
 describe("Task persistence", () => {
@@ -242,14 +246,78 @@ describe("Task persistence", () => {
 	let mockOutputChannel: vscode.OutputChannel
 	let mockExtensionContext: vscode.ExtensionContext
 
-	beforeEach(() => {
+	let storageRoot: string
+	const disposals: Promise<void>[] = []
+	const persistenceOperations = new Set<Promise<unknown>>()
+	function trackOperation<T>(operation: Promise<T>): Promise<T> {
+		persistenceOperations.add(operation)
+		void operation.then(
+			() => persistenceOperations.delete(operation),
+			() => persistenceOperations.delete(operation),
+		)
+		return operation
+	}
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		// Only external file-watcher/timer effects are disabled. Initialize, reconcile,
+		// provider updates and every actual store/file publication still execute.
+		const watcherEffects = TaskHistoryStore.prototype as unknown as {
+			startWatcher: () => void
+			startPeriodicReconciliation: () => void
+		}
+		vi.spyOn(watcherEffects, "startWatcher").mockImplementation(() => {})
+		vi.spyOn(watcherEffects, "startPeriodicReconciliation").mockImplementation(() => {})
+		// Provider construction starts initialization; awaiting a second initialize()
+		// does not drain that first startup-admission lease.
+		const initialize = TaskHistoryStore.prototype.initialize
+		vi.spyOn(TaskHistoryStore.prototype, "initialize").mockImplementation(function (this: TaskHistoryStore) {
+			return trackOperation(initialize.call(this))
+		})
+		// initializeTaskHistoryStore is private; the double assertion only exposes it to vi.spyOn.
+		const providerLifecycle = ClineProvider.prototype as unknown as {
+			initializeTaskHistoryStore: () => Promise<void>
+		}
+		const initializeProvider = providerLifecycle.initializeTaskHistoryStore
+		vi.spyOn(providerLifecycle, "initializeTaskHistoryStore").mockImplementation(function (this: ClineProvider) {
+			return trackOperation(initializeProvider.call(this))
+		})
+		// Observe admitted saves before acquisition starts, without replacing their
+		// implementation. Cancellation can settle its waiter ahead of the actual I/O.
+		const saveMethods = Task.prototype as unknown as {
+			saveApiConversationHistory: (merge?: boolean) => Promise<boolean>
+			saveClineMessages: (merge?: boolean) => Promise<boolean>
+			withStartExclusion: (effect: () => Promise<void>, fresh?: boolean) => Promise<void>
+		}
+		for (const method of ["saveApiConversationHistory", "saveClineMessages"] as const) {
+			const original = saveMethods[method]
+			vi.spyOn(saveMethods, method).mockImplementation(function (this: Task, merge?: boolean) {
+				return trackOperation(original.call(this, merge))
+			})
+		}
+		// Inner saves may finish before the outer start/resume ownership check and
+		// fence release. Keep the disk root alive through that actual boundary too.
+		const startExclusion = saveMethods.withStartExclusion
+		vi.spyOn(saveMethods, "withStartExclusion").mockImplementation(function (this: Task, effect, fresh) {
+			return trackOperation(startExclusion.call(this, effect, fresh))
+		})
+		const dispose = Task.prototype.dispose
+		vi.spyOn(Task.prototype, "dispose").mockImplementation(function (this: Task) {
+			const result = dispose.call(this)
+			disposals.push(result)
+			return result
+		})
+		mockTaskMetadata.mockReset()
+		mockSaveApiMessages.mockReset().mockResolvedValue(undefined)
+		mockSaveTaskMessages.mockReset().mockResolvedValue(undefined)
+		mockReadApiMessages.mockReset().mockResolvedValue([])
+		mockReadTaskMessages.mockReset().mockResolvedValue([])
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
 		}
 
-		const storageUri = { fsPath: path.join(os.tmpdir(), "test-storage") }
+		storageRoot = await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-broad-persistence-"))
+		const storageUri = { fsPath: storageRoot }
 
 		mockExtensionContext = {
 			globalState: {
@@ -297,8 +365,23 @@ describe("Task persistence", () => {
 		mockProvider.postMessageToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
-		mockProvider.updateTaskHistory = vi.fn().mockResolvedValue(undefined)
+		await Promise.all([...persistenceOperations])
+		vi.spyOn(mockProvider.taskHistoryStore, "get")
+		vi.spyOn(mockProvider, "updateTaskHistory")
 		mockProvider.log = vi.fn()
+	})
+
+	afterEach(async () => {
+		vi.useRealTimers()
+		// Existing cancellation assertions intentionally dispose without waiting. The
+		// temporary disk root must outlive their actual final-save/disposal promises.
+		await Promise.all(disposals.splice(0))
+		for (let batch = 0; persistenceOperations.size > 0 && batch < 8; batch++)
+			await Promise.allSettled([...persistenceOperations])
+		expect(persistenceOperations.size).toBe(0)
+		mockProvider.taskHistoryStore.dispose()
+		vi.restoreAllMocks()
+		await fs.rm(storageRoot, { recursive: true, force: true })
 	})
 
 	// ── saveApiConversationHistory (via retrySaveApiConversationHistory) ──
@@ -370,8 +453,7 @@ describe("Task persistence", () => {
 			})
 
 			const promise = task.retrySaveApiConversationHistory()
-			await vi.runAllTimersAsync()
-			const result = await promise
+			const result = await settleDiskTimers(promise)
 
 			expect(result).toBe(false)
 			expect(mockSaveApiMessages).toHaveBeenCalledTimes(3)
@@ -392,8 +474,7 @@ describe("Task persistence", () => {
 			})
 
 			const promise = task.retrySaveApiConversationHistory()
-			await vi.runAllTimersAsync()
-			const result = await promise
+			const result = await settleDiskTimers(promise)
 
 			expect(result).toBe(true)
 			expect(mockSaveApiMessages).toHaveBeenCalledTimes(2)
@@ -651,8 +732,7 @@ describe("Task persistence", () => {
 					},
 					callbacks,
 				)
-				await vi.runAllTimersAsync()
-				await handlingCompletion
+				await settleDiskTimers(handlingCompletion)
 
 				expect(mockSaveApiMessages).toHaveBeenCalledTimes(4)
 				expect(completionListener).not.toHaveBeenCalled()
@@ -857,8 +937,7 @@ describe("Task persistence", () => {
 				})
 				const waiting = task.waitForCurrentAssistantMessagePersistence()
 
-				await vi.advanceTimersByTimeAsync(100)
-				expect(mockSaveApiMessages).toHaveBeenCalledTimes(2)
+				await vi.waitFor(() => expect(mockSaveApiMessages).toHaveBeenCalledTimes(2))
 				void task.dispose()
 				retrySave.resolve(undefined)
 
@@ -890,7 +969,7 @@ describe("Task persistence", () => {
 				task.userMessageContent = [{ type: "tool_result", tool_use_id: "tool-1", content: "done" }]
 
 				const flushing = task.flushPendingToolResultsToHistory()
-				await vi.runAllTimersAsync()
+				await settleDiskTimers(flushing)
 
 				await expect(flushing).resolves.toBe(true)
 				expect(mockSaveApiMessages).toHaveBeenCalledTimes(3)
@@ -950,7 +1029,7 @@ describe("Task persistence", () => {
 				task.userMessageContent = [{ type: "tool_result", tool_use_id: "tool-1", content: "done" }]
 
 				const flushing = task.flushPendingToolResultsToHistory()
-				await vi.runAllTimersAsync()
+				await settleDiskTimers(flushing)
 
 				await expect(flushing).resolves.toBe(false)
 				expect(mockSaveApiMessages).toHaveBeenCalledTimes(4)
@@ -1406,6 +1485,7 @@ describe("Task persistence", () => {
 				startTask: false,
 			})
 			vi.spyOn(task, "ask").mockResolvedValue({ response: "noButtonClicked" })
+			routeResumeAsksThroughAsk(task)
 			vi.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop").mockResolvedValue(undefined)
 			const replay = vi.spyOn(getTaskPersistenceAccess(task), "resumePendingTaskAction")
 
@@ -1547,8 +1627,7 @@ describe("Task persistence", () => {
 				await vi.advanceTimersByTimeAsync(0)
 				expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
 
-				await vi.advanceTimersByTimeAsync(100)
-				await saving
+				await settleDiskTimers(saving)
 				expect(mockSaveApiMessages).toHaveBeenCalledTimes(2)
 				expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action")
 			} finally {
@@ -1731,6 +1810,12 @@ describe("Task persistence", () => {
 				text: "Please revise",
 				queuedMessageId: "queued-lifecycle",
 			})
+			routeResumeAsksThroughAsk(task)
+			// The presentation reads its authoritative status baseline.
+			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
+				kind: "found",
+				item: { id: task.taskId, status: "active", pendingAction: lifecycleAction },
+			} as Awaited<ReturnType<ClineProvider["getTaskMetadata"]>>)
 			const persist = vi.spyOn(task, "persistQueuedFeedbackAndAcknowledge").mockResolvedValue(true)
 			const initiate = vi
 				.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop")
@@ -1738,13 +1823,15 @@ describe("Task persistence", () => {
 					await getTaskPersistenceAccess(task).addToApiConversationHistory({ role: "user", content })
 				})
 
-			await getTaskPersistenceAccess(task).resumePendingTaskAction(lifecycleAction)
+			await settleResume(getTaskPersistenceAccess(task).resumePendingTaskAction(lifecycleAction))
 
 			expect(rawToolUseId).not.toBe(sanitizedActionId)
 			expect(persist).toHaveBeenCalledWith("queued-lifecycle", "Please revise", undefined)
-			expect(initiate).toHaveBeenCalledWith([
-				expect.objectContaining({ type: "tool_result", tool_use_id: sanitizedActionId }),
-			])
+			// The denied loop is prepared in the resolve phase and runs after the exclusion is released.
+			expect(initiate).toHaveBeenCalledWith(
+				[expect.objectContaining({ type: "tool_result", tool_use_id: sanitizedActionId })],
+				expect.any(Function),
+			)
 			expect(mockSaveApiMessages).toHaveBeenCalled()
 			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", sanitizedActionId)
 			expect(persist.mock.invocationCallOrder[0]).toBeLessThan(initiate.mock.invocationCallOrder[0])
@@ -1789,6 +1876,7 @@ describe("Task persistence", () => {
 			const ask = vi.spyOn(task, "ask")
 			const pendingResponse = createDeferred<Awaited<ReturnType<Task["ask"]>>>()
 			ask.mockImplementation(() => pendingResponse.promise)
+			routeResumeAsksThroughAsk(task)
 			const delegate = vi.spyOn(mockProvider, "delegateParentAndOpenChild")
 
 			const resume = getTaskPersistenceAccess(task).resumeTaskFromHistory()
@@ -1840,6 +1928,7 @@ describe("Task persistence", () => {
 				text: "Continue without child",
 				queuedMessageId: claimed?.id,
 			})
+			routeResumeAsksThroughAsk(task)
 			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
 				kind: "found",
 				item: { id: task.taskId, status: "interrupted", pendingAction: action },
@@ -1853,10 +1942,14 @@ describe("Task persistence", () => {
 			mockSaveApiMessages.mockImplementation(async ({ messages }: { messages: Anthropic.MessageParam[] }) => {
 				mockReadApiMessages.mockResolvedValue(messages)
 			})
-			vi.spyOn(mockProvider, "clearPendingTaskAction").mockResolvedValue(true)
+			const clearAction = vi.spyOn(mockProvider, "clearPendingTaskAction").mockResolvedValue(true)
 			const delegate = vi.spyOn(mockProvider, "delegateParentAndOpenChild")
+			const restore = vi.spyOn(mockProvider, "resumeInterruptedTask")
 			const loop = vi.spyOn(access, "initiateTaskLoop").mockResolvedValue(undefined)
-			await access.resumeInterruptedCreateSubtask(action)
+			// Resolve through the production answer scope: the restore needs its fresh start exclusion.
+			const presented = await access.resumeInterruptedCreateSubtask(action)
+			if (!presented) throw new Error("recovery ask was not presented")
+			await access.answerResumeWait(presented)
 			expect(mockSaveApiMessages).toHaveBeenCalledWith(
 				expect.objectContaining({
 					messages: expect.arrayContaining([
@@ -1873,16 +1966,46 @@ describe("Task persistence", () => {
 					]),
 				}),
 			)
+			// The recovery loop is prepared in the resolve phase and runs after the exclusion is released.
 			expect(loop).toHaveBeenCalledWith(
 				expect.arrayContaining([
 					expect.objectContaining({ type: "text", text: expect.stringContaining("Continue without child") }),
 				]),
+				expect.any(Function),
 			)
 			expect(task.messageQueueService.isEmpty()).toBe(true)
 			expect(delegate).not.toHaveBeenCalled()
+			// Deliberately changed: recovery now makes the chat live again, but only after the
+			// durable recovery result and the action clear (both of which require `interrupted`).
+			// The restore is the dedicated lifecycle write, never an ordinary history upsert.
 			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalledWith(
 				expect.objectContaining({ status: "active" }),
 			)
+			const resultSave = mockSaveApiMessages.mock.calls.findIndex(([{ messages }]) =>
+				(messages as Anthropic.MessageParam[]).some(
+					(message) =>
+						Array.isArray(message.content) &&
+						message.content.some(
+							(block) => block.type === "tool_result" && block.tool_use_id === action.actionId,
+						),
+				),
+			)
+			expect(resultSave).toBeGreaterThanOrEqual(0)
+			expect(restore).toHaveBeenCalledTimes(1)
+			expect(restore).toHaveBeenCalledWith(
+				task.taskId,
+				expect.objectContaining({ id: task.taskId }),
+				expect.any(Function),
+			)
+			expect(mockSaveApiMessages.mock.invocationCallOrder[resultSave]).toBeLessThan(
+				clearAction.mock.invocationCallOrder[0],
+			)
+			expect(clearAction.mock.invocationCallOrder[0]).toBeLessThan(restore.mock.invocationCallOrder[0])
+			expect(restore.mock.invocationCallOrder[0]).toBeLessThan(loop.mock.invocationCallOrder[0])
+			expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				kind: "found",
+				item: { status: "active" },
+			})
 		})
 
 		it("keeps the interrupted recovery ask owned after Continue", () => {
@@ -1952,6 +2075,7 @@ describe("Task persistence", () => {
 				text: item.text,
 				queuedMessageId: item.id,
 			})
+			routeResumeAsksThroughAsk(task)
 			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
 				kind: "found",
 				item: { id: task.taskId, status: "interrupted", pendingAction: action },
@@ -1965,7 +2089,9 @@ describe("Task persistence", () => {
 			mockSaveApiMessages.mockRejectedValue(new Error("save failed"))
 			const access = getTaskPersistenceAccess(task)
 			const loop = vi.spyOn(access, "initiateTaskLoop").mockResolvedValue(undefined)
-			await expect(access.resumeInterruptedCreateSubtask(action)).rejects.toThrow("not durably saved")
+			await expect(settleResume(access.resumeInterruptedCreateSubtask(action))).rejects.toThrow(
+				"not durably saved",
+			)
 			expect(task.messageQueueService.messages).toContainEqual(item)
 			expect(task.messageQueueService.claimNextMessage()).toEqual(item)
 			expect(task["pendingAction"]).toEqual(action)
@@ -2005,6 +2131,7 @@ describe("Task persistence", () => {
 				text: item.text,
 				queuedMessageId: item.id,
 			})
+			routeResumeAsksThroughAsk(task)
 			vi.spyOn(mockProvider, "getTaskMetadata").mockResolvedValue({
 				kind: "found",
 				item: { id: task.taskId, status: "interrupted", pendingAction: { ...action, actionId: "new-action" } },
@@ -2016,9 +2143,9 @@ describe("Task persistence", () => {
 				},
 			])
 			const loop = vi.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop").mockResolvedValue(undefined)
-			await expect(getTaskPersistenceAccess(task).resumeInterruptedCreateSubtask(action)).rejects.toThrow(
-				"Ownership or API boundary changed",
-			)
+			await expect(
+				settleResume(getTaskPersistenceAccess(task).resumeInterruptedCreateSubtask(action)),
+			).rejects.toThrow("Ownership or API boundary changed")
 			expect(task.messageQueueService.claimNextMessage()).toEqual(item)
 			expect(mockSaveApiMessages).not.toHaveBeenCalled()
 			expect(loop).not.toHaveBeenCalled()
@@ -2098,6 +2225,7 @@ describe("Task persistence", () => {
 				)
 				throw new Error("stop after hydration")
 			})
+			routeResumeAsksThroughAsk(task)
 
 			await expect(getTaskPersistenceAccess(task).resumeTaskFromHistory()).rejects.toThrow("stop after hydration")
 			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
@@ -2132,6 +2260,7 @@ describe("Task persistence", () => {
 				)
 				throw new Error("stop after hydration")
 			})
+			routeResumeAsksThroughAsk(task)
 
 			await expect(getTaskPersistenceAccess(task).resumeTaskFromHistory()).rejects.toThrow("stop after hydration")
 			expect(mockSaveTaskMessages).not.toHaveBeenCalled()

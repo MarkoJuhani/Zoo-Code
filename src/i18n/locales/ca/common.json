@@ -24,6 +24,9 @@
 		"delete_custom_mode_with_rules": "Esteu segur que voleu suprimir aquest mode {scope}?\n\nAixò també suprimirà la carpeta de regles associada a:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "L'historial de tasques s'ha carregat, però s'han omès les reparacions d'inici: el bloqueig d'inici està en ús. Si no hi ha cap altra finestra de Zoo Code oberta, l'ha deixat un procés que ha fallat; mou aquesta carpeta a un altre lloc i torna a carregar: {{lockPath}}",
+		"task_history_startup_generation_invalid": "L'historial de tasques s'ha carregat, però s'han omès les reparacions d'inici: el fitxer de generació del bloqueig d'inici no és vàlid. Tanca les altres finestres de Zoo Code, mou aquest fitxer i la carpeta {{lockPath}} a un altre lloc i torna a carregar: {{generationPath}}",
+		"task_history_startup_fence_unusable": "L'historial de tasques s'ha carregat, però s'han omès les reparacions d'inici: no es pot utilitzar la carpeta de bloqueigs ({{code}}). Comprova que sigui una carpeta amb permís d'escriptura i torna a carregar: {{fencePath}}",
 		"invalid_data_uri": "Format d'URI de dades no vàlid",
 		"error_copying_image": "Error copiant la imatge: {{errorMessage}}",
 		"error_saving_image": "Error desant la imatge: {{errorMessage}}",

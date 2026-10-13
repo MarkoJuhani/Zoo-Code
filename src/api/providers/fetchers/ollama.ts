@@ -3,6 +3,7 @@ import { ModelInfo, ollamaDefaultModelInfo } from "@roo-code/types"
 import { z } from "zod"
 
 import { throwIfAborted } from "../utils/abort-signal"
+import { getErrorCode } from "../../../utils/errors"
 
 const OllamaModelDetailsSchema = z.object({
 	family: z.string(),
@@ -122,7 +123,7 @@ export async function getOllamaModels(
 			console.error(`Error parsing Ollama models response: ${JSON.stringify(parsedResponse.error, null, 2)}`)
 		}
 	} catch (error) {
-		if (error.code === "ECONNREFUSED") {
+		if (getErrorCode(error) === "ECONNREFUSED") {
 			console.warn(`Failed connecting to Ollama at ${baseUrl}`)
 		} else {
 			console.error(

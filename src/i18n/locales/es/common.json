@@ -20,6 +20,9 @@
 		"delete_custom_mode_with_rules": "¿Estás seguro de que quieres eliminar este modo {scope}?\n\nEsto también eliminará la carpeta de reglas asociada en:\n{rulesFolderPath}"
 	},
 	"errors": {
+		"task_history_startup_lock_held": "El historial de tareas se cargó, pero se omitieron las reparaciones de inicio: el bloqueo de inicio está en uso. Si no hay otra ventana de Zoo Code abierta, lo dejó un proceso que falló; mueve esta carpeta a otro lugar y recarga: {{lockPath}}",
+		"task_history_startup_generation_invalid": "El historial de tareas se cargó, pero se omitieron las reparaciones de inicio: el archivo de generación del bloqueo de inicio no es válido. Cierra las demás ventanas de Zoo Code, mueve este archivo y la carpeta {{lockPath}} a otro lugar y recarga: {{generationPath}}",
+		"task_history_startup_fence_unusable": "El historial de tareas se cargó, pero se omitieron las reparaciones de inicio: no se puede usar la carpeta de bloqueos ({{code}}). Comprueba que sea una carpeta con permiso de escritura y recarga: {{fencePath}}",
 		"invalid_data_uri": "Formato de URI de datos no válido",
 		"error_copying_image": "Error copiando la imagen: {{errorMessage}}",
 		"error_saving_image": "Error guardando la imagen: {{errorMessage}}",

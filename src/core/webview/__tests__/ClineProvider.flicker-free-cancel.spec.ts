@@ -1,5 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import * as vscode from "vscode"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 
 import { ClineProvider } from "../ClineProvider"
 import { Task } from "../../task/Task"
@@ -144,17 +147,6 @@ vi.mock("p-wait-for", () => ({
 	default: vi.fn().mockResolvedValue(undefined),
 }))
 
-vi.mock("fs/promises", () => ({
-	mkdir: vi.fn().mockResolvedValue(undefined),
-	writeFile: vi.fn().mockResolvedValue(undefined),
-	readFile: vi.fn().mockResolvedValue(""),
-	readdir: vi.fn().mockResolvedValue([]),
-	unlink: vi.fn().mockResolvedValue(undefined),
-	rmdir: vi.fn().mockResolvedValue(undefined),
-	access: vi.fn().mockResolvedValue(undefined),
-	rm: vi.fn().mockResolvedValue(undefined),
-}))
-
 vi.mock("axios", () => ({
 	default: { get: vi.fn().mockResolvedValue({ data: { data: [] } }), post: vi.fn() },
 	get: vi.fn().mockResolvedValue({ data: { data: [] } }),
@@ -170,14 +162,10 @@ vi.mock("delay", () => {
 })
 
 vi.mock("../../../utils/storage", () => ({
-	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
-	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
-	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
-	getStorageBasePath: vi.fn().mockImplementation((defaultPath: string) => defaultPath),
-}))
-
-vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockResolvedValue(undefined),
+	getSettingsDirectoryPath: vi.fn(async (root: string) => path.join(root, "settings")),
+	getTaskDirectoryPath: vi.fn(async (root: string, id: string) => path.join(root, "tasks", id)),
+	getGlobalStoragePath: vi.fn(async (root: string) => root),
+	getStorageBasePath: vi.fn(async (root: string) => root),
 }))
 
 vi.mock("../../../utils/tts", () => ({
@@ -281,6 +269,7 @@ vi.mock("../../task-persistence", async (importOriginal) => {
 })
 
 describe("ClineProvider flicker-free cancel", () => {
+	let storagePath: string
 	let provider: ClineProvider
 	let mockContext: vscode.ExtensionContext
 	let mockOutputChannel: vscode.OutputChannel
@@ -304,8 +293,9 @@ describe("ClineProvider flicker-free cancel", () => {
 		consoleErrorSpy.mockRestore()
 	})
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		storagePath = await fs.mkdtemp(path.join(os.tmpdir(), "provider-cancel-"))
 
 		// Setup mock extension context
 		mockContext = {
@@ -314,7 +304,7 @@ describe("ClineProvider flicker-free cancel", () => {
 				update: vi.fn().mockResolvedValue(undefined),
 				keys: vi.fn().mockReturnValue([]),
 			},
-			globalStorageUri: { fsPath: "/test/storage" },
+			globalStorageUri: { fsPath: storagePath },
 			secrets: {
 				get: vi.fn().mockResolvedValue(undefined),
 				store: vi.fn().mockResolvedValue(undefined),
@@ -408,6 +398,7 @@ describe("ClineProvider flicker-free cancel", () => {
 
 	afterEach(async () => {
 		await provider.dispose()
+		await fs.rm(storagePath, { recursive: true, force: true })
 	})
 
 	it("should not remove current task from stack when rehydrating same taskId", async () => {
@@ -502,11 +493,12 @@ describe("ClineProvider flicker-free cancel", () => {
 			workspace: "/test/workspace",
 		}
 
-		// Act: Should not error and should call removeClineFromStack
+		// An empty stack needs no eviction; the restored task must still be published.
 		await provider.createTaskWithHistoryItem(historyItem)
 
-		// Assert: removeClineFromStack should be called (no current task to rehydrate)
-		expect(removeClineFromStackSpy).toHaveBeenCalled()
+		expect(removeClineFromStackSpy).not.toHaveBeenCalled()
+		expect(provider["taskRegistry"].current).toBe(mockTask2)
+		expect(provider["taskRegistry"].length).toBe(1)
 	})
 
 	it("should maintain task stack integrity during flicker-free replacement", async () => {
@@ -581,6 +573,66 @@ describe("ClineProvider flicker-free cancel", () => {
 		expect(registry.getAll()[1]).toBe(mockTopTask)
 		// Focus follows the replacement
 		expect(registry.current).toBe(mockTask2)
+	})
+
+	it("real-disk cancel preserves delegated ownership and the unanswered child question without child/model/queue effects", async () => {
+		const { TaskHistoryStore } = await import("../../task-persistence/TaskHistoryStore")
+		const store = new TaskHistoryStore(storagePath)
+		await store.initialize()
+		Object.defineProperty(provider, "taskHistoryStore", { value: store })
+		provider["taskHistoryStoreInitialized"] = true
+		await provider.taskHistoryStore.initialized
+		const record = (id: string, extra: Partial<HistoryItem> = {}): HistoryItem => ({
+			id,
+			number: 1,
+			ts: 1,
+			task: id,
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+			status: "active",
+			...extra,
+		})
+		const parent = record("disk-parent", {
+			status: "delegated",
+			awaitingChildId: "disk-child",
+			childIds: ["disk-child"],
+		})
+		const child = record("disk-child", {
+			parentTaskId: parent.id,
+			rootTaskId: parent.id,
+			pendingQuestion: { id: "cancel-q", taskId: "disk-child", toolCallId: "call", text: "Choose?" },
+		})
+		await provider.taskHistoryStore.upsert(parent)
+		await provider.taskHistoryStore.upsert(child)
+		provider.getTaskWithId = ClineProvider.prototype.getTaskWithId.bind(provider)
+		Object.assign(mockTask1, {
+			taskId: child.id,
+			parentTaskId: parent.id,
+			cancelCurrentRequest: vi.fn(),
+			isStreaming: false,
+		})
+		seedRegistry(provider, mockTask1)
+		const rehydrate = vi
+			.spyOn(provider, "createTaskWithHistoryItem")
+			.mockResolvedValue(mockTask2 as unknown as Task)
+		const create = vi.mocked(Task).mockClear()
+		const schedule = vi.spyOn(provider["taskScheduler"], "schedule")
+		await provider.cancelTask()
+		const persisted = JSON.parse(
+			await fs.readFile(path.join(storagePath, "tasks", child.id, "history_item.json"), "utf8"),
+		)
+		expect(persisted).toMatchObject({ status: "interrupted", parentTaskId: parent.id, rootTaskId: parent.id })
+		expect(persisted.pendingQuestion).toEqual(child.pendingQuestion)
+		expect(persisted.pendingQuestion.answer).toBeUndefined()
+		expect(
+			JSON.parse(await fs.readFile(path.join(storagePath, "tasks", parent.id, "history_item.json"), "utf8")),
+		).toMatchObject({ status: "delegated", awaitingChildId: child.id })
+		expect(mockTask1.abortReason).toBe("user_cancelled")
+		expect(mockTask1.abandoned).toBe(true)
+		expect(rehydrate).toHaveBeenCalledWith(expect.objectContaining({ id: child.id, status: "interrupted" }))
+		expect(create).not.toHaveBeenCalled()
+		expect(schedule).not.toHaveBeenCalled()
 	})
 
 	it("marks a cancelled delegated child as interrupted and keeps parent delegated (preserving resume path)", async () => {

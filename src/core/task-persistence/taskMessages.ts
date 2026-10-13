@@ -7,6 +7,7 @@ import { GlobalFileNames } from "../../shared/globalFileNames"
 import { getTaskDirectoryPath } from "../../utils/storage"
 import { ensureMessageIdentifiers, mergeClineMessageSnapshots } from "./mergeMessageSnapshots"
 import { getErrorCode, readFileWithMissingRetry } from "./readFileWithMissingRetry"
+import { withTargetPersistence, assertTargetEffect } from "./targetPersistenceBoundary"
 
 export type TaskMessagesReadErrorKind = "not_found" | "invalid" | "io_error"
 
@@ -71,21 +72,22 @@ export async function saveTaskMessages({
 	globalStoragePath,
 	merge = false,
 }: SaveTaskMessagesOptions): Promise<ClineMessage[]> {
-	ensureMessageIdentifiers(messages)
-	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
-	const filePath = path.join(taskDir, GlobalFileNames.uiMessages)
-	let savedMessages = messages
-	await safeWriteJson(
-		filePath,
-		messages,
-		merge
-			? {
-					merge: (existing, incoming) => {
-						savedMessages = mergeClineMessageSnapshots(existing, incoming) as ClineMessage[]
-						return savedMessages
-					},
-				}
-			: undefined,
-	)
-	return savedMessages
+	return withTargetPersistence(globalStoragePath, taskId, async () => {
+		ensureMessageIdentifiers(messages)
+		const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+		const root = path.dirname(path.dirname(taskDir))
+		const filePath = path.join(taskDir, GlobalFileNames.uiMessages)
+		let savedMessages = messages
+		await safeWriteJson(filePath, messages, {
+			publicationGuard: { check: () => assertTargetEffect(root, taskId) },
+			merge: (existing, incoming) => {
+				assertTargetEffect(root, taskId)
+				savedMessages = merge
+					? (mergeClineMessageSnapshots(existing, incoming) as ClineMessage[])
+					: (incoming as ClineMessage[])
+				return savedMessages
+			},
+		})
+		return savedMessages
+	})
 }

@@ -1,5 +1,14 @@
 import { TaskSemaphore } from "../../utils/TaskSemaphore"
 import { type Task } from "./Task"
+import { inIndependentTaskOrchestration } from "../task-persistence/targetPersistenceBoundary"
+
+/** Only this entry may run the Task-owned prepared loop outside capable admission. */
+export interface PreparedTaskResume {
+	kind: "prepared-resume"
+	authorize: (prepare: () => Promise<() => void>) => Promise<boolean>
+}
+
+export type TaskScheduledRunner = (() => Promise<void>) | PreparedTaskResume
 
 export type TaskScheduleStage = "admitted" | "cancelled" | "started" | "settled" | "failed"
 
@@ -35,7 +44,7 @@ export class TaskScheduler {
 	 * user cancelled it before it started), the permit is released immediately
 	 * without calling `run()`.
 	 */
-	async schedule(task: Task, run: () => Promise<void>, observe?: TaskScheduleObserver): Promise<void> {
+	async schedule(task: Task, run?: TaskScheduledRunner, observe?: TaskScheduleObserver): Promise<void> {
 		const notify: TaskScheduleObserver = (stage, error) => {
 			try {
 				observe?.(stage, error)
@@ -56,8 +65,34 @@ export class TaskScheduler {
 				notify("cancelled")
 				return
 			}
-			notify("started")
-			await run()
+			if (run && typeof run !== "function") {
+				const resumed = await inIndependentTaskOrchestration(() =>
+					task.runScheduledResume((prepare) =>
+						run.authorize(async () => {
+							const invoke = await prepare()
+							return () => {
+								invoke()
+								notify("started")
+							}
+						}),
+					),
+				)
+				notify(resumed ? "settled" : "cancelled")
+				return
+			}
+			const execute = () => {
+				notify("started")
+				return run ? run() : task.runScheduled()
+			}
+			// The prepared entry above and the no-runner entry are ordinary Task orchestration.
+			// Arbitrary callbacks retain exclusion through their last effect; never surrender it.
+			await inIndependentTaskOrchestration(() =>
+				run
+					? typeof task.runWithStartExclusion === "function"
+						? task.runWithStartExclusion(execute)
+						: execute()
+					: execute(),
+			)
 			notify("settled")
 		} catch (error) {
 			notify("failed", error)

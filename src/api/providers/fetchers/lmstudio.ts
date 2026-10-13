@@ -4,6 +4,7 @@ import { LLM, LLMInfo, LLMInstanceInfo, LMStudioClient } from "@lmstudio/sdk"
 import { type ModelInfo, lMStudioDefaultModelInfo, providerIdentifiers } from "@roo-code/types"
 
 import { throwIfAborted } from "../utils/abort-signal"
+import { getErrorCode } from "../../../utils/errors"
 
 import { flushModels, getModels } from "./modelCache"
 
@@ -26,7 +27,7 @@ export const forceFullModelDetailsLoad = async (baseUrl: string, modelId: string
 		// Mark this model as having full details loaded.
 		modelsWithLoadedDetails.add(modelId)
 	} catch (error) {
-		if (error.code === "ECONNREFUSED") {
+		if (getErrorCode(error) === "ECONNREFUSED") {
 			console.warn(`Error connecting to LMStudio at ${baseUrl}`)
 		} else {
 			console.error(
@@ -128,7 +129,7 @@ export async function getLMStudioModels(
 		// the empty-catalog handling below.
 		throwIfAborted(opts?.signal)
 
-		if (error.code === "ECONNREFUSED") {
+		if (getErrorCode(error) === "ECONNREFUSED") {
 			console.warn(`Error connecting to LMStudio at ${baseUrl}`)
 		} else {
 			console.error(

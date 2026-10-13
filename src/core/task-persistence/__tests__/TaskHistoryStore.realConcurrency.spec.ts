@@ -6,14 +6,14 @@ import type { HistoryItem } from "@roo-code/types"
 
 import { TaskHistoryStore } from "../TaskHistoryStore"
 
-type WriteTaskFile = (item: HistoryItem, delta?: Partial<HistoryItem>) => Promise<HistoryItem>
+type AtomicUpdate = TaskHistoryStore["atomicReadAndUpdate"]
 
 interface WriteBarrier {
 	arrivals(): number
 	dispose(): void
 }
 
-function synchronizeNextWrites(stores: TaskHistoryStore[], timeoutMs = 2_000): WriteBarrier {
+function synchronizeNextUpdates(stores: TaskHistoryStore[], timeoutMs = 2_000): WriteBarrier {
 	let arrivals = 0
 	let release!: () => void
 	let rejectBarrier!: (error: Error) => void
@@ -30,21 +30,19 @@ function synchronizeNextWrites(stores: TaskHistoryStore[], timeoutMs = 2_000): W
 		timer = setTimeout(() => {
 			if (settled) return
 			settled = true
-			reject(new Error(`Only ${arrivals}/${stores.length} stores reached writeTaskFile within ${timeoutMs}ms`))
+			reject(new Error(`Only ${arrivals}/${stores.length} stores reached atomic update within ${timeoutMs}ms`))
 		}, timeoutMs)
 	})
 	void barrier.catch(() => {})
 
 	for (const store of stores) {
-		const value: unknown = Reflect.get(store, "writeTaskFile")
-		if (typeof value !== "function") throw new Error("TaskHistoryStore.writeTaskFile is unavailable")
-		const original = value.bind(store) as WriteTaskFile
-		Reflect.set(store, "writeTaskFile", async (historyItem: HistoryItem, delta?: Partial<HistoryItem>) => {
+		const original: AtomicUpdate = store.atomicReadAndUpdate.bind(store)
+		store.atomicReadAndUpdate = async (taskId, updater) => {
 			arrivals++
 			if (arrivals === stores.length) release()
 			await barrier
-			return original(historyItem, delta)
-		})
+			return original(taskId, updater)
+		}
 	}
 
 	return {
@@ -83,7 +81,7 @@ describe("TaskHistoryStore real cross-host locking", () => {
 			await storeA.initialize()
 			await storeA.upsert(item("shared-task"))
 			await storeB.initialize()
-			writeBarrier = synchronizeNextWrites([storeA, storeB])
+			writeBarrier = synchronizeNextUpdates([storeA, storeB])
 
 			await Promise.all([
 				storeA.atomicReadAndUpdate("shared-task", (current) => ({ ...current, mode: "architect" })),
@@ -111,11 +109,11 @@ describe("TaskHistoryStore real cross-host locking", () => {
 			await storeA.initialize()
 			await storeA.upsert(item("shared-task"))
 			await storeB.initialize()
-			writeBarrier = synchronizeNextWrites([storeA, storeB], 50)
+			writeBarrier = synchronizeNextUpdates([storeA, storeB], 50)
 
 			await expect(
 				storeA.atomicReadAndUpdate("shared-task", (current) => ({ ...current, mode: "architect" })),
-			).rejects.toThrow("Only 1/2 stores reached writeTaskFile within 50ms")
+			).rejects.toThrow("Only 1/2 stores reached atomic update within 50ms")
 			expect(writeBarrier.arrivals()).toBe(1)
 		} finally {
 			writeBarrier?.dispose()
