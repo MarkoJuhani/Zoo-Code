@@ -2189,7 +2189,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Keep queued user messages intact during command_output asks. Those asks
 			// are terminal flow-control, not conversational turns.
 			const shouldDrainQueuedMessageForAsk = type !== "command_output"
-			const isStatusMutable = !partial && isBlocking && !isMessageQueued && approval.decision === "ask"
+			// A queued message cannot answer a protected ask (see the claim guard above), so it
+			// must not suppress the interactive status and notification either.
+			const isStatusMutable =
+				!partial && isBlocking && (!isMessageQueued || isProtected === true) && approval.decision === "ask"
 
 			let queuedMessageId: string | undefined
 			if (isStatusMutable) {

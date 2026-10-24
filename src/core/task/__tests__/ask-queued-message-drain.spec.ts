@@ -1,5 +1,5 @@
 import { Task } from "../Task"
-import type { PendingTaskAction } from "@roo-code/types"
+import { RooCodeEventName, type ClineMessage, type PendingTaskAction } from "@roo-code/types"
 
 type QueueTaskTestAccess = {
 	say: Task["say"]
@@ -189,6 +189,38 @@ describe("Task.ask queued message drain", () => {
 		// claimNextMessage only returns unclaimed messages: the queued message must
 		// still be present and unclaimed after the protected ask resolved.
 		expect(task.messageQueueService.claimNextMessage()?.text).toBe("mid-wait message")
+	})
+
+	it("still reports a protected command ask as interactive while a message is queued", async () => {
+		vi.useFakeTimers()
+		try {
+			const provider = {
+				getState: async () => ({ autoApprovalEnabled: true, alwaysAllowExecute: true }),
+				postMessageToWebview: vi.fn(async () => {}),
+			}
+			const task = await createTask(provider)
+			// The status timer looks the ask row up by timestamp, so keep the rows it adds.
+			Object.assign(task, {
+				addToClineMessages: async (message: ClineMessage) => {
+					task.clineMessages.push(message)
+				},
+			})
+			task.messageQueueService.addMessage("run it anyway")
+
+			const ask = task.ask("command", "rm -rf build", false, undefined, true)
+			await vi.advanceTimersByTimeAsync(2_000)
+
+			expect(task.emit).toHaveBeenCalledWith(RooCodeEventName.TaskInteractive, task.taskId)
+			expect(provider.postMessageToWebview).toHaveBeenCalledWith({ type: "interactionRequired" })
+			expect(task.messageQueueService.isEmpty()).toBe(false)
+
+			task.approveAsk()
+			// pWaitFor polls on timers, so advance the fake clock for the answer to land.
+			await vi.advanceTimersByTimeAsync(1_000)
+			await expect(ask).resolves.toMatchObject({ response: "yesButtonClicked", text: undefined })
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 
 	// The drain guards key on the isProtected flag, so they also cover protected
