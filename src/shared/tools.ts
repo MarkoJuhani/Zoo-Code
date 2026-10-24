@@ -356,6 +356,11 @@ export type DiffResult =
 				searchContent?: string
 				bestMatch?: string
 			}
+			/**
+			 * Zoo-local: search text, best match and surrounding file lines of a failed
+			 * block, kept apart from the content-free `error` so models can self-repair.
+			 */
+			fileContext?: string
 			failParts?: DiffResult[]
 	  } & ({ error: string } | { failParts: DiffResult[] }))
 

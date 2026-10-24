@@ -1017,17 +1017,23 @@ aaaaaa
 			expect(error).not.toContain("!!!!!!")
 		})
 
-		it("never echoes search, best-match or surrounding file text in failure diagnostics", async () => {
+		// Zoo-local: file text moves to `fileContext`; the error diagnostics stay content-free.
+		it("keeps search, best-match and surrounding file text out of the error and in fileContext", async () => {
 			const originalContent = "const a = 1\nAPI_KEY=FILE-SECRET-1\nconst b = 2\nAPI_KEY=FILE-SECRET-2\n"
 			const diffContent =
 				"<<<<<<< SEARCH\n:start_line:2\n-------\nAPI_KEY=SEARCH-SECRET-0\n=======\nAPI_KEY=x\n>>>>>>> REPLACE"
 
 			const result = await strategy.applyDiff(originalContent, diffContent)
-			const serialized = JSON.stringify(result)
+			const failure = !result.success ? result.failParts?.[0] : undefined
+			const error = failure && !failure.success ? failure.error : undefined
+			const fileContext = failure && !failure.success ? failure.fileContext : undefined
 
 			expect(result.success).toBe(false)
-			expect(serialized).toContain("No sufficiently similar match found")
-			expect(serialized).not.toMatch(/FILE-SECRET|SEARCH-SECRET/)
+			expect(error).toContain("No sufficiently similar match found")
+			expect(error).not.toMatch(/FILE-SECRET|SEARCH-SECRET/)
+			expect(fileContext).toContain("Search Content:\nAPI_KEY=SEARCH-SECRET-0")
+			expect(fileContext).toMatch(/Best Match Found:\n\d+ \| API_KEY=FILE-SECRET-\d/)
+			expect(fileContext).toContain("Original Content:\n1 | const a = 1\n2 | API_KEY=FILE-SECRET-1")
 		})
 
 		it("should match content with extra whitespace", async () => {

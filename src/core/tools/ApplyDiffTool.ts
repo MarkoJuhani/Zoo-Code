@@ -25,6 +25,8 @@ const DETAILED_APPLY_DIFF_FAILURES = 5
 const MAX_DETAILED_FAILURE_CHARACTERS = 4000
 const MAX_SUMMARY_FAILURE_CHARACTERS = 200
 const MAX_ABBREVIATED_FAILURES = 50
+// Zoo-local cap for the first failure's search/best-match/original excerpts.
+const MAX_FILE_CONTEXT_CHARACTERS = 20000
 
 export class ApplyDiffTool extends BaseTool<"apply_diff"> {
 	readonly name = "apply_diff" as const
@@ -99,7 +101,8 @@ export class ApplyDiffTool extends BaseTool<"apply_diff"> {
 							? `${failedParts.length} diff blocks failed to apply. Fix the failures below before retrying.\n\n`
 							: ""
 
-					formattedError = `Unable to apply diff to file: ${absolutePath}\n\n<error_details>\n${summary}${this.formatFailedParts(failedParts)}\n</error_details>`
+					// Nothing applied, so the excerpt line numbers still match the file on disk.
+					formattedError = `Unable to apply diff to file: ${absolutePath}\n\n<error_details>\n${summary}${this.formatFailedParts(failedParts, true)}\n</error_details>`
 				} else {
 					// `details` may carry search/best-match file text, so it is never forwarded.
 					formattedError = `Unable to apply diff to file: ${absolutePath}\n\n<error_details>\n${this.truncate(
@@ -280,8 +283,14 @@ export class ApplyDiffTool extends BaseTool<"apply_diff"> {
 		}
 	}
 
-	/** Strategy errors are file-content-free diagnostics; `details` may hold file text and is never rendered. */
-	private formatFailedParts(failedParts: Extract<DiffResult, { success: false }>[]): string {
+	/**
+	 * Strategy errors are file-content-free diagnostics; `details` may hold file text and is never rendered.
+	 * Zoo-local: with `includeFileContext`, the first failure also shows its `fileContext` excerpts.
+	 */
+	private formatFailedParts(
+		failedParts: Extract<DiffResult, { success: false }>[],
+		includeFileContext = false,
+	): string {
 		const renderedCount = Math.min(failedParts.length, MAX_ABBREVIATED_FAILURES)
 		const sections = failedParts.slice(0, renderedCount).map((failPart, index) => {
 			const label = failedParts.length > 1 ? `--- Failure ${index + 1} of ${failedParts.length} ---\n` : ""
@@ -292,7 +301,13 @@ export class ApplyDiffTool extends BaseTool<"apply_diff"> {
 				return `${label}${this.truncate(summaryLine, MAX_SUMMARY_FAILURE_CHARACTERS)}`
 			}
 
-			return this.truncate(`${label}${error}`, MAX_DETAILED_FAILURE_CHARACTERS)
+			const detailed = this.truncate(`${label}${error}`, MAX_DETAILED_FAILURE_CHARACTERS)
+
+			if (includeFileContext && index === 0 && failPart.fileContext) {
+				return `${detailed}\n\n${this.truncate(failPart.fileContext, MAX_FILE_CONTEXT_CHARACTERS)}`
+			}
+
+			return detailed
 		})
 
 		const trailers: string[] = []

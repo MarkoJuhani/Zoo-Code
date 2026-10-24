@@ -2,7 +2,7 @@ import { distance } from "fastest-levenshtein"
 
 import { ToolProgressStatus, DEFAULT_DIFF_FUZZY_THRESHOLD } from "@roo-code/types"
 
-import { everyLineHasLineNumbers, stripLineNumbers } from "../../../integrations/misc/extract-text"
+import { addLineNumbers, everyLineHasLineNumbers, stripLineNumbers } from "../../../integrations/misc/extract-text"
 import { ToolUse, DiffStrategy, DiffResult } from "../../../shared/tools"
 import { normalizeString } from "../../../utils/text-normalization"
 
@@ -538,7 +538,7 @@ export class MultiSearchReplaceDiffStrategy implements DiffStrategy {
 					searchLines = aggressiveSearchLines
 					replaceLines = replaceContent ? replaceContent.split(/\r?\n/) : []
 				} else {
-					// File and search text are never echoed: they may hold secrets. Report only numbers and constants.
+					// `error` stays content-free; file and search text go only into `fileContext`.
 					const lineRange = startLine ? ` at line: ${startLine}` : ""
 					const bestMatchLocation =
 						bestMatchContent && matchIndex >= 0
@@ -561,8 +561,28 @@ export class MultiSearchReplaceDiffStrategy implements DiffStrategy {
 						? `\n- LIKELY CAUSE: the first line of your search content looks like a malformed start-line marker and was therefore searched for as literal file text${separatorSwallowed ? ', together with the "-------" line after it' : ""}. The only recognized form is ":start_line:<number>" on the line immediately after "<<<<<<< SEARCH", optionally followed by a "-------" line. Remove or correct that line and retry.`
 						: ""
 
+					// Zoo-local: restore the pre-#2053 excerpts so the model can repair the
+					// block without an extra read_file round trip.
+					const contextStart = startLine ? startLine - 1 : Math.max(0, matchIndex)
+					const contextEnd = startLine
+						? startLine - 1 + searchLines.length
+						: Math.max(0, matchIndex) + searchLines.length
+					const bestMatchSection = bestMatchContent
+						? `Best Match Found:\n${addLineNumbers(bestMatchContent, matchIndex + 1)}`
+						: `Best Match Found:\n(no match)`
+					const originalContentSection = `Original Content:\n${addLineNumbers(
+						resultLines
+							.slice(
+								Math.max(0, contextStart - this.bufferLines),
+								Math.min(resultLines.length, contextEnd + this.bufferLines),
+							)
+							.join("\n"),
+						Math.max(1, contextStart - this.bufferLines + 1),
+					)}`
+
 					diffResults.push({
 						success: false,
+						fileContext: `Search Content:\n${searchChunk}\n\n${bestMatchSection}\n\n${originalContentSection}`,
 						error:
 							`No sufficiently similar match found${lineRange} ` +
 							`(${Math.floor(bestMatchScore * 100)}% similar, needs ${Math.floor(this.fuzzyThreshold * 100)}%)\n\n` +
