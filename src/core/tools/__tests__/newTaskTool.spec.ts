@@ -102,6 +102,7 @@ const mockCline = {
 	startSubtask: mockStartSubtask,
 	providerRef: {
 		deref: vi.fn(() => ({
+			getTaskMetadata: vi.fn(async () => ({ kind: "found", item: { status: "active" } })),
 			getState: vi.fn(() => ({ customModes: [], mode: "ask" })),
 			handleModeSwitch: vi.fn(),
 			delegateParentAndOpenChild: mockDelegateParentAndOpenChild,
@@ -578,6 +579,7 @@ describe("newTaskTool delegation flow", () => {
 	it("delegates to provider and does not call legacy startSubtask", async () => {
 		// Arrange: stub provider delegation
 		const providerSpy = {
+			getTaskMetadata: vi.fn().mockResolvedValue({ kind: "found", item: { status: "active" } }),
 			getState: vi.fn().mockResolvedValue({
 				mode: "ask",
 				experiments: {},
@@ -658,6 +660,89 @@ describe("newTaskTool delegation flow", () => {
 		// Assert: tool result reflects delegation
 		expect(mockPushToolResult).toHaveBeenCalledWith(expect.stringContaining("Delegated to child task child-1"))
 	})
+
+	/** A tool run against a task whose persisted status is `status`; approval is declined if asked. */
+	async function runWithStatus(status: string, item: Record<string, unknown> = {}) {
+		const providerSpy = {
+			getTaskMetadata: vi.fn().mockResolvedValue({ kind: "found", item: { status, ...item } }),
+			getState: vi.fn().mockResolvedValue({ mode: "ask", experiments: {} }),
+			setPendingTaskAction: vi.fn(),
+			delegateParentAndOpenChild: vi.fn(),
+		}
+		const localCline = {
+			taskId: "status-task",
+			consecutiveMistakeCount: 0,
+			didToolFailInCurrentTurn: false,
+			recordToolError: vi.fn(),
+			say: vi.fn().mockResolvedValue(undefined),
+			setPendingTaskAction: vi.fn(),
+			providerRef: { deref: vi.fn(() => providerSpy) },
+		}
+		const block: ToolUse<"new_task"> = {
+			type: "tool_use",
+			name: "new_task",
+			params: { mode: "code", message: "Follow up" },
+			partial: false,
+		}
+		const callbacks = {
+			askApproval: vi.fn<AskApproval>(async () => false),
+			handleError: vi.fn<HandleError>(async () => {}),
+			pushToolResult: vi.fn<PushToolResult>(),
+			toolCallId: "call-new-task",
+		}
+
+		// Double assertion: the tool reads only these members; a real Task needs a provider,
+		// API handler and storage, and its providerRef is a WeakRef that cannot hold this double.
+		await newTaskTool.handle(localCline as unknown as Task, withNativeArgs(block), callbacks)
+		return { providerSpy, localCline, callbacks }
+	}
+
+	it.each([
+		["completed", {}, "This task is already completed", "start a new task"],
+		[
+			"blocked_protocol_error",
+			{ protocolErrorChildId: "child-1" },
+			"blocked by a subtask protocol error",
+			"start a new task",
+		],
+		// A blocked child's own completion is missing; its way out is attempt_completion.
+		["blocked_protocol_error", {}, "has not finished with attempt_completion", "call attempt_completion"],
+	])(
+		"refuses in a %s task %o before saving an action, asking approval or creating a child",
+		async (status, item, reason, nextStep) => {
+			// This status cannot become delegated; a saved action would only be replayed into a refusal.
+			const { providerSpy, localCline, callbacks } = await runWithStatus(status, item)
+
+			expect(providerSpy.getTaskMetadata).toHaveBeenCalledWith("status-task")
+			expect(providerSpy.setPendingTaskAction).not.toHaveBeenCalled()
+			expect(localCline.setPendingTaskAction).not.toHaveBeenCalled()
+			expect(callbacks.askApproval).not.toHaveBeenCalled()
+			expect(providerSpy.delegateParentAndOpenChild).not.toHaveBeenCalled()
+			expect(localCline.recordToolError).toHaveBeenCalledWith("new_task")
+			expect(localCline.didToolFailInCurrentTurn).toBe(true)
+			expect(localCline.say).toHaveBeenCalledWith("error", expect.stringContaining(reason))
+			expect(localCline.say).toHaveBeenCalledWith("error", expect.stringContaining(nextStep))
+			expect(callbacks.pushToolResult).toHaveBeenCalledWith(expect.stringContaining("No subtask was created"))
+			expect(callbacks.handleError).not.toHaveBeenCalled()
+		},
+	)
+
+	it.each(["active", "interrupted", "delegated"])(
+		"saves the action and asks approval in an %s task",
+		async (status) => {
+			// Interrupted tasks keep their saved-handoff recovery path, and a delegated parent may re-delegate
+			// once its awaited child is interrupted; the provider decides both.
+			const { providerSpy, localCline, callbacks } = await runWithStatus(status)
+
+			expect(providerSpy.setPendingTaskAction).toHaveBeenCalledWith(
+				"status-task",
+				expect.objectContaining({ kind: "create_subtask", actionId: "call-new-task" }),
+			)
+			expect(callbacks.askApproval).toHaveBeenCalledOnce()
+			expect(localCline.say).not.toHaveBeenCalled()
+			expect(localCline.recordToolError).not.toHaveBeenCalled()
+		},
+	)
 })
 
 describe("newTaskTool handoff after the answered-ask save", () => {
@@ -692,6 +777,7 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 	function handoffFixture(interrupt?: "abort" | "abandoned") {
 		const diagnostics = { event: vi.fn<(phase: string, stage: string, error?: unknown) => void>() }
 		const provider = {
+			getTaskMetadata: vi.fn(async () => ({ kind: "found", item: { status: "active" } })),
 			getState: vi.fn(async () => ({ mode: "ask", customModes: [] })),
 			setPendingTaskAction: vi.fn(async () => {}),
 			createDelegationDiagnostics: vi.fn(() => diagnostics),

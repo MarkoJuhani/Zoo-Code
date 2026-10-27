@@ -18,6 +18,7 @@ export {
 	abandonDelegatedChild,
 	assertValidTransition,
 	blockDelegatedChildProtocol,
+	canDelegateTask,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,

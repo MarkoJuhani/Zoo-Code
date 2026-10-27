@@ -12,6 +12,7 @@ import { Package } from "../../shared/package"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { canDelegateTask } from "../task-persistence/taskLifecycle"
 import { toError } from "../../utils/errors"
 
 interface NewTaskParams {
@@ -51,6 +52,25 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 
 			if (!provider) {
 				pushToolResult(formatResponse.toolError("Provider reference lost"))
+				return
+			}
+
+			// A completed or blocked task cannot delegate; the provider would refuse after approval.
+			// Refuse before saving an action that a reopen would replay. Interrupted and delegated
+			// tasks keep their own recovery and re-delegation paths.
+			const metadata = await provider.getTaskMetadata(task.taskId)
+			const item = metadata.kind === "found" ? metadata.item : undefined
+			const status = item?.status
+			if (status && status !== "interrupted" && status !== "delegated" && !canDelegateTask(status)) {
+				// A blocked parent records the failing child; a blocked child's own completion is missing.
+				const errorMsg =
+					status === "blocked_protocol_error" && !item?.protocolErrorChildId
+						? "This task is blocked because it has not finished with attempt_completion, so it cannot start a subtask. No subtask was created. Finish the remaining work yourself and call attempt_completion."
+						: `This task is ${status === "completed" ? "already completed" : "blocked by a subtask protocol error"}, so it cannot start a subtask. No subtask was created. Ask the user to start a new task for this follow-up work.`
+				task.recordToolError("new_task")
+				task.didToolFailInCurrentTurn = true
+				await task.say("error", errorMsg)
+				pushToolResult(formatResponse.toolError(errorMsg))
 				return
 			}
 

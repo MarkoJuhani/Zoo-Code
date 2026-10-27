@@ -84,6 +84,16 @@ export function assertValidTransition(from: HistoryItemStatus | undefined, to: H
 	}
 }
 
+/** Whether delegateTaskToChild accepts a parent in this status; `delegated` needs an interrupted awaited child. */
+export function canDelegateTask(
+	status: HistoryItemStatus | undefined,
+	awaitedChildStatus?: HistoryItemStatus,
+): boolean {
+	const fromStatus: HistoryItemStatus = status ?? "active"
+	if (fromStatus === "delegated") return awaitedChildStatus === "interrupted"
+	return VALID_TASK_STATUS_TRANSITIONS[fromStatus].includes("delegated")
+}
+
 export function delegateTaskToChild(
 	parent: HistoryItem,
 	childId: string,

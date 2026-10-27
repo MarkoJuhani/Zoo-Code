@@ -198,6 +198,51 @@ describe("ClineProvider.delegateParentAndOpenChild()", () => {
 		expect(taskHistoryStore.atomicReadAndUpdate).not.toHaveBeenCalled()
 	})
 
+	it.each(["completed", "blocked_protocol_error"] as const)(
+		"rejects a %s parent before disposing it or writing an orphan child record",
+		async (status) => {
+			// The parent commit would refuse this status only after the durable child write.
+			const pendingAction = {
+				kind: "create_subtask" as const,
+				actionId: "create-action",
+				approvalText: "{}",
+				mode: "code",
+				message: "Do something",
+				todos: [],
+			}
+			const parentTask = makeParentTask()
+			const removeClineFromStack = vi.fn()
+			const createTask = vi.fn()
+			const taskHistoryStore = makeStoreStub({
+				get: vi.fn().mockReturnValue({ ...parentHistoryItem, status, pendingAction }),
+			})
+			const provider = await prepareProvider({
+				getCurrentTask: vi.fn(() => parentTask),
+				removeClineFromStack,
+				createTask,
+				taskHistoryStore,
+			})
+
+			await expect(
+				ClineProvider.prototype.delegateParentAndOpenChild.call(provider, {
+					parentTaskId: "parent-1",
+					message: "Do something",
+					initialTodos: [],
+					mode: "code",
+					pendingActionId: "create-action",
+				}),
+			).rejects.toThrow(`is ${status}; refusing to delegate before any write`)
+			expect(parentTask.flushPendingToolResultsToHistory).not.toHaveBeenCalled()
+			expect(removeClineFromStack).not.toHaveBeenCalled()
+			expect(createTask).not.toHaveBeenCalled()
+			const store = provider.taskHistoryStore as TaskHistoryStore
+			// prepareProvider spies on the real store, so upsert is a mock here.
+			expect(store.upsert).not.toHaveBeenCalled()
+			expect(taskHistoryStore.atomicReadAndUpdate).not.toHaveBeenCalled()
+			expect(store.getAll().map((item) => item.id)).toEqual(["parent-1"])
+		},
+	)
+
 	it("rejects a stale restored action before delegation side effects", async () => {
 		const parentTask = makeParentTask()
 		const removeClineFromStack = vi.fn()

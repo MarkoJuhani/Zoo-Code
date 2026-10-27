@@ -8,6 +8,7 @@ import EventEmitter from "events"
 import {
 	registerPendingQuestion,
 	answerPendingQuestion,
+	canDelegateTask,
 	clearPendingQuestion,
 	type HistoryItemStatus,
 	LifecycleTransitionError,
@@ -648,6 +649,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/** Instance view of the persisted status: the creation-time status until a resume restores it. */
 	private get liveStatus(): HistoryItemStatus | undefined {
 		return this.resumedStatus ?? this.initialStatus
+	}
+
+	/** Completed or blocked: a saved subtask handoff can never delegate. Interrupted and delegated keep their own paths. */
+	private get liveStatusCannotDelegate(): boolean {
+		const status = this.liveStatus
+		return status !== undefined && status !== "interrupted" && status !== "delegated" && !canDelegateTask(status)
 	}
 	public pendingQuestion?: PendingQuestion
 	private questionResultDelivered = false
@@ -3344,6 +3351,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Return to the owning orchestrator before entering an external-answer wait.
 			if (this.pendingQuestion) return true
 
+			if (this.pendingAction?.kind === "create_subtask" && this.liveStatusCannotDelegate) {
+				// A completed or blocked task cannot delegate, so replaying this approval only ends in a
+				// refusal (formerly after an empty child was written). Drop it; the generic resume answers
+				// the unfinished new_task call as interrupted.
+				console.warn(
+					`[Task#resumeTaskFromHistory] dropping stale subtask handoff task=${this.taskId} action=${this.pendingAction.actionId}; a ${this.liveStatus} task cannot delegate`,
+				)
+				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
+			}
+
 			if (this.pendingAction?.kind === "create_subtask" && this.liveStatus === "interrupted") {
 				// Keep the saved approval/action and history intact. Replaying it here
 				// would dispose this chat before an interrupted parent can delegate.
@@ -3358,7 +3375,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				return await this.resumeInterruptedCreateSubtask(this.pendingAction)
 			}
 
-			if (this.pendingAction) {
+			// The clear above can adopt a newer stored subtask handoff; a task that cannot delegate never replays one.
+			if (
+				this.pendingAction &&
+				!(this.pendingAction.kind === "create_subtask" && this.liveStatusCannotDelegate)
+			) {
 				this.isInitialized = true
 				return await this.resumePendingTaskAction(this.pendingAction)
 			}

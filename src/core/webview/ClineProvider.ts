@@ -138,6 +138,7 @@ import {
 	TaskHistoryStore,
 	abandonDelegatedChild,
 	blockDelegatedChildProtocol,
+	canDelegateTask,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
@@ -4358,6 +4359,13 @@ export class ClineProvider
 		if (authoritativeParent.status === "interrupted") {
 			throw new Error(
 				`[delegateParentAndOpenChild] Parent ${parentTaskId} is interrupted; refusing to dispose it for delegation`,
+			)
+		}
+		// The parent commit would refuse a status that cannot become delegated (completed,
+		// blocked_protocol_error) only after the durable child write, leaving an empty orphan child.
+		if (authoritativeParent.status !== "delegated" && !canDelegateTask(authoritativeParent.status)) {
+			throw new Error(
+				`[delegateParentAndOpenChild] Parent ${parentTaskId} is ${authoritativeParent.status}; refusing to delegate before any write`,
 			)
 		}
 

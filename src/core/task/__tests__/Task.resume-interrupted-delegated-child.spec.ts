@@ -5,7 +5,7 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
-import type { ClineMessage, GlobalState, HistoryItem, ProviderSettings } from "@roo-code/types"
+import type { ClineMessage, GlobalState, HistoryItem, PendingTaskAction, ProviderSettings } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import type { Anthropic } from "@anthropic-ai/sdk"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
@@ -626,6 +626,239 @@ describe("Resuming an interrupted delegated child (nested orchestrator)", () => 
 			} finally {
 				ClineProvider["resumeDelegationLockWaitMs"] = bound
 			}
+		})
+	})
+
+	describe("saved subtask handoff on reopen", () => {
+		const createAction: PendingTaskAction = {
+			kind: "create_subtask",
+			actionId: "call_followup",
+			approvalText: JSON.stringify({ tool: "newTask", mode: "Code", content: "Follow up" }),
+			mode: "code",
+			message: "Follow up",
+			todos: [],
+		}
+
+		/** Field shape: the child finished into its parent, then feedback led it to call new_task. */
+		async function openCompletedOrchestrator(): Promise<Task> {
+			await provider.updateTaskHistory(
+				historyItem("root", { status: "completed", childIds: ["orch"], completedByChildId: "orch" }),
+			)
+			await provider.updateTaskHistory(
+				historyItem("orch", {
+					status: "completed",
+					parentTaskId: "root",
+					rootTaskId: "root",
+					pendingAction: createAction,
+				}),
+			)
+			const completed = await provider.getTaskMetadata("orch")
+			if (completed.kind !== "found") throw new Error("seed failed")
+			mockReadTaskMessages.mockResolvedValue([
+				{ ts: 1, type: "say", say: "completion_result", text: "TICKET_RESULT: FAILED" },
+				{ ts: 2, type: "ask", ask: "tool", text: createAction.approvalText },
+			])
+			mockReadApiMessages.mockResolvedValue([
+				{ role: "user", content: [{ type: "text", text: "Why is it blocked?" }], ts: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: createAction.actionId, name: "new_task", input: {} }],
+					ts: 2,
+				},
+			])
+			return new Task({
+				provider,
+				apiConfiguration: {
+					apiProvider: providerIdentifiers.anthropic,
+					apiModelId: "claude-3-5-sonnet-20241022",
+					apiKey: "test-api-key",
+				},
+				historyItem: completed.item,
+				initialStatus: completed.item.status,
+				startTask: false,
+			})
+		}
+
+		it("drops the handoff on open instead of replaying it, so an approval creates no empty child", async () => {
+			const task = await openCompletedOrchestrator()
+			// The field approvals answered the replayed handoff with Yes; here Yes meets the Resume ask.
+			const ask = answerAsks(task, { response: "yesButtonClicked" })
+			const delegate = vi.spyOn(provider, "delegateParentAndOpenChild")
+			const loop = vi.spyOn(access(task), "initiateTaskLoop").mockResolvedValue(undefined)
+
+			await access(task).resumeTaskFromHistory()
+
+			// The completed Resume ask is shown; the subtask approval is not replayed.
+			expect(ask.mock.calls.map(([type]) => type)).toEqual(["resume_completed_task"])
+			expect(delegate).not.toHaveBeenCalled()
+			expect(
+				provider.taskHistoryStore
+					.getAll()
+					.map((item) => item.id)
+					.sort(),
+			).toEqual(["orch", "root"])
+			const orch = await provider.getTaskMetadata("orch")
+			expect(orch).toMatchObject({ kind: "found", item: { status: "completed" } })
+			expect(orch.kind === "found" ? orch.item : undefined).not.toHaveProperty("pendingAction")
+			expect(await provider.getTaskMetadata("root")).toMatchObject({
+				kind: "found",
+				item: { status: "completed", childIds: ["orch"] },
+			})
+			// The unfinished call is answered as an error.
+			expect(loop).toHaveBeenCalledTimes(1)
+			expect(loop.mock.calls[0]?.[0]).toEqual([
+				expect.objectContaining({ type: "tool_result", tool_use_id: createAction.actionId, is_error: true }),
+			])
+		})
+
+		it("answers the unfinished call as an error before the user's feedback", async () => {
+			const task = await openCompletedOrchestrator()
+			answerAsks(task, { response: "messageResponse", text: "Assign the fixes" })
+			const loop = vi.spyOn(access(task), "initiateTaskLoop").mockResolvedValue(undefined)
+
+			await access(task).resumeTaskFromHistory()
+
+			expect(loop.mock.calls[0]?.[0]).toEqual([
+				expect.objectContaining({ type: "tool_result", tool_use_id: createAction.actionId, is_error: true }),
+				{ type: "text", text: "<user_message>\nAssign the fixes\n</user_message>" },
+			])
+		})
+
+		it("does not replay a newer stored handoff adopted when the clear finds a different action", async () => {
+			const task = await openCompletedOrchestrator()
+			const newer: PendingTaskAction = { ...createAction, actionId: "call_newer" }
+			// Another host rewrote the stored action between the open snapshot and the clear.
+			vi.spyOn(provider, "clearPendingTaskAction").mockResolvedValue(false)
+			const get = provider.taskHistoryStore.get.bind(provider.taskHistoryStore)
+			vi.spyOn(provider.taskHistoryStore, "get").mockImplementation((id) => {
+				const item = get(id)
+				return id === "orch" && item ? { ...item, pendingAction: newer } : item
+			})
+			const ask = answerAsks(task, { response: "yesButtonClicked" })
+			const delegate = vi.spyOn(provider, "delegateParentAndOpenChild")
+			vi.spyOn(access(task), "initiateTaskLoop").mockResolvedValue(undefined)
+
+			await access(task).resumeTaskFromHistory()
+
+			expect(task["pendingAction"]).toEqual(newer)
+			expect(ask.mock.calls.map(([type]) => type)).toEqual(["resume_completed_task"])
+			expect(delegate).not.toHaveBeenCalled()
+		})
+
+		it("drops a blocked task's handoff on open, keeping its blocked delegation intact", async () => {
+			// A blocked parent cannot delegate either; replaying the approval only ended in a refusal.
+			await provider.updateTaskHistory(
+				historyItem("orch", {
+					status: "blocked_protocol_error",
+					awaitingChildId: "lead",
+					delegatedToId: "lead",
+					protocolErrorChildId: "lead",
+					protocolErrorCode: "missing_attempt_completion",
+					childIds: ["lead"],
+					pendingAction: createAction,
+				}),
+			)
+			await provider.updateTaskHistory(
+				historyItem("lead", {
+					status: "blocked_protocol_error",
+					parentTaskId: "orch",
+					rootTaskId: "orch",
+					protocolErrorCode: "missing_attempt_completion",
+				}),
+			)
+			const blocked = await provider.getTaskMetadata("orch")
+			if (blocked.kind !== "found") throw new Error("seed failed")
+			mockReadTaskMessages.mockResolvedValue([
+				{ ts: 1, type: "ask", ask: "tool", text: createAction.approvalText },
+			])
+			mockReadApiMessages.mockResolvedValue([
+				{ role: "user", content: [{ type: "text", text: "Continue" }], ts: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: createAction.actionId, name: "new_task", input: {} }],
+					ts: 2,
+				},
+			])
+			const task = new Task({
+				provider,
+				apiConfiguration: {
+					apiProvider: providerIdentifiers.anthropic,
+					apiModelId: "claude-3-5-sonnet-20241022",
+					apiKey: "test-api-key",
+				},
+				historyItem: blocked.item,
+				initialStatus: blocked.item.status,
+				startTask: false,
+			})
+			const ask = answerAsks(task, { response: "yesButtonClicked" })
+			const delegate = vi.spyOn(provider, "delegateParentAndOpenChild")
+			const loop = vi.spyOn(access(task), "initiateTaskLoop").mockResolvedValue(undefined)
+
+			await access(task).resumeTaskFromHistory()
+
+			expect(ask.mock.calls.map(([type]) => type)).toEqual(["resume_task"])
+			expect(delegate).not.toHaveBeenCalled()
+			expect(
+				provider.taskHistoryStore
+					.getAll()
+					.map((item) => item.id)
+					.sort(),
+			).toEqual(["lead", "orch"])
+			const orch = await provider.getTaskMetadata("orch")
+			expect(orch).toMatchObject({
+				kind: "found",
+				item: { status: "blocked_protocol_error", awaitingChildId: "lead", protocolErrorChildId: "lead" },
+			})
+			expect(orch.kind === "found" ? orch.item : undefined).not.toHaveProperty("pendingAction")
+			expect(loop.mock.calls[0]?.[0]).toEqual([
+				expect.objectContaining({ type: "tool_result", tool_use_id: createAction.actionId, is_error: true }),
+			])
+		})
+
+		it("still replays a delegated parent's re-delegation once its awaited child is interrupted", async () => {
+			// Delegated is excluded from the drop: re-delegation depends on the awaited child, not the parent.
+			const root = historyItem("root", {
+				status: "delegated",
+				awaitingChildId: "orch",
+				delegatedToId: "orch",
+				childIds: ["orch"],
+			})
+			const orch = historyItem("orch", { status: "active", parentTaskId: "root", rootTaskId: "root" })
+			await provider.updateTaskHistory(root)
+			await provider.updateTaskHistory(orch)
+			await provider.updateTaskHistory(interruptDelegatedChild(root, orch))
+			await provider.updateTaskHistory({ ...root, pendingAction: createAction })
+			const delegated = await provider.getTaskMetadata("root")
+			if (delegated.kind !== "found") throw new Error("seed failed")
+			mockReadTaskMessages.mockResolvedValue([
+				{ ts: 1, type: "ask", ask: "tool", text: createAction.approvalText },
+			])
+			mockReadApiMessages.mockResolvedValue([
+				{ role: "user", content: [{ type: "text", text: "Retry the work" }], ts: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: createAction.actionId, name: "new_task", input: {} }],
+					ts: 2,
+				},
+			])
+			const task = new Task({
+				provider,
+				apiConfiguration: {
+					apiProvider: providerIdentifiers.anthropic,
+					apiModelId: "claude-3-5-sonnet-20241022",
+					apiKey: "test-api-key",
+				},
+				historyItem: delegated.item,
+				initialStatus: delegated.item.status,
+				startTask: false,
+			})
+			// Deny the replayed approval so the test observes the replay without starting a child.
+			const ask = answerAsks(task, { response: "noButtonClicked" })
+			vi.spyOn(access(task), "initiateTaskLoop").mockResolvedValue(undefined)
+
+			await access(task).resumeTaskFromHistory()
+
+			expect(ask).toHaveBeenCalledExactlyOnceWith("tool", createAction.approvalText, false)
 		})
 	})
 })

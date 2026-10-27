@@ -5,11 +5,14 @@ import type { HistoryItem } from "../packages/types/src/history"
 import {
 	abandonDelegatedChild,
 	blockDelegatedChildProtocol,
+	canDelegateTask,
 	completeDelegatedChild,
 	delegateTaskToChild,
+	type HistoryItemStatus,
 	interruptDelegatedChild,
 	LifecycleTransitionError,
 	resumeInterruptedTask,
+	VALID_TASK_STATUS_TRANSITIONS,
 } from "../src/core/task-persistence/taskLifecycle"
 
 const taskIds = ["parent", "child-a", "child-b"] as const
@@ -99,9 +102,8 @@ function transitions(state: ModelState): Transition[] {
 		for (const childId of taskIds) {
 			if (childId === parentId || state[childId]) continue
 			const awaitedStatus = parent.awaitingChildId ? state[parent.awaitingChildId as TaskId]?.status : undefined
-			if (parent.status !== "active" && !(parent.status === "delegated" && awaitedStatus === "interrupted")) {
-				continue
-			}
+			// The provider's pre-write refusal uses the same predicate.
+			if (!canDelegateTask(parent.status, awaitedStatus)) continue
 			const delegated = delegateTaskToChild(parent, childId, awaitedStatus)
 			result.push({
 				name: `delegate(${parentId}, ${childId})`,
@@ -336,6 +338,25 @@ function runRepresentativeScenarios(): void {
 	const parent = task("parent")
 	const childA = task("child-a", "parent")
 	const delegated = delegateTaskToChild(parent, childA.id)
+
+	// The provider refuses before its durable child write exactly when the parent commit would throw.
+	const statuses = [undefined, ...Object.keys(VALID_TASK_STATUS_TRANSITIONS)] as (HistoryItemStatus | undefined)[]
+	for (const status of statuses) {
+		for (const awaitedStatus of statuses) {
+			const candidate = { ...parent, status, ...(status === "delegated" && { awaitingChildId: childA.id }) }
+			let accepted = true
+			try {
+				delegateTaskToChild(candidate, "child-b", awaitedStatus)
+			} catch {
+				accepted = false
+			}
+			assert.equal(
+				canDelegateTask(status, awaitedStatus),
+				accepted,
+				`canDelegateTask(${status}, ${awaitedStatus})`,
+			)
+		}
+	}
 
 	assert.throws(() => delegateTaskToChild(delegated, "child-b", "active"), /not interrupted/)
 
