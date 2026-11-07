@@ -74,8 +74,14 @@ export class DirectoryScanner implements IDirectoryScanner {
 		signal?: AbortSignal,
 	): Promise<{ stats: { processed: number; skipped: number }; totalBlockCount: number }> {
 		const directoryPath = directory
-		// Capture workspace context at scan start
-		const scanWorkspace = getWorkspacePathForContext(directoryPath)
+		// Capture workspace context at scan start. VS Code cannot map a real path to a folder
+		// opened through a symlink and then falls back to another folder; stored paths must
+		// stay relative to a root that contains the scanned directory.
+		const contextWorkspace = getWorkspacePathForContext(directoryPath)
+		const contextRelative = path.relative(contextWorkspace, directoryPath)
+		const contextContainsScan =
+			!contextWorkspace || (!contextRelative.startsWith("..") && !path.isAbsolute(contextRelative))
+		const scanWorkspace = contextContainsScan ? contextWorkspace : directoryPath
 
 		// Get all files recursively (handles .gitignore automatically)
 		const [allPaths, _] = await listFiles(directoryPath, true, MAX_LIST_FILES_LIMIT_CODE_INDEX)

@@ -13,6 +13,7 @@ import { RooIgnoreController } from "../../core/ignore/RooIgnoreController"
 import fs from "fs/promises"
 import ignore from "ignore"
 import path from "path"
+import { resolveIndexRoot } from "./shared/get-relative-path"
 import { t } from "../../i18n"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
@@ -31,12 +32,15 @@ export class CodeIndexManager {
 	private _isRecoveringFromError = false
 
 	private readonly workspacePath: string
+	/** Canonical root that identifies this workspace's collection, cache and point IDs. */
+	private readonly indexRoot: string
 	private readonly _folderUri: vscode.Uri
 	private readonly context: vscode.ExtensionContext
 
 	/** @internal — construct only via {@link CodeIndexManagerRegistry} */
 	public constructor(workspacePath: string, folderUri: vscode.Uri, context: vscode.ExtensionContext) {
 		this.workspacePath = workspacePath
+		this.indexRoot = resolveIndexRoot(workspacePath)
 		this._folderUri = folderUri
 		this.context = context
 		this._stateManager = new CodeIndexStateManager()
@@ -156,7 +160,7 @@ export class CodeIndexManager {
 
 		// 5. CacheManager Initialization
 		if (!this._cacheManager) {
-			this._cacheManager = new CacheManager(this.context, this.workspacePath)
+			this._cacheManager = new CacheManager(this.context, this.indexRoot)
 			await this._cacheManager.initialize()
 		}
 
@@ -371,12 +375,13 @@ export class CodeIndexManager {
 		// (Re)Initialize service factory for external providers
 		this._serviceFactory = new CodeIndexServiceFactory(
 			this._configManager!,
-			this.workspacePath,
+			this.indexRoot,
 			this._cacheManager!,
+			this.workspacePath,
 		)
 
 		const ignoreInstance = ignore()
-		const workspacePath = this.workspacePath
+		const workspacePath = this.indexRoot
 
 		if (!workspacePath) {
 			this._stateManager.setSystemState("Standby", "")
@@ -423,7 +428,7 @@ export class CodeIndexManager {
 		this._orchestrator = new CodeIndexOrchestrator(
 			this._configManager!,
 			this._stateManager,
-			this.workspacePath,
+			this.indexRoot,
 			this._cacheManager!,
 			vectorStore,
 			scanner,
@@ -466,7 +471,7 @@ export class CodeIndexManager {
 				try {
 					// Ensure cacheManager is initialized before recreating services
 					if (!this._cacheManager) {
-						this._cacheManager = new CacheManager(this.context, this.workspacePath)
+						this._cacheManager = new CacheManager(this.context, this.indexRoot)
 						await this._cacheManager.initialize()
 					}
 

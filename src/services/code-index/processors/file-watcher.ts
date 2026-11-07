@@ -21,7 +21,7 @@ import {
 } from "../interfaces"
 import { codeParser } from "./parser"
 import { CacheManager } from "../cache-manager"
-import { generateNormalizedAbsolutePath, generateRelativeFilePath } from "../shared/get-relative-path"
+import { generateNormalizedAbsolutePath, generateRelativeFilePath, toIndexPath } from "../shared/get-relative-path"
 import { isPathInIgnoredDirectory } from "../../glob/ignore-utils"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
@@ -71,6 +71,7 @@ export class FileWatcher implements IFileWatcher {
 	 * @param embedder Optional embedder
 	 * @param vectorStore Optional vector store
 	 * @param cacheManager Cache manager
+	 * @param watchRoot Workspace root as opened, when it differs from the canonical workspacePath
 	 */
 	constructor(
 		private workspacePath: string,
@@ -81,6 +82,7 @@ export class FileWatcher implements IFileWatcher {
 		ignoreInstance?: Ignore,
 		ignoreController?: RooIgnoreController,
 		batchSegmentThreshold?: number,
+		private readonly watchRoot: string = workspacePath,
 	) {
 		this.ignoreController = ignoreController || new RooIgnoreController(workspacePath)
 		if (ignoreInstance) {
@@ -107,8 +109,9 @@ export class FileWatcher implements IFileWatcher {
 	 */
 	async initialize(): Promise<void> {
 		// Create file watcher
+		// Watch the folder as opened; events are mapped to the canonical root in toIndexUri
 		const filePattern = new vscode.RelativePattern(
-			this.workspacePath,
+			this.watchRoot,
 			`**/*{${scannerExtensions.map((e) => e.substring(1)).join(",")}}`,
 		)
 		this.fileWatcher = vscode.workspace.createFileSystemWatcher(filePattern)
@@ -137,7 +140,8 @@ export class FileWatcher implements IFileWatcher {
 	 * Handles file creation events
 	 * @param uri URI of the created file
 	 */
-	private async handleFileCreated(uri: vscode.Uri): Promise<void> {
+	private async handleFileCreated(eventUri: vscode.Uri): Promise<void> {
+		const uri = this.toIndexUri(eventUri)
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "create" })
 		this.scheduleBatchProcessing()
 	}
@@ -146,7 +150,8 @@ export class FileWatcher implements IFileWatcher {
 	 * Handles file change events
 	 * @param uri URI of the changed file
 	 */
-	private async handleFileChanged(uri: vscode.Uri): Promise<void> {
+	private async handleFileChanged(eventUri: vscode.Uri): Promise<void> {
+		const uri = this.toIndexUri(eventUri)
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "change" })
 		this.scheduleBatchProcessing()
 	}
@@ -155,9 +160,20 @@ export class FileWatcher implements IFileWatcher {
 	 * Handles file deletion events
 	 * @param uri URI of the deleted file
 	 */
-	private async handleFileDeleted(uri: vscode.Uri): Promise<void> {
+	private async handleFileDeleted(eventUri: vscode.Uri): Promise<void> {
+		const uri = this.toIndexUri(eventUri)
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "delete" })
 		this.scheduleBatchProcessing()
+	}
+
+	/**
+	 * Maps an event URI under the watched root to the same file under the canonical root,
+	 * so cache keys and point IDs do not depend on which symlink opened the workspace.
+	 * @param uri URI reported by the file system watcher
+	 */
+	private toIndexUri(uri: vscode.Uri): vscode.Uri {
+		const indexPath = toIndexPath(uri.fsPath, this.watchRoot, this.workspacePath)
+		return indexPath === uri.fsPath ? uri : vscode.Uri.file(indexPath)
 	}
 
 	/**

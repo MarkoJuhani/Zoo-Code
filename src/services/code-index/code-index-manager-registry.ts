@@ -1,5 +1,6 @@
 import * as vscode from "vscode"
 import { CodeIndexManager } from "./manager"
+import { resolveIndexRoot } from "./shared/get-relative-path"
 
 /** Resolves workspaces and owns their cached CodeIndexManager instances. */
 export class CodeIndexManagerRegistry {
@@ -12,7 +13,9 @@ export class CodeIndexManagerRegistry {
 			return undefined
 		}
 
-		const existing = this.instances.get(resolvedPath)
+		// One manager per real folder, so symlinked paths never index it twice
+		const instanceKey = resolveIndexRoot(resolvedPath)
+		const existing = this.instances.get(instanceKey)
 		if (existing) {
 			return existing
 		}
@@ -20,7 +23,7 @@ export class CodeIndexManagerRegistry {
 		// Preserve real workspace URIs, including remote schemes and authorities.
 		const folderUri = folder?.uri ?? vscode.Uri.file(resolvedPath)
 		const manager = new CodeIndexManager(resolvedPath, folderUri, context)
-		this.instances.set(resolvedPath, manager)
+		this.instances.set(instanceKey, manager)
 		return manager
 	}
 

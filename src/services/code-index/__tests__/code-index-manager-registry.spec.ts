@@ -1,3 +1,6 @@
+import fs from "fs"
+import os from "os"
+import path from "path"
 import * as vscode from "vscode"
 import { makeExtensionContext, makeTextDocument, makeTextEditor, makeUri } from "../../../test-utils/vscode"
 import { CodeIndexManager } from "../manager"
@@ -105,6 +108,22 @@ describe("CodeIndexManagerRegistry", () => {
 		expect(b).not.toBe(a)
 		expect(CodeIndexManager).toHaveBeenCalledTimes(2)
 		expect(CodeIndexManagerRegistry.getAllInstances()).toEqual([a, b])
+	})
+
+	it("reuses one manager for a folder opened through a symlink", () => {
+		const tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "registry-")))
+		try {
+			const realRoot = path.join(tempRoot, "real")
+			const linkRoot = path.join(tempRoot, "link")
+			fs.mkdirSync(realRoot)
+			fs.symlinkSync(realRoot, linkRoot, "junction")
+
+			const real = CodeIndexManagerRegistry.getOrCreate(context, realRoot)
+			expect(CodeIndexManagerRegistry.getOrCreate(context, linkRoot)).toBe(real)
+			expect(CodeIndexManager).toHaveBeenCalledTimes(1)
+		} finally {
+			fs.rmSync(tempRoot, { recursive: true, force: true })
+		}
 	})
 
 	it("returns a snapshot that cannot mutate the cache", () => {

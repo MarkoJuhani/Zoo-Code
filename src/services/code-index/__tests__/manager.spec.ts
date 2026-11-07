@@ -1,10 +1,12 @@
 import { ContextProxy } from "../../../core/config/ContextProxy"
-import { makeExtensionContext } from "../../../test-utils/vscode"
+import { makeExtensionContext, makeUri } from "../../../test-utils/vscode"
 import { CodeIndexManager } from "../manager"
 import { CodeIndexManagerRegistry } from "../code-index-manager-registry"
 import { CodeIndexServiceFactory } from "../service-factory"
 import type { MockedClass } from "vitest"
 import * as path from "path"
+import fs from "fs"
+import os from "os"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 // Helper: create a mock vscode.Uri from an fsPath
@@ -896,5 +898,24 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockOrchestrator.stopIndexing).toHaveBeenCalled()
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Code indexing is disabled")
 		})
+	})
+})
+
+describe("CodeIndexManager - symlinked workspace", () => {
+	it("identifies the index by the real path but reports the folder as opened", () => {
+		const tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "manager-")))
+		try {
+			const realRoot = path.join(tempRoot, "real")
+			const linkRoot = path.join(tempRoot, "link")
+			fs.mkdirSync(realRoot)
+			fs.symlinkSync(realRoot, linkRoot, "junction")
+
+			const manager = new CodeIndexManager(linkRoot, makeUri(linkRoot), makeExtensionContext())
+
+			expect(manager["indexRoot"]).toBe(realRoot)
+			expect(manager.getCurrentStatus().workspacePath).toBe(linkRoot)
+		} finally {
+			fs.rmSync(tempRoot, { recursive: true, force: true })
+		}
 	})
 })

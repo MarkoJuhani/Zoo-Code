@@ -1,7 +1,14 @@
 // npx vitest services/code-index/processors/__tests__/scanner.spec.ts
 
+import fs from "fs"
+import os from "os"
+import path from "path"
+
 import { DirectoryScanner } from "../scanner"
 import { stat } from "fs/promises"
+import { getWorkspacePathForContext } from "../../../../utils/path"
+import { v5 as uuidv5 } from "uuid"
+import { QDRANT_CODE_BLOCK_NAMESPACE } from "../../constants"
 
 // Mock TelemetryService
 vi.mock("../../../../../packages/telemetry/src/TelemetryService", () => ({
@@ -60,6 +67,10 @@ vi.mock("vscode", () => ({
 }))
 
 vi.mock("../../../../core/ignore/RooIgnoreController")
+vi.mock("../../../../utils/path", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../../utils/path")>()
+	return { ...actual, getWorkspacePathForContext: vi.fn(actual.getWorkspacePathForContext) }
+})
 vi.mock("ignore")
 
 // Override the Jest-based mock with a vitest-compatible version
@@ -488,6 +499,73 @@ describe("DirectoryScanner", () => {
 
 			// Deleted file cleanup should not have run
 			expect(mockVectorStore.deletePointsByFilePath).not.toHaveBeenCalled()
+		})
+
+		it("stores paths relative to the real root when the workspace was opened through a symlink", async () => {
+			const tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "scanner-")))
+			try {
+				const realRoot = path.join(tempRoot, "real")
+				const linkRoot = path.join(tempRoot, "link")
+				fs.mkdirSync(realRoot)
+				fs.symlinkSync(realRoot, linkRoot, "junction")
+				const filePath = path.join(realRoot, "src", "file1.js")
+
+				// VS Code reports the folder as opened, while the manager scans its real path
+				vi.mocked(getWorkspacePathForContext).mockReturnValueOnce(linkRoot)
+				const { listFiles } = await import("../../../glob/list-files")
+				vi.mocked(listFiles).mockResolvedValueOnce([[filePath], false])
+				mockCodeParser.parseFile.mockResolvedValue([
+					{
+						file_path: filePath,
+						content: "test content",
+						start_line: 1,
+						end_line: 5,
+						identifier: "test",
+						type: "function",
+						fileHash: "hash",
+						segmentHash: "symlink-segment",
+					},
+				])
+
+				await scanner.scanDirectory(realRoot)
+
+				expect(mockVectorStore.upsertPoints).toHaveBeenCalledWith([
+					expect.objectContaining({
+						id: uuidv5("symlink-segment", QDRANT_CODE_BLOCK_NAMESPACE),
+						payload: expect.objectContaining({ filePath: path.join("src", "file1.js") }),
+					}),
+				])
+				expect(mockCacheManager.updateHash).toHaveBeenCalledWith(filePath, expect.any(String))
+			} finally {
+				fs.rmSync(tempRoot, { recursive: true, force: true })
+			}
+		})
+
+		it("stores paths relative to the scanned folder when another workspace folder is reported", async () => {
+			// Multi-root window: the active editor's folder is not the folder being indexed
+			vi.mocked(getWorkspacePathForContext).mockReturnValueOnce("/workspace/a")
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValueOnce([["/workspace/b/src/file1.js"], false])
+			mockCodeParser.parseFile.mockResolvedValue([
+				{
+					file_path: "/workspace/b/src/file1.js",
+					content: "test content",
+					start_line: 1,
+					end_line: 5,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: "multi-root-segment",
+				},
+			])
+
+			await scanner.scanDirectory("/workspace/b")
+
+			expect(mockVectorStore.upsertPoints).toHaveBeenCalledWith([
+				expect.objectContaining({
+					payload: expect.objectContaining({ filePath: path.join("src", "file1.js") }),
+				}),
+			])
 		})
 	})
 })

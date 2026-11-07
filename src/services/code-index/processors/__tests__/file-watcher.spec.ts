@@ -1,8 +1,10 @@
 // npx vitest services/code-index/processors/__tests__/file-watcher.spec.ts
 
 import * as vscode from "vscode"
+import { v5 as uuidv5 } from "uuid"
 
 import { FileWatcher } from "../file-watcher"
+import { QDRANT_CODE_BLOCK_NAMESPACE } from "../../constants"
 
 import { clearAllMocks } from "../../../../test-utils/reset"
 
@@ -322,6 +324,41 @@ describe("FileWatcher", () => {
 			expect(skippedPaths).toContain("/mock/workspace/src/.hidden/components/Button.tsx")
 			expect(skippedPaths).toContain("/mock/workspace/.hidden/src/components/Button.tsx")
 			expect(skippedPaths).toContain("/mock/workspace/src/components/.hidden/Button.tsx")
+		})
+	})
+
+	describe("symlinked workspace", () => {
+		it("watches the opened root but indexes events under the canonical root", async () => {
+			fileWatcher.dispose()
+			fileWatcher = new FileWatcher(
+				"/real/workspace",
+				mockContext,
+				mockCacheManager,
+				mockEmbedder,
+				mockVectorStore,
+				mockIgnoreInstance,
+				undefined,
+				undefined,
+				"/link/workspace",
+			)
+			await fileWatcher.initialize()
+			expect(vscode.RelativePattern).toHaveBeenCalledWith("/link/workspace", expect.any(String))
+
+			const batchPromise = waitForNextBatch()
+			await mockOnDidCreate({ fsPath: "/link/workspace/src/file.ts" })
+			await flushBatch()
+			const batchSummary = await batchPromise
+
+			expect(batchSummary.processedFiles).toEqual([
+				expect.objectContaining({ path: "/real/workspace/src/file.ts", status: "success" }),
+			])
+			expect(mockCacheManager.updateHash).toHaveBeenCalledWith("/real/workspace/src/file.ts", expect.any(String))
+			expect(mockVectorStore.upsertPoints).toHaveBeenCalledWith([
+				expect.objectContaining({
+					id: uuidv5("/real/workspace/src/file.ts:1", QDRANT_CODE_BLOCK_NAMESPACE),
+					payload: expect.objectContaining({ filePath: "src/file.ts" }),
+				}),
+			])
 		})
 	})
 

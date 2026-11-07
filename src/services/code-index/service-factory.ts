@@ -36,6 +36,7 @@ export class CodeIndexServiceFactory {
 		private readonly configManager: CodeIndexConfigManager,
 		private readonly workspacePath: string,
 		private readonly cacheManager: CacheManager,
+		private readonly watchRoot: string = workspacePath,
 	) {}
 
 	/**
@@ -243,6 +244,7 @@ export class CodeIndexServiceFactory {
 			ignoreInstance,
 			rooIgnoreController,
 			batchSize,
+			this.watchRoot,
 		)
 	}
 
