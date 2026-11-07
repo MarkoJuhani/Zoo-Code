@@ -485,6 +485,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/** At most one pending deferred usage save; it is never rescheduled by its own failure. */
 	private usageSaveRetryTimer?: ReturnType<typeof setTimeout>
 	private usageSaveRetrySkippedAt = 0
+	private usageSaveRetryInFlight?: Promise<void>
 	/** Settles after every background usage save started so far; never rejects. */
 	private usagePersistence: Promise<void> = Promise.resolve()
 	private diffReversionPromise: Promise<void> = Promise.resolve()
@@ -1899,10 +1900,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (this.usageSaveRetryTimer) return // The pending retry saves the whole current message list.
 		const skippedAt = this.uiMessagesSnapshotSeq
 		this.usageSaveRetrySkippedAt = skippedAt
-		this.usageSaveRetryTimer = setTimeout(() => {
-			this.usageSaveRetryTimer = undefined
-			void this.retrySkippedUsageSave(skippedAt)
-		}, USAGE_SAVE_RETRY_DELAY_MS)
+		this.usageSaveRetryTimer = setTimeout(() => void this.flushUsageSaveRetry(), USAGE_SAVE_RETRY_DELAY_MS)
 	}
 
 	/** Chains a background usage save so `waitForUsagePersistence()` covers it. */
@@ -1921,23 +1919,29 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Waits for the background usage saves started so far. Those saves hold this task's persistence
 	 * fence, so a zero-wait handoff must await this outside every scope. A pending deferred retry is
-	 * run now instead of after its delay. Saves started after this call are not awaited, so the wait
-	 * cannot be starved. Never rejects: a failed usage save is logged only.
+	 * run now instead of after its delay. Other saves started after this call are not awaited, so the
+	 * wait cannot be starved. Never rejects: a failed usage save is logged only.
 	 */
 	public async waitForUsagePersistence(): Promise<void> {
 		void this.flushUsageSaveRetry()
 		await this.usagePersistence
-		// A contended save in that snapshot arms its retry only as it settles. Run and await just that
-		// retry; a retry never reschedules itself.
+		// A contended save in that snapshot arms the retry only as it settles, and a pending timer may
+		// have fired meanwhile. Run a pending retry now and await the one retry running, if any. A retry
+		// never reschedules itself, so this is bounded.
 		await this.flushUsageSaveRetry()
 	}
 
-	/** Runs a pending deferred usage retry now; resolves when it settles (immediately if none). */
+	/** Runs a pending deferred usage retry now; resolves when the running retry (if any) settles. */
 	private flushUsageSaveRetry(): Promise<void> {
-		if (!this.usageSaveRetryTimer) return Promise.resolve()
-		clearTimeout(this.usageSaveRetryTimer)
-		this.usageSaveRetryTimer = undefined
-		return this.retrySkippedUsageSave(this.usageSaveRetrySkippedAt)
+		if (this.usageSaveRetryTimer) {
+			clearTimeout(this.usageSaveRetryTimer)
+			this.usageSaveRetryTimer = undefined
+			const retry = this.retrySkippedUsageSave(this.usageSaveRetrySkippedAt).finally(() => {
+				if (this.usageSaveRetryInFlight === retry) this.usageSaveRetryInFlight = undefined
+			})
+			this.usageSaveRetryInFlight = retry
+		}
+		return this.usageSaveRetryInFlight ?? Promise.resolve()
 	}
 
 	private async retrySkippedUsageSave(skippedAt: number): Promise<void> {
