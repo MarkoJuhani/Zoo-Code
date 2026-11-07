@@ -21,6 +21,27 @@ export type ParentHandoffFenceLockDiagnostic =
  */
 export type ParentHandoffFenceUnavailableReason = "timeout" | "unrecoverable" | "filesystem"
 
+/**
+ * Who held the lock when a bounded acquire timed out. Diagnostic only: never a path, hostname, pid or
+ * owner token, and never used for an ownership decision.
+ */
+export interface ParentHandoffFenceHolderSnapshot {
+	/** Operation label the holder recorded, or "unlabeled" (older builds and unlabeled callers). */
+	label: string
+	generation: number
+	/** First 16 hex digits of sha256(ownerToken); matches the delegation diagnostics guard field. */
+	ownerCorrelation: string
+	/** How long the holder had held the lock when read; null when not recorded. */
+	heldMs: number | null
+	/** True when the holder recorded this extension host's pid and hostname. */
+	sameProcess: boolean
+}
+
+/** Operation labels are short identifiers such as `task.usage_drain`; anything else is not recorded. */
+export function isFenceOperationLabel(value: unknown): value is string {
+	return typeof value === "string" && /^[a-z0-9_.]{1,64}$/.test(value)
+}
+
 export class ParentHandoffFenceUnavailableError extends Error {
 	constructor(
 		parentTaskId: string,
@@ -28,12 +49,26 @@ export class ParentHandoffFenceUnavailableError extends Error {
 		public readonly filesystemCode?: string,
 		/** Sanitized fence-evidence diagnostic (never a path), e.g. `INVALID_GENERATION`. */
 		public readonly diagnostic?: "INVALID_GENERATION" | ParentHandoffFenceLockDiagnostic,
+		/** Set only for `timeout` when the lock held a complete owner record. Not part of `message`. */
+		public readonly holder?: ParentHandoffFenceHolderSnapshot,
 	) {
 		super(
 			`Parent handoff fence is unavailable for ${parentTaskId} (${reason}${filesystemCode ? `: ${filesystemCode}` : ""}${diagnostic ? `; ${diagnostic}` : ""})`,
 		)
 		this.name = "ParentHandoffFenceUnavailableError"
 	}
+}
+
+/** The fence-unavailable error inside `originalError` wrappers, if any; diagnostics only. */
+export function findParentHandoffFenceUnavailableError(error: unknown): ParentHandoffFenceUnavailableError | undefined {
+	let current = error
+	for (let depth = 0; depth < 8 && current && typeof current === "object"; depth++) {
+		if (current instanceof ParentHandoffFenceUnavailableError) return current
+		const next: unknown = "originalError" in current ? current.originalError : undefined
+		if (next === current) return undefined
+		current = next
+	}
+	return undefined
 }
 
 class InvalidGenerationEvidence extends Error {
@@ -75,6 +110,8 @@ interface PersistedFenceOwner {
 	acquiredAt: number
 	/** Absent in legacy records; such owners are never taken over. */
 	holder?: FenceHolder
+	/** Diagnostic operation label; absent in older records and for unlabeled callers. */
+	label?: string
 }
 
 interface PersistedTakeoverClaim {
@@ -127,6 +164,8 @@ export interface ParentHandoffFenceLease {
 export interface AcquireParentHandoffFenceOptions {
 	timeoutMs?: number
 	retryIntervalMs?: number
+	/** Recorded in owner.json so a refused contender can name this holder. Invalid labels are dropped. */
+	label?: string
 }
 
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -368,7 +407,9 @@ export class ParentHandoffFence {
 		} catch (error) {
 			throw new ParentHandoffFenceUnavailableError(parentTaskId, "filesystem", errorCode(error))
 		}
-		const deadline = Date.now() + timeoutMs
+		// Monotonic: a wall-clock step (e.g. a WSL2 time resync) must not stretch or cut the wait short,
+		// or misclassify contention as `unrecoverable`.
+		const deadline = performance.now() + timeoutMs
 		const unrecoverableAfterMs = Math.max(UNRECOVERABLE_MIN_OBSERVATION_MS, timeoutMs / 2)
 		let takeovers = 0
 		// Continuous observation of one unusable lock instance; reset by any change.
@@ -391,7 +432,7 @@ export class ParentHandoffFence {
 				}
 				if (timeoutMs >= unrecoverableAfterMs) {
 					const observation = await this.observeLock(parentTaskId, lockDirectory)
-					const observedAt = Date.now()
+					const observedAt = performance.now()
 					if (!observation?.diagnostic) unusable = undefined
 					else if (unusable?.identity !== observation.identity)
 						unusable = {
@@ -400,17 +441,23 @@ export class ParentHandoffFence {
 							diagnostic: observation.diagnostic,
 						}
 				}
-				if (Date.now() >= deadline) {
-					if (unusable && Date.now() - unusable.since >= unrecoverableAfterMs)
+				if (performance.now() >= deadline) {
+					if (unusable && performance.now() - unusable.since >= unrecoverableAfterMs)
 						throw new ParentHandoffFenceUnavailableError(
 							parentTaskId,
 							"unrecoverable",
 							undefined,
 							unusable.diagnostic,
 						)
-					throw new ParentHandoffFenceUnavailableError(parentTaskId, "timeout")
+					throw new ParentHandoffFenceUnavailableError(
+						parentTaskId,
+						"timeout",
+						undefined,
+						undefined,
+						await this.holderSnapshot(parentTaskId, ownerPath),
+					)
 				}
-				await delay(Math.min(retryIntervalMs, Math.max(1, deadline - Date.now())))
+				await delay(Math.min(retryIntervalMs, Math.max(1, deadline - performance.now())))
 			}
 		}
 
@@ -440,6 +487,7 @@ export class ParentHandoffFence {
 				generation,
 				acquiredAt: Date.now(),
 				...(holder ? { holder } : {}),
+				...(isFenceOperationLabel(options.label) ? { label: options.label } : {}),
 			}
 			await durableWrite(ownerPath, JSON.stringify(owner))
 
@@ -511,6 +559,30 @@ export class ParentHandoffFence {
 				errorCode(error),
 				error instanceof InvalidGenerationEvidence ? "INVALID_GENERATION" : undefined,
 			)
+		}
+	}
+
+	/** Failure path only: one read of the current owner record for diagnostics. Never throws. */
+	private async holderSnapshot(
+		parentTaskId: string,
+		ownerPath: string,
+	): Promise<ParentHandoffFenceHolderSnapshot | undefined> {
+		try {
+			const owner = await readJson(ownerPath)
+			if (!isCompleteOwner(owner, parentTaskId)) return undefined
+			const self = currentHolder()
+			return {
+				label: isFenceOperationLabel(owner.label) ? owner.label : "unlabeled",
+				generation: owner.generation,
+				ownerCorrelation: crypto.createHash("sha256").update(owner.ownerToken).digest("hex").slice(0, 16),
+				heldMs:
+					typeof owner.acquiredAt === "number" && Number.isFinite(owner.acquiredAt)
+						? Math.min(86_400_000, Math.max(0, Date.now() - owner.acquiredAt))
+						: null,
+				sameProcess: !!self && owner.holder.pid === self.pid && owner.holder.hostname === self.hostname,
+			}
+		} catch {
+			return undefined
 		}
 	}
 

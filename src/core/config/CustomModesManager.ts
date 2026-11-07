@@ -52,6 +52,8 @@ export class CustomModesManager {
 	private writeQueue: Array<() => Promise<void>> = []
 	private cachedModes: ModeConfig[] | null = null
 	private cachedAt: number = 0
+	/** Bumped by clearCache(); a read that started before a clear must not repopulate stale modes. */
+	private cacheGeneration = 0
 
 	constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -361,6 +363,8 @@ export class CustomModesManager {
 			return this.cachedModes
 		}
 
+		const generation = this.cacheGeneration
+
 		// Get modes from settings file.
 		const settingsPath = await this.getCustomModesFilePath()
 		const settingsModes = await this.loadModesFromFile(settingsPath)
@@ -393,10 +397,18 @@ export class CustomModesManager {
 				.map((mode) => ({ ...mode, source: "global" as const })),
 		]
 
-		await this.context.globalState.update("customModes", mergedModes)
+		// A watcher cleared the cache while these files were read; its newer result wins.
+		if (generation !== this.cacheGeneration) return mergedModes
+
+		// Not awaited: the in-memory value updates at once, but the returned promise waits for the
+		// workbench renderer to persist it, which a hidden window throttles to one wake-up a minute.
+		Promise.resolve(this.context.globalState.update("customModes", mergedModes)).catch((error: unknown) =>
+			console.error("[CustomModesManager] Failed to mirror custom modes to global state:", error),
+		)
 
 		this.cachedModes = mergedModes
-		this.cachedAt = now
+		// Measured from completion, so a slow file read is not already expired when it returns.
+		this.cachedAt = Date.now()
 
 		return mergedModes
 	}
@@ -1003,6 +1015,7 @@ export class CustomModesManager {
 	private clearCache(): void {
 		this.cachedModes = null
 		this.cachedAt = 0
+		this.cacheGeneration++
 	}
 
 	dispose(): void {

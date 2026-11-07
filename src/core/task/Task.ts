@@ -15,6 +15,13 @@ import {
 } from "../task-persistence/taskLifecycle"
 import { AskIgnoredError } from "./AskIgnoredError"
 import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
+import { StreamStallMonitor } from "./StreamStallMonitor"
+import { RequestPrepTimeline } from "./RequestPrepTimeline"
+import {
+	RunawayToolArgumentsError,
+	RunawayToolArgumentsGuard,
+	runawayToolArgumentsNote,
+} from "./RunawayToolArgumentsGuard"
 
 import { Anthropic } from "@anthropic-ai/sdk"
 import OpenAI from "openai"
@@ -135,8 +142,11 @@ import {
 	isPersistenceAuthorityError,
 	isPersistenceContentionError,
 	isStickyPersistenceRefusal,
+	withDefaultFenceOperationLabel,
+	withFenceOperationLabel,
 	type OrdinaryTaskPersistenceAuthority,
 } from "../task-persistence/targetPersistenceBoundary"
+import { findParentHandoffFenceUnavailableError } from "../task-persistence/parentHandoffFence"
 import { MultiSearchReplaceDiffStrategy } from "../diff/strategies/multi-search-replace"
 import {
 	type ApiMessage,
@@ -388,6 +398,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private readonly globalStoragePath: string
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
+	/** Diagnostics only: timing of the current request's preparation in attemptApiRequest. */
+	private currentRequestPrep?: RequestPrepTimeline
 	/**
 	 * Controller for the waiter on an in-flight `ensureModelFetched()` call (see
 	 * safeEnsureModelFetched). Aborting it detaches this task from the provider-side
@@ -472,6 +484,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private uiMessagesPersistedSeq = 0
 	/** At most one pending deferred usage save; it is never rescheduled by its own failure. */
 	private usageSaveRetryTimer?: ReturnType<typeof setTimeout>
+	private usageSaveRetrySkippedAt = 0
+	/** Settles after every background usage save started so far; never rejects. */
+	private usagePersistence: Promise<void> = Promise.resolve()
 	private diffReversionPromise: Promise<void> = Promise.resolve()
 
 	// Checkpoints
@@ -1639,7 +1654,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/** Persists the current API conversation history to disk, returning false on I/O errors. */
-	private async saveApiConversationHistory(merge = true): Promise<boolean> {
+	private saveApiConversationHistory(merge = true): Promise<boolean> {
+		return withDefaultFenceOperationLabel("task.api_history", () => this.persistApiConversationHistory(merge))
+	}
+
+	private async persistApiConversationHistory(merge: boolean): Promise<boolean> {
 		try {
 			return await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
 				await saveApiMessages({
@@ -1727,17 +1746,24 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Partial *asks* still flush, via the clause below — `Task#ask` adds them without
 		// `isAnswered`, so they keep the ordering guarantee that unanswered asks depend on.
 		const requiresImmediateState = message.type === "ask" && message.isAnswered !== true
-		try {
-			await provider?.postStateToWebviewThrottled()
-		} catch (error) {
-			console.error("[Task#addToClineMessages] postStateToWebviewThrottled failed:", error)
-		}
 		if (requiresImmediateState) {
+			try {
+				await provider?.postStateToWebviewThrottled()
+			} catch (error) {
+				console.error("[Task#addToClineMessages] postStateToWebviewThrottled failed:", error)
+			}
 			try {
 				await provider?.flushPostStateToWebviewThrottled()
 			} catch (error) {
 				console.error("[Task#addToClineMessages] flushPostStateToWebviewThrottled failed:", error)
 			}
+		} else {
+			// Not awaited: every call inside the debounce window returns the same pending post, and
+			// with a throttled background renderer that post takes minutes. Waiting here held the
+			// stream loop on each reasoning chunk; the trailing post still carries this message.
+			provider?.postStateToWebviewThrottled().catch((error: unknown) => {
+				console.error("[Task#addToClineMessages] postStateToWebviewThrottled failed:", error)
+			})
 		}
 		this.emit(RooCodeEventName.Message, { action: "created", message })
 		await this.saveClineMessages()
@@ -1807,7 +1833,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/** Persists Cline messages and updates task metadata in the history store. Returns false on failure. */
-	private async saveClineMessages(merge = true): Promise<boolean> {
+	private saveClineMessages(merge = true): Promise<boolean> {
+		return withDefaultFenceOperationLabel("task.ui_messages", () => this.persistClineMessages(merge))
+	}
+
+	private async persistClineMessages(merge: boolean): Promise<boolean> {
 		try {
 			return await withOrdinaryTaskPersistence(this.globalStoragePath, this.persistenceAuthority, async () => {
 				const snapshotSeq = ++this.uiMessagesSnapshotSeq
@@ -1868,10 +1898,46 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private scheduleUsageSaveRetry(): void {
 		if (this.usageSaveRetryTimer) return // The pending retry saves the whole current message list.
 		const skippedAt = this.uiMessagesSnapshotSeq
+		this.usageSaveRetrySkippedAt = skippedAt
 		this.usageSaveRetryTimer = setTimeout(() => {
 			this.usageSaveRetryTimer = undefined
 			void this.retrySkippedUsageSave(skippedAt)
 		}, USAGE_SAVE_RETRY_DELAY_MS)
+	}
+
+	/** Chains a background usage save so `waitForUsagePersistence()` covers it. */
+	private trackUsagePersistence<T>(save: Promise<T>): Promise<T> {
+		this.usagePersistence = this.usagePersistence.then(
+			() =>
+				save.then(
+					() => undefined,
+					() => undefined,
+				),
+			() => undefined,
+		)
+		return save
+	}
+
+	/**
+	 * Waits for the background usage saves started so far. Those saves hold this task's persistence
+	 * fence, so a zero-wait handoff must await this outside every scope. A pending deferred retry is
+	 * run now instead of after its delay. Saves started after this call are not awaited, so the wait
+	 * cannot be starved. Never rejects: a failed usage save is logged only.
+	 */
+	public async waitForUsagePersistence(): Promise<void> {
+		void this.flushUsageSaveRetry()
+		await this.usagePersistence
+		// A contended save in that snapshot arms its retry only as it settles. Run and await just that
+		// retry; a retry never reschedules itself.
+		await this.flushUsageSaveRetry()
+	}
+
+	/** Runs a pending deferred usage retry now; resolves when it settles (immediately if none). */
+	private flushUsageSaveRetry(): Promise<void> {
+		if (!this.usageSaveRetryTimer) return Promise.resolve()
+		clearTimeout(this.usageSaveRetryTimer)
+		this.usageSaveRetryTimer = undefined
+		return this.retrySkippedUsageSave(this.usageSaveRetrySkippedAt)
 	}
 
 	private async retrySkippedUsageSave(skippedAt: number): Promise<void> {
@@ -1884,7 +1950,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 		let saved = false
 		try {
-			saved = await this.saveClineMessages()
+			saved = await this.trackUsagePersistence(
+				withFenceOperationLabel("task.usage_retry", () => this.saveClineMessages()),
+			)
 		} catch (error) {
 			console.warn(
 				`[Background Usage Collection] Deferred usage save for task ${this.taskId} failed; usage metrics may be lost: ${error instanceof Error ? error.message : String(error)}`,
@@ -2448,9 +2516,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				void this.updateClineMessage(this.clineMessages[lastToolAskIndex]).catch((error) => {
 					console.error("[Task#handleWebviewAskResponse] updateClineMessage failed:", error)
 				})
-				const saved = this.saveClineMessages().catch((error) => {
-					console.error("Failed to save answered tool-ask state:", error)
-				})
+				const saved = withFenceOperationLabel("task.answered_ask", () => this.saveClineMessages()).catch(
+					(error) => {
+						console.error("Failed to save answered tool-ask state:", error)
+					},
+				)
 				// Chain, so a waiter covers every answered-ask save started up to its call.
 				this.answeredAskPersistence = this.answeredAskPersistence.then(() => saved).then(() => undefined)
 			}
@@ -4161,6 +4231,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			includeFileDetails: boolean
 			retryAttempt?: number
 			userMessageWasRemoved?: boolean // Track if user message was removed due to empty response
+			runawayRetried?: boolean // A runaway tool call was already retried once automatically
 		}
 
 		const stack: StackItem[] = [{ userContent, includeFileDetails, retryAttempt: 0 }]
@@ -4432,6 +4503,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// No legacy text-stream tool parser.
 				this.streamingToolCallIndices.clear()
 				const nativeToolCallParserScope = NativeToolCallParser.createScope()
+				const runawayGuard = new RunawayToolArgumentsGuard()
 
 				await this.diffViewProvider.reset()
 
@@ -4446,6 +4518,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Yields only if the first chunk is successful, otherwise will
 				// allow the user to retry the request (most likely due to rate
 				// limit error, which gets thrown on the first chunk).
+				// Cleared first so a request that returns before preparing never shows the previous one's timing.
+				this.currentRequestPrep = undefined
 				const stream = this.attemptApiRequest(currentItem.retryAttempt ?? 0, {
 					skipProviderRateLimit: true,
 					requestModelInfo: streamModelInfo,
@@ -4454,12 +4528,32 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				let reasoningMessage = ""
 				const pendingGroundingSources: GroundingSource[] = []
 				this.isStreaming = true
+				const streamMonitor = new StreamStallMonitor({
+					log: (line) => this.providerRef.deref()?.log(line),
+					context: {
+						taskId: this.taskId,
+						instanceId: this.instanceId,
+						provider: this.apiConfiguration.apiProvider,
+						model: cachedModelId,
+						retryAttempt: currentItem.retryAttempt ?? 0,
+					},
+					getTransport: () => this.api.getStreamTransportDiagnostics?.(),
+					getPrep: () => this.currentRequestPrep?.snapshot(),
+				})
 
 				try {
 					const iterator = stream[Symbol.asyncIterator]()
 
-					// Helper to race iterator.next() with abort signal
+					// Diagnostics only: times each wait for the provider, never alters it.
 					const nextChunkWithAbort = async () => {
+						streamMonitor.waitStarted()
+						const next = await nextChunkRacedWithAbort()
+						streamMonitor.chunkReceived(next.done ? undefined : next.value, next.done === true)
+						return next
+					}
+
+					// Helper to race iterator.next() with abort signal
+					const nextChunkRacedWithAbort = async () => {
 						const nextPromise = iterator.next()
 
 						// If we have an abort controller, race it with the next chunk
@@ -4527,6 +4621,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								}
 								break
 							case "tool_call_partial": {
+								// A runaway argument stream would otherwise run until the output cap.
+								// Abort the provider request so it stops generating, then let the
+								// catch below clean up and retry.
+								const runaway = runawayGuard.check(chunk)
+								if (runaway) {
+									this.currentRequestAbortController?.abort()
+									throw runaway
+								}
+
 								// Process raw tool call chunk through NativeToolCallParser
 								// which handles tracking, buffering, and emits events
 								const events = NativeToolCallParser.processRawChunk(
@@ -4754,13 +4857,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								// Update the API request message with the latest usage data
 								updateApiReqMsg()
 								try {
-									await this.saveClineMessages()
+									// Tracked: a zero-wait new_task handoff awaits this save first.
+									await this.trackUsagePersistence(
+										withFenceOperationLabel("task.usage_drain", () => this.saveClineMessages()),
+									)
 								} catch (error) {
 									if (!isPersistenceContentionError(error)) throw error
 									// Another save holds this task's fence. The usage stays in the
 									// in-memory message; one deferred save (or any newer save) persists it.
+									const holder = findParentHandoffFenceUnavailableError(error)?.holder
 									console.warn(
-										`[Background Usage Collection] Skipped usage save for task ${this.taskId}: persistence fence busy (${error instanceof Error ? error.message : String(error)})`,
+										`[Background Usage Collection] Skipped usage save for task ${this.taskId}: persistence fence busy (${error instanceof Error ? error.message : String(error)})${holder ? ` holder=${JSON.stringify(holder)}` : ""}`,
 									)
 									this.scheduleUsageSaveRetry()
 								}
@@ -4897,6 +5004,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						console.error("Background usage collection failed:", error)
 					})
 				} catch (error) {
+					streamMonitor.finish(this.abort ? "aborted" : "error", error)
 					// Abandoned happens when extension is no longer waiting for the
 					// Cline instance to finish aborting (error is thrown here when
 					// any function in the for loop throws due to this.abort).
@@ -4906,9 +5014,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 						const rawErrorMessage =
 							getThrownMessage(error) ?? JSON.stringify(serializeError(error), null, 2)
+						// The runaway guard stops the stream on Zoo's side, so the provider is not to blame.
 						const streamingFailedMessage = this.abort
 							? undefined
-							: `${t("common:interruption.streamTerminatedByProvider")}: ${rawErrorMessage}`
+							: error instanceof RunawayToolArgumentsError
+								? rawErrorMessage
+								: `${t("common:interruption.streamTerminatedByProvider")}: ${rawErrorMessage}`
 
 						// Clean up partial state
 						await abortStream(cancelReason, streamingFailedMessage)
@@ -4917,6 +5028,31 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							// ??= keeps the first reason; a cancel can land during abortStream after cancelReason was already computed.
 							this.abortReason ??= "user_cancelled"
 							await this.abortTask()
+						} else if (error instanceof RunawayToolArgumentsError) {
+							const retryNote = { type: "text" as const, text: runawayToolArgumentsNote(error) }
+							const askUser = currentItem.runawayRetried === true
+							this.providerRef
+								.deref()
+								?.log(
+									`[stream-guard] ERROR reasons=runawayToolArgs task=${this.taskId} instance=${this.instanceId} tool=${error.toolName} limit=${error.limit} argBytes=${error.argBytes} limitBytes=${error.limitBytes} argDeltas=${error.argDeltas} limitDeltas=${error.limitDeltas} action=${askUser ? "ask" : "retry"}`,
+								)
+							if (askUser) {
+								// It happened again right after the note; let the user decide once.
+								const { response } = await this.ask("api_req_failed", rawErrorMessage)
+								if (response !== "yesButtonClicked") {
+									throw new Error("API request failed")
+								}
+								await this.say("api_req_retried")
+							}
+							// The stopped response is never saved, so the note goes in as a new user
+							// message (retryAttempt 0); consecutive user messages are merged for the API.
+							stack.push({
+								userContent: [retryNote],
+								includeFileDetails: false,
+								retryAttempt: 0,
+								runawayRetried: true,
+							})
+							continue
 						} else if (error instanceof OutputTokenLimitError) {
 							// Truncation repeats on an identical request, so never auto-retry it
 							// (even with auto-approval); let the user decide once.
@@ -4931,6 +5067,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								userContent: currentUserContent,
 								includeFileDetails: false,
 								retryAttempt: 0,
+								runawayRetried: currentItem.runawayRetried,
 							})
 							continue
 						} else {
@@ -4961,6 +5098,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								userContent: currentUserContent,
 								includeFileDetails: false,
 								retryAttempt: (currentItem.retryAttempt ?? 0) + 1,
+								// Same turn: a later runaway must still ask instead of auto-retrying again.
+								runawayRetried: currentItem.runawayRetried,
 							})
 
 							// Continue to retry the request
@@ -4968,6 +5107,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 					}
 				} finally {
+					streamMonitor.finish(this.abort ? "aborted" : "stopped_early")
 					this.isStreaming = false
 					// Clean up the abort controller when streaming completes
 					this.currentRequestAbortController = undefined
@@ -5437,6 +5577,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							includeFileDetails: false,
 							retryAttempt: (currentItem.retryAttempt ?? 0) + 1,
 							userMessageWasRemoved: removedCurrentUserMessage,
+							runawayRetried: currentItem.runawayRetried,
 						})
 
 						// Continue to retry the request
@@ -5458,6 +5599,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								includeFileDetails: false,
 								retryAttempt: (currentItem.retryAttempt ?? 0) + 1,
 								userMessageWasRemoved: removedCurrentUserMessage,
+								runawayRetried: currentItem.runawayRetried,
 							})
 
 							// Continue to retry the request
@@ -5849,6 +5991,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		options: { skipProviderRateLimit?: boolean; requestModelInfo?: ModelInfo } = {},
 	): ApiStream {
 		if (this.pendingQuestion) return
+		// Phase names and durations only; logged by StreamStallMonitor.
+		const prep = new RequestPrepTimeline()
+		this.currentRequestPrep = prep
+		prep.phase("state")
 		const state = await this.providerRef.deref()?.getState()
 
 		const {
@@ -5859,6 +6005,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			profileThresholds = {},
 		} = state ?? {}
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
+		prep.phase("mode")
 		const mode = await this.getTaskMode()
 		const apiConfiguration = this.apiConfiguration
 
@@ -5866,6 +6013,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
 
 		if (!options.skipProviderRateLimit) {
+			prep.phase("rateLimit", { userWait: true })
 			await this.maybeWaitForProviderRateLimit(retryAttempt)
 		}
 
@@ -5884,6 +6032,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Capture one bounded-wait model-info snapshot per request, shared by the
 		// prompt and every tool array built below; prefer the caller's snapshot
 		// when one was threaded.
+		prep.phase("modelInfo")
 		const requestModelInfo = options.requestModelInfo ?? (await this.safeEnsureModelFetched())
 		// Retry recursions must reuse this snapshot instead of re-deriving it: a
 		// metadata fetch landing between attempts would otherwise move
@@ -5891,7 +6040,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// caller threaded a snapshot its options object is forwarded unchanged —
 		// same reference, and never mutated.
 		const retryOptions = options.requestModelInfo === undefined ? { ...options, requestModelInfo } : options
+		prep.phase("systemPrompt")
 		const systemPrompt = await this.getSystemPrompt(state, requestModelInfo)
+		prep.phase("contextCheck")
 
 		// A cancellation landing during the rate-limit countdown, the bounded metadata
 		// wait, or the MCP wait inside getSystemPrompt must stop this request before any
@@ -5957,6 +6108,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Build tools for condensing metadata (same tools used for normal API calls)
 			// This ensures the condensing API call includes tool definitions for providers that need them
+			prep.phase("condenseTools")
 			let contextMgmtTools: import("openai").default.Chat.ChatCompletionTool[] = []
 			{
 				const provider = this.providerRef.deref()
@@ -5997,6 +6149,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Only generate environment details when context management will actually run.
 			// getEnvironmentDetails(this, true) triggers a recursive workspace listing which
 			// adds overhead - avoid this for the common case where context is below threshold.
+			prep.phase("condenseInputs")
 			const contextMgmtEnvironmentDetails = contextManagementWillRun
 				? await getEnvironmentDetails(this, true)
 				: undefined
@@ -6007,6 +6160,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					? await this.getFilesReadByRooSafely("attemptApiRequest")
 					: undefined
 
+			prep.phase("manageContext")
 			try {
 				const truncateResult = await manageContext({
 					messages: this.apiConversationHistory,
@@ -6088,6 +6242,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Get the effective API history by filtering out condensed messages
 		// This allows non-destructive condensing where messages are tagged but not deleted,
 		// enabling accurate rewind operations while still sending condensed history to the API.
+		prep.phase("history")
 		const effectiveHistory = getEffectiveApiHistory(this.apiConversationHistory)
 		const messagesSinceLastSummary = getMessagesSinceLastSummary(effectiveHistory)
 		// For API only: merge consecutive user messages (excludes summary messages per
@@ -6099,7 +6254,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			requestModelInfo,
 		)
 
-		// Check auto-approval limits
+		// Check auto-approval limits; it may ask the user, so it counts as a deliberate wait.
+		prep.phase("approvalLimit", { userWait: true })
 		const approvalResult = await this.autoApprovalHandler.checkAutoApprovalLimits(
 			state,
 			this.combineMessages(this.clineMessages.slice(1)),
@@ -6129,6 +6285,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// so they continue to receive only the filtered tools for the current mode.
 		const supportsAllowedFunctionNames = apiConfiguration?.apiProvider === providerIdentifiers.gemini
 
+		prep.phase("tools")
 		{
 			const provider = this.providerRef.deref()
 			if (!provider) {
@@ -6178,6 +6335,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// The provider accepts reasoning items alongside standard messages; cast to the expected parameter type.
 		if (this.pendingQuestion || this.abort || this.abandoned) return
+		prep.finish()
 		const stream = this.api.createMessage(
 			systemPrompt,
 			cleanConversationHistory as unknown as Anthropic.Messages.MessageParam[],

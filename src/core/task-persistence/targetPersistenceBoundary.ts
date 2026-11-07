@@ -55,6 +55,18 @@ type ProviderStartContext = {
 	parent?: ProviderStartContext
 }
 const providerStartContext = new AsyncLocalStorage<ProviderStartContext>()
+/** Diagnostic name of the operation acquiring fences; recorded in owner.json, never an authority. */
+const fenceOperationLabel = new AsyncLocalStorage<string>()
+
+/** Names the fence acquisitions inside `effect` for holder diagnostics. The innermost label wins. */
+export function withFenceOperationLabel<T>(label: string, effect: () => T): T {
+	return fenceOperationLabel.run(label, effect)
+}
+/** Like withFenceOperationLabel, but keeps a more specific label that a caller already set. */
+export function withDefaultFenceOperationLabel<T>(label: string, effect: () => T): T {
+	return fenceOperationLabel.getStore() ? effect() : fenceOperationLabel.run(label, effect)
+}
+const fenceLabel = (fallback: string) => fenceOperationLabel.getStore() ?? fallback
 
 /** Read-only observation: never acquires, validates, joins, releases or exposes an owner token. */
 export function providerStartExclusionDiagnostics(
@@ -261,6 +273,13 @@ async function withProviderStartExclusionPhase<T>(
 	// A queued callback must not inherit a lease that its enqueuer will release.
 	const lease = await new ParentHandoffFence(root).acquire(id, {
 		timeoutMs: options.failFast ? 0 : options.fresh || options.persistence ? 30_000 : 0,
+		label: fenceLabel(
+			options.fresh
+				? "provider_start.fresh"
+				: options.persistence
+					? "provider_start.persistence"
+					: "provider_start",
+		),
 	})
 	const guard: ProviderStartContext = { root, id, lease, active: true, effects: new Set(), parent: inherited }
 	try {
@@ -285,7 +304,9 @@ async function withProviderStartExclusionPhase<T>(
 /** A queued ordinary run is independent of its enqueuer, never a lease surrender. */
 export function inIndependentTaskOrchestration<T>(effect: () => T): T {
 	if (storeMutex.getStore()) throw new OrdinaryPersistenceAuthorityError("Orchestration cannot escape a store mutex")
-	return providerStartContext.exit(() => ordinaryContext.exit(() => context.exit(() => startupContext.exit(effect))))
+	return providerStartContext.exit(() =>
+		ordinaryContext.exit(() => context.exit(() => startupContext.exit(() => fenceOperationLabel.exit(effect)))),
+	)
 }
 
 /** Idle orchestration cannot surrender an arbitrary caller's capable effect window. */
@@ -375,7 +396,10 @@ export async function withStartupAdmission<T>(storage: string, effect: () => Pro
 		return effect()
 	}
 	if (storeMutex.getStore()) throw new Error("Startup admission cannot be acquired inside store mutex")
-	const lease = await new ParentHandoffFence(root).acquire(startupAdmissionId, { timeoutMs: 30_000 })
+	const lease = await new ParentHandoffFence(root).acquire(startupAdmissionId, {
+		timeoutMs: 30_000,
+		label: fenceLabel("startup_admission"),
+	})
 	try {
 		await lease.assertOwned()
 		return await startupContext.run({ root, lease }, async () => {
@@ -438,9 +462,15 @@ export async function bindTargetPersistence(
 	if (!validId(parentId) || !action) throw new Error("Invalid target identity")
 	const root = await resolveRoot(storage)
 	if (storeMutex.getStore()) throw new Error("Target admission cannot be acquired inside store mutex")
-	const admission = await new ParentHandoffFence(root).acquire(startupAdmissionId, { timeoutMs: 0 })
+	const admission = await new ParentHandoffFence(root).acquire(startupAdmissionId, {
+		timeoutMs: 0,
+		label: fenceLabel("bind_target"),
+	})
 	try {
-		const lease = await new ParentHandoffFence(root).acquire(parentId, { timeoutMs: 0 })
+		const lease = await new ParentHandoffFence(root).acquire(parentId, {
+			timeoutMs: 0,
+			label: fenceLabel("bind_target"),
+		})
 		try {
 			await admission.assertOwned()
 			await lease.assertOwned()
@@ -608,7 +638,10 @@ async function withSingleTargetPersistence<T>(
 	const current = context.getStore()
 	if (current?.binding.root === target.root && current.binding.parentId === id) return effect()
 	if (storeMutex.getStore()) throw new Error("Target exclusion cannot be acquired inside store mutex")
-	const lease = await new ParentHandoffFence(target.root).acquire(id, { timeoutMs: 0 })
+	const lease = await new ParentHandoffFence(target.root).acquire(id, {
+		timeoutMs: 0,
+		label: fenceLabel("bound_target"),
+	})
 	let outcome: { ok: true; value: T } | { ok: false; error: unknown }
 	try {
 		const guard: Context = { binding: target.binding, bytes: target.bytes, lease }

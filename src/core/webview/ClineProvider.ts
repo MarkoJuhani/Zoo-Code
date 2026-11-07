@@ -151,9 +151,11 @@ import {
 	withPersistenceExclusions,
 	inIndependentTaskOrchestration,
 	providerStartExclusionDiagnostics,
+	withFenceOperationLabel,
 	OrdinaryPersistenceAuthorityError,
 	type OrdinaryAuthorityHistoryItem,
 } from "../task-persistence/targetPersistenceBoundary"
+import { findParentHandoffFenceUnavailableError } from "../task-persistence/parentHandoffFence"
 import { LifecycleTransitionContentionError, type OrdinaryPersistenceIdentity } from "../task-persistence/taskLifecycle"
 import { getNonce } from "./getNonce"
 import { getUri } from "./getUri"
@@ -241,6 +243,8 @@ class DelegationDiagnostics {
 						? id
 						: `hash-${crypto.createHash("sha256").update(id).digest("hex").slice(0, 16)}`
 			const code = error && typeof error === "object" && "code" in error ? error.code : undefined
+			// Names the operation that held the fence when an acquire was refused (no paths or tokens).
+			const fence = error === undefined ? undefined : findParentHandoffFenceUnavailableError(error)
 			this.sink(
 				`[ordinary_delegation] ${JSON.stringify({
 					correlation: this.correlation,
@@ -270,6 +274,8 @@ class DelegationDiagnostics {
 									["EIO", "ENOENT", "EACCES", "EPERM", "ENOSPC", "EROFS", "EEXIST"].includes(code)
 										? { code }
 										: {}),
+									...(fence ? { reason: fence.reason } : {}),
+									...(fence?.holder ? { holder: fence.holder } : {}),
 								},
 							}),
 				})}`,
@@ -516,21 +522,13 @@ export class ClineProvider
 	private taskEventListeners: WeakMap<Task, Array<() => void>> = new WeakMap()
 	private currentWorkspacePath: string | undefined
 	private _disposed = false
-	private readonly _postStateToWebviewThrottled = debounce(
-		async () => {
-			try {
-				await this.postStateToWebviewWithoutTaskHistory()
-			} catch (error) {
-				this.log(
-					`[ClineProvider#postStateToWebviewThrottled] Failed to post state: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				)
-			}
-		},
-		500,
-		{ leading: true, trailing: true, maxWait: 1000 },
-	)
+	private readonly _postStateToWebviewThrottled = debounce(() => this.postStateToWebviewOneAtATime(), 500, {
+		leading: true,
+		trailing: true,
+		maxWait: 1000,
+	})
+	private throttledStatePostInFlight?: Promise<void>
+	private throttledStatePostQueued?: Promise<void>
 	private readonly rateLimitClock: RateLimitClock = createRateLimitClock()
 
 	private recentTasksCache?: string[]
@@ -2887,6 +2885,42 @@ export class ClineProvider
 	}
 
 	/**
+	 * Runs at most one throttled state post at a time. A hidden, throttled renderer can hold a post for
+	 * minutes; starting a new full-state post every debounce window would pile them up. Calls made while
+	 * a post runs share one follow-up post, which starts after it and reads the newest state, so each
+	 * caller waits for at most the running post plus one more.
+	 */
+	private postStateToWebviewOneAtATime(): Promise<void> {
+		if (this._disposed) {
+			return Promise.resolve()
+		}
+
+		if (this.throttledStatePostInFlight) {
+			this.throttledStatePostQueued ??= this.throttledStatePostInFlight.then(() => {
+				this.throttledStatePostQueued = undefined
+				return this.postStateToWebviewOneAtATime()
+			})
+			return this.throttledStatePostQueued
+		}
+
+		const post = this.postStateToWebviewWithoutTaskHistory()
+			.catch((error) => {
+				this.log(
+					`[ClineProvider#postStateToWebviewThrottled] Failed to post state: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				)
+			})
+			.finally(() => {
+				if (this.throttledStatePostInFlight === post) {
+					this.throttledStatePostInFlight = undefined
+				}
+			})
+		this.throttledStatePostInFlight = post
+		return post
+	}
+
+	/**
 	 * Like postStateToWebview but intentionally omits both clineMessages and taskHistory.
 	 *
 	 * Rationale:
@@ -4286,14 +4320,12 @@ export class ClineProvider
 				diagnostics.event("transition_acquire", "end")
 				diagnostics.event("fence_acquire", "begin") // Before acquisition, including refusal.
 				let acquired = false
-				return withProviderStartExclusion(
-					this.contextProxy.globalStorageUri.fsPath,
-					params.parentTaskId,
-					() => {
+				return withFenceOperationLabel("provider.delegation_handoff", () =>
+					withProviderStartExclusion(this.contextProxy.globalStorageUri.fsPath, params.parentTaskId, () => {
 						acquired = true
 						diagnostics.event("fence_acquire", "end")
 						return delegate.call(this, { ...params, diagnostics })
-					},
+					}),
 				).then(
 					(child) => {
 						diagnostics.event("fence_scope", "end")

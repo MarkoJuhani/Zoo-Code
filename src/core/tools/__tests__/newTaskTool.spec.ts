@@ -90,6 +90,7 @@ const mockCline = {
 	ask: vi.fn(),
 	waitForCurrentAssistantMessagePersistence: vi.fn(async () => true),
 	waitForAnsweredAskPersistence: vi.fn(async () => {}),
+	waitForUsagePersistence: vi.fn(async () => {}),
 	sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 	emit: mockEmit,
 	recordToolError: mockRecordToolError,
@@ -596,6 +597,7 @@ describe("newTaskTool delegation flow", () => {
 			ask: vi.fn(),
 			waitForCurrentAssistantMessagePersistence: vi.fn(async () => true),
 			waitForAnsweredAskPersistence: vi.fn(async () => {}),
+			waitForUsagePersistence: vi.fn(async () => {}),
 			sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 			emit: localEmit,
 			recordToolError: mockRecordToolError,
@@ -761,6 +763,7 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 		| "setPendingTaskAction"
 		| "waitForCurrentAssistantMessagePersistence"
 		| "waitForAnsweredAskPersistence"
+		| "waitForUsagePersistence"
 	> & { providerRef: { deref: () => unknown } }
 
 	beforeEach(() => {
@@ -773,8 +776,11 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 		})
 	})
 
-	/** `interrupt` is set on the task while its answered-ask save settles, before the wait resolves. */
-	function handoffFixture(interrupt?: "abort" | "abandoned") {
+	/**
+	 * `interrupt` is set on the task while its answered-ask save settles, before the wait resolves.
+	 * With `deferUsageSave`, the usage-save wait also resolves only when the test settles it.
+	 */
+	function handoffFixture(interrupt?: "abort" | "abandoned", deferUsageSave = false) {
 		const diagnostics = { event: vi.fn<(phase: string, stage: string, error?: unknown) => void>() }
 		const provider = {
 			getTaskMetadata: vi.fn(async () => ({ kind: "found", item: { status: "active" } })),
@@ -784,7 +790,19 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 			delegateParentAndOpenChild: vi.fn(async () => ({ taskId: "child-1" })),
 		}
 		const answeredAskSaveSettled = vi.fn()
+		const usageSaveSettled = vi.fn()
 		let settle: (() => void) | undefined
+		let settleUsage: (() => void) | undefined
+		const waitForUsagePersistence = vi.fn(() =>
+			deferUsageSave
+				? new Promise<void>((resolve) => {
+						settleUsage = () => {
+							usageSaveSettled()
+							resolve()
+						}
+					})
+				: Promise.resolve(),
+		)
 		const task: HandoffTaskDouble = {
 			taskId: "parent-task",
 			instanceId: "parent-instance",
@@ -808,6 +826,7 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 						}
 					}),
 			),
+			waitForUsagePersistence,
 			providerRef: { deref: () => provider },
 		}
 		const callbacks = {
@@ -831,6 +850,10 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 			expect(settle).toBeDefined()
 			settle?.()
 		}
+		const settleUsageSave = () => {
+			expect(settleUsage).toBeDefined()
+			settleUsage?.()
+		}
 		const handoffEvents = () => diagnostics.event.mock.calls.filter(([phase]) => phase === "tool_handoff")
 		return {
 			task,
@@ -840,6 +863,9 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 			handle,
 			settleAnsweredAskSave,
 			answeredAskSaveSettled,
+			settleUsageSave,
+			usageSaveSettled,
+			waitForUsagePersistence,
 			handoffEvents,
 		}
 	}
@@ -881,6 +907,28 @@ describe("newTaskTool handoff after the answered-ask save", () => {
 			["tool_handoff", "begin"],
 			["tool_handoff", "end"],
 		])
+		expect(f.callbacks.pushToolResult).toHaveBeenCalledWith("Delegated to child task child-1")
+		expect(f.callbacks.handleError).not.toHaveBeenCalled()
+	})
+
+	it("hands off only after the background usage save settles, waited after the answered-ask save", async () => {
+		const f = handoffFixture(undefined, true)
+		const handled = f.handle()
+		await vi.waitFor(() => expect(f.task.waitForAnsweredAskPersistence).toHaveBeenCalledOnce())
+		f.settleAnsweredAskSave()
+		await vi.waitFor(() => expect(f.waitForUsagePersistence).toHaveBeenCalledOnce())
+		expect(f.provider.delegateParentAndOpenChild).not.toHaveBeenCalled()
+
+		f.settleUsageSave()
+		await handled
+
+		expect(f.provider.delegateParentAndOpenChild).toHaveBeenCalledOnce()
+		expect(f.answeredAskSaveSettled.mock.invocationCallOrder[0]).toBeLessThan(
+			f.waitForUsagePersistence.mock.invocationCallOrder[0],
+		)
+		expect(f.usageSaveSettled.mock.invocationCallOrder[0]).toBeLessThan(
+			f.provider.delegateParentAndOpenChild.mock.invocationCallOrder[0],
+		)
 		expect(f.callbacks.pushToolResult).toHaveBeenCalledWith("Delegated to child task child-1")
 		expect(f.callbacks.handleError).not.toHaveBeenCalled()
 	})

@@ -29,6 +29,7 @@ import { getEnvironmentDetails } from "../../environment/getEnvironmentDetails"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ApiStreamChunk } from "../../../api/transform/stream"
 import { OutputTokenLimitError } from "../../../api/providers/utils/output-token-limit-error"
+import { RUNAWAY_TOOL_ARGUMENT_LIMIT_BYTES } from "../RunawayToolArgumentsGuard"
 import { ContextProxy } from "../../config/ContextProxy"
 import { processUserContentMentions } from "../../mentions/processUserContentMentions"
 import { MultiSearchReplaceDiffStrategy } from "../../diff/strategies/multi-search-replace"
@@ -671,6 +672,122 @@ describe("Cline", () => {
 			await task.recursivelyMakeClineRequests([{ type: "text", text: "long request" }])
 
 			expect(attemptApiRequestSpy.mock.calls.slice(0, 2).map(([retryAttempt]) => retryAttempt)).toEqual([0, 0])
+		})
+	})
+
+	describe("runaway tool arguments mid-stream", () => {
+		const runawayArguments = " ".repeat(RUNAWAY_TOOL_ARGUMENT_LIMIT_BYTES)
+
+		async function createAutoApprovedTask() {
+			vi.spyOn(mockProvider, "getState").mockResolvedValue(
+				providerStateWith({ autoApprovalEnabled: true, requestDelaySeconds: 0 }),
+			)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+			vi.spyOn(getTaskTestAccess(task), "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
+			vi.spyOn(getTaskTestAccess(task), "presentAssistantMessageSafe").mockImplementation(() => {})
+			return task
+		}
+
+		/** A read_file call whose arguments keep growing; records the request's abort controller. */
+		function runawayStream(task: Task, controllers: AbortController[]): AsyncGenerator<ApiStreamChunk> {
+			const controller = new AbortController()
+			controllers.push(controller)
+			task.currentRequestAbortController = controller
+			return (async function* (): AsyncGenerator<ApiStreamChunk> {
+				yield { type: "tool_call_partial", index: 0, id: "call_1", name: "read_file", arguments: '{"path":"a' }
+				yield { type: "tool_call_partial", index: 0, arguments: runawayArguments }
+				// Task reads one chunk ahead, so this is fetched before the guard sees the chunk above.
+				yield { type: "tool_call_partial", index: 0, arguments: " " }
+				throw new Error("the guard must stop the stream before reading further")
+			})()
+		}
+
+		it("aborts the provider request and retries once with a note, without saving the stopped response", async () => {
+			const task = await createAutoApprovedTask()
+			const askSpy = vi.spyOn(task, "ask")
+			const logSpy = vi.spyOn(mockProvider, "log")
+			const controllers: AbortController[] = []
+			const attemptApiRequestSpy = vi
+				.spyOn(task, "attemptApiRequest")
+				.mockImplementationOnce(() => runawayStream(task, controllers))
+				.mockImplementationOnce(() => asyncStreamFrom<ApiStreamChunk>([{ type: "text", text: "done" }]))
+				.mockImplementation(() => {
+					throw new Error("stop after retry response")
+				})
+
+			await task.recursivelyMakeClineRequests([{ type: "text", text: "read a file" }])
+
+			expect(controllers[0].signal.aborted).toBe(true)
+			expect(attemptApiRequestSpy.mock.calls.slice(0, 2).map(([retryAttempt]) => retryAttempt)).toEqual([0, 0])
+			expect(askSpy).not.toHaveBeenCalledWith("api_req_failed", expect.anything())
+			expect(logSpy).toHaveBeenCalledWith(
+				expect.stringMatching(
+					/^\[stream-guard\] ERROR reasons=runawayToolArgs .* tool=read_file .* action=retry$/,
+				),
+			)
+			const failedRequest = task.clineMessages.find(
+				(message) => message.say === "api_req_started" && message.text?.includes("streaming_failed"),
+			)
+			// Zoo stopped the stream, so the row must not blame the provider.
+			expect(failedRequest?.text).toContain("Stopped a runaway read_file call")
+			expect(failedRequest?.text).not.toMatch(/streamTerminatedByProvider|terminated by provider/i)
+			const history = JSON.stringify(task.apiConversationHistory)
+			expect(history).toContain("Your previous response was stopped")
+			expect(history).not.toContain(runawayArguments)
+			expect(history).not.toContain('{\\"path\\":\\"a')
+		})
+
+		it("asks the user when the retried request runs away again", async () => {
+			const task = await createAutoApprovedTask()
+			const askSpy = vi
+				.spyOn(task, "ask")
+				.mockResolvedValue({ response: "noButtonClicked" } satisfies TaskAskResult)
+			const controllers: AbortController[] = []
+			const attemptApiRequestSpy = vi
+				.spyOn(task, "attemptApiRequest")
+				.mockImplementation(() => runawayStream(task, controllers))
+
+			await task.recursivelyMakeClineRequests([{ type: "text", text: "read a file" }])
+
+			expect(attemptApiRequestSpy).toHaveBeenCalledTimes(2)
+			expect(controllers.map((controller) => controller.signal.aborted)).toEqual([true, true])
+			expect(askSpy).toHaveBeenCalledOnce()
+			expect(askSpy).toHaveBeenCalledWith("api_req_failed", expect.stringContaining("runaway read_file"))
+		})
+
+		it("still asks when an ordinary stream failure came between the two runaways", async () => {
+			const task = await createAutoApprovedTask()
+			vi.spyOn(getTaskTestAccess(task), "backoffAndAnnounce").mockResolvedValue(undefined)
+			const askSpy = vi
+				.spyOn(task, "ask")
+				.mockResolvedValue({ response: "noButtonClicked" } satisfies TaskAskResult)
+			const controllers: AbortController[] = []
+			const attemptApiRequestSpy = vi
+				.spyOn(task, "attemptApiRequest")
+				.mockImplementationOnce(() => runawayStream(task, controllers))
+				.mockImplementationOnce(() =>
+					(async function* (): AsyncGenerator<ApiStreamChunk> {
+						yield { type: "text", text: "partial" }
+						throw new Error("connection reset")
+					})(),
+				)
+				.mockImplementation(() => runawayStream(task, controllers))
+
+			await task.recursivelyMakeClineRequests([{ type: "text", text: "read a file" }])
+
+			expect(attemptApiRequestSpy).toHaveBeenCalledTimes(3)
+			expect(askSpy).toHaveBeenCalledOnce()
+			expect(askSpy).toHaveBeenCalledWith("api_req_failed", expect.stringContaining("runaway read_file"))
+			const notes = task.apiConversationHistory.filter((message) =>
+				JSON.stringify(message.content).includes("Your previous response was stopped"),
+			)
+			expect(notes).toHaveLength(1)
 		})
 	})
 

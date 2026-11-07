@@ -630,4 +630,70 @@ describe("Case 19: one deferred retry after a contention-skipped usage save", ()
 
 		expect({ saves: saves.length, disk: await onDisk() }).toEqual({ saves: 1, disk: { ui: 7, history: 7 } })
 	})
+
+	it("waitForUsagePersistence runs a pending retry now and settles after it persisted", async () => {
+		const { task, saves } = await skippedUsage()
+		task["scheduleUsageSaveRetry"]()
+
+		await task.waitForUsagePersistence()
+
+		// No retry delay elapsed: the wait itself ran the deferred save.
+		expect({ saves: saves.length, disk: await onDisk() }).toEqual({ saves: 1, disk: { ui: 7, history: 7 } })
+		await delay(RETRY_DELAY_MS * 2)
+		expect(saves).toHaveLength(1) // The cancelled timer never fires a second save.
+	})
+
+	it("waitForUsagePersistence also runs the retry that a contended save in its snapshot arms", async () => {
+		const { task, saves } = await skippedUsage()
+		const contended = signal()
+		gates.push(contended)
+		// The drain's shape: a tracked save whose contention handler arms the deferred retry.
+		const capture = (async () => {
+			try {
+				await task["trackUsagePersistence"](contended.promise.then(() => Promise.reject(new Error("busy"))))
+			} catch {
+				task["scheduleUsageSaveRetry"]()
+			}
+		})()
+		const waited = task.waitForUsagePersistence()
+		contended.release()
+
+		await Promise.all([capture, waited])
+
+		expect({ saves: saves.length, disk: await onDisk(), timer: task["usageSaveRetryTimer"] }).toEqual({
+			saves: 1,
+			disk: { ui: 7, history: 7 },
+			timer: undefined,
+		})
+	})
+
+	it("waitForUsagePersistence awaits an in-flight usage save that waits for the fence", async () => {
+		const { task } = await skippedUsage()
+		const holder = await new ParentHandoffFence(root).acquire("parent")
+		let settled = false
+		let waited: Promise<void>
+		try {
+			void task["trackUsagePersistence"](task["saveClineMessages"]())
+			waited = task.waitForUsagePersistence().then(() => void (settled = true))
+			await delay(200)
+			expect(settled).toBe(false)
+		} finally {
+			await holder.release()
+		}
+
+		await waited
+		expect(await onDisk()).toEqual({ ui: 7, history: 7 })
+	})
+
+	it("waitForUsagePersistence never rejects and does not wait for saves started after the call", async () => {
+		const { task } = await skippedUsage()
+		const later = signal()
+		gates.push(later)
+		void task["trackUsagePersistence"](Promise.reject(new Error("usage save failed"))).catch(() => undefined)
+
+		const waited = task.waitForUsagePersistence()
+		void task["trackUsagePersistence"](later.promise)
+
+		await expect(waited).resolves.toBeUndefined()
+	})
 })

@@ -117,6 +117,30 @@ export interface ApiHandlerCreateMessageMetadata {
 	abortSignal?: AbortSignal
 }
 
+/** Epoch-millisecond timestamps; identifiers only, never request or response content. */
+export interface ApiStreamTransportDiagnostics {
+	/** Which transport carries the request; unset until one has been chosen. */
+	transport?: "sdk" | "sse"
+	/** Increments for every request the handler sends; identifies which request this describes. */
+	requestSequence: number
+	requestStartedAt: number
+	/** Handler time from createMessage until requestStartedAt: auth plus request body building. */
+	prepareMs?: number
+	/** Part of prepareMs spent getting (or refreshing) the access token. */
+	accessTokenMs?: number
+	/** Account lookup after requestStartedAt, before the request reaches the wire. */
+	accountIdMs?: number
+	/** Parsed provider events, including those that produce no stream chunk. */
+	eventCount: number
+	lastEventAt?: number
+	lastEventType?: string
+	/** Raw body reads (SSE transport only); a read without a parsed event is keep-alive or a partial line. */
+	lastReadAt?: number
+	responseId?: string
+	requestId?: string
+	cfRay?: string
+}
+
 export interface ApiHandler {
 	createMessage(
 		systemPrompt: string,
@@ -146,6 +170,13 @@ export interface ApiHandler {
 	 * inflated live window); others leave it undefined and callers fall back.
 	 */
 	getCondenseContextWindow?(): number
+
+	/**
+	 * Optional transport-level view of the current or most recent streaming request, used only
+	 * for stall diagnostics. It lets a stall log tell a silent upstream apart from events that
+	 * arrived at the provider but did not reach the task. Never affects request behavior.
+	 */
+	getStreamTransportDiagnostics?(): Readonly<ApiStreamTransportDiagnostics> | undefined
 
 	/**
 	 * Counts tokens for content blocks

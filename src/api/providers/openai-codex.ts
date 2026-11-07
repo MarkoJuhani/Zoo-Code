@@ -25,7 +25,12 @@ import { ApiStream, ApiStreamUsageChunk } from "../transform/stream"
 import { getModelParams } from "../transform/model-params"
 
 import { BaseProvider } from "./base-provider"
-import type { SingleCompletionHandler, ApiHandlerCreateMessageMetadata, CompletePromptOptions } from "../index"
+import type {
+	SingleCompletionHandler,
+	ApiHandlerCreateMessageMetadata,
+	ApiStreamTransportDiagnostics,
+	CompletePromptOptions,
+} from "../index"
 import { isMcpTool } from "../../utils/mcp-name"
 import { sanitizeOpenAiCallId } from "../../utils/tool-id"
 import { openAiCodexOAuthManager } from "../../integrations/openai-codex/oauth"
@@ -34,6 +39,46 @@ import { t } from "../../i18n"
 export type OpenAiCodexModel = ReturnType<OpenAiCodexHandler["getModel"]>
 
 type OpenAiCodexRequestServiceTier = typeof OpenAiCodexServiceTier.Priority
+
+interface HeaderReader {
+	get(name: string): string | null
+}
+
+interface SdkRequestWithResponse {
+	withResponse(): Promise<{ data: unknown; response?: { headers?: HeaderReader }; request_id?: string | null }>
+}
+
+function recordResponseHeaders(
+	diagnostics: ApiStreamTransportDiagnostics,
+	headers: HeaderReader | undefined,
+	requestId?: string | null,
+): void {
+	const read = (name: string) => (typeof headers?.get === "function" ? headers.get(name) : null) ?? undefined
+	diagnostics.requestId = requestId ?? read("x-request-id")
+	diagnostics.cfRay = read("cf-ray")
+}
+
+/** Records the event type and response id only; never event content. */
+function recordTransportEvent(diagnostics: ApiStreamTransportDiagnostics, event: unknown): void {
+	const { type, response } = (typeof event === "object" && event !== null ? event : {}) as {
+		type?: unknown
+		response?: { id?: unknown }
+	}
+	diagnostics.eventCount++
+	diagnostics.lastEventAt = Date.now()
+	diagnostics.lastEventType = typeof type === "string" ? type : "unknown"
+	if (typeof response?.id === "string") {
+		diagnostics.responseId = response.id
+	}
+}
+
+function hasWithResponse(value: unknown): value is SdkRequestWithResponse {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as { withResponse?: unknown }).withResponse === "function"
+	)
+}
 
 /**
  * OpenAI Codex base URL for API requests
@@ -140,8 +185,6 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 	private lastResponseOutput: any[] | undefined
 	// Last top-level response id
 	private lastResponseId: string | undefined
-	// Abort controller for cancelling ongoing requests
-	private abortController?: AbortController
 	// Session ID for the Codex API (persists for the lifetime of the handler)
 	private readonly sessionId: string
 	// Response-local identities: item IDs and output indexes are not call IDs.
@@ -156,6 +199,12 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 	// accepted the request and its output is already with the caller. Neither transport may be
 	// replayed after that: doing so appends a second generation to the first.
 	private sawSdkEventInCurrentResponse = false
+	// Transport timing and identifiers for the most recent request; read only by stall diagnostics.
+	// Each request records into its own object, so a previous response still being drained for
+	// usage cannot count its events against the next request. The sequence also marks which
+	// request is the newest, the only one allowed to set the response id and output.
+	private transportDiagnostics: ApiStreamTransportDiagnostics | undefined
+	private transportRequestSequence = 0
 
 	// Event types handled by the shared event processor
 	private readonly coreHandledEventTypes = new Set<string>([
@@ -241,6 +290,9 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		metadata?: ApiHandlerCreateMessageMetadata,
 		abortSignal?: AbortSignal,
 	): ApiStream {
+		// Diagnostics only: times this handler's work before the request is sent.
+		const prep = { startedAt: Date.now(), accessTokenMs: 0 }
+
 		// Reset state for this request
 		this.lastResponseOutput = undefined
 		this.lastResponseId = undefined
@@ -253,6 +305,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 
 		// Get access token from OAuth manager
 		let accessToken = await openAiCodexOAuthManager.getAccessToken()
+		prep.accessTokenMs = Date.now() - prep.startedAt
 		if (!accessToken) {
 			throw new Error(
 				t("common:errors.openAiCodex.notAuthenticated", {
@@ -289,7 +342,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		// Make the request with retry on auth failure
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
-				yield* this.executeRequest(requestBody, model, accessToken, effectiveSessionId, abortSignal)
+				yield* this.executeRequest(requestBody, model, accessToken, effectiveSessionId, prep, abortSignal)
 				return
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error)
@@ -300,7 +353,9 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				// and append a second generation to output the caller already has.
 				if (attempt === 0 && isAuthFailure && !this.sawSdkEventInCurrentResponse) {
 					// Force refresh the token for retry
+					const refreshStartedAt = Date.now()
 					const refreshed = await openAiCodexOAuthManager.forceRefreshAccessToken()
+					prep.accessTokenMs += Date.now() - refreshStartedAt
 					if (!refreshed) {
 						throw new Error(
 							t("common:errors.openAiCodex.notAuthenticated", {
@@ -462,18 +517,29 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		model: OpenAiCodexModel,
 		accessToken: string,
 		effectiveSessionId: string,
+		prep: { startedAt: number; accessTokenMs: number },
 		abortSignal?: AbortSignal,
 	): ApiStream {
-		// Create AbortController for cancellation
-		this.abortController = new AbortController()
+		// One controller per request: a previous response still being drained for usage may overlap
+		// this one, and a shared controller let either request's cleanup break the other.
+		const abortController = new AbortController()
+		const requestStartedAt = Date.now()
+		const diagnostics: ApiStreamTransportDiagnostics = {
+			requestSequence: ++this.transportRequestSequence,
+			requestStartedAt,
+			prepareMs: requestStartedAt - prep.startedAt,
+			accessTokenMs: prep.accessTokenMs,
+			eventCount: 0,
+		}
+		this.transportDiagnostics = diagnostics
 
 		// A caller's signal has to be linked rather than used directly, since both transports below
-		// abort through `this.abortController`. Without this the signal never reaches the wire.
-		const abortFromCaller = () => this.abortController?.abort()
+		// abort through `abortController`. Without this the signal never reaches the wire.
+		const abortFromCaller = () => abortController.abort()
 
 		if (abortSignal) {
 			if (abortSignal.aborted) {
-				this.abortController.abort()
+				abortController.abort()
 			} else {
 				abortSignal.addEventListener("abort", abortFromCaller, { once: true })
 			}
@@ -484,7 +550,9 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 			// is consistent across providers.
 			try {
 				// Get ChatGPT account ID for organization subscriptions
+				const accountIdStartedAt = Date.now()
 				const accountId = await openAiCodexOAuthManager.getAccountId()
+				diagnostics.accountIdMs = Date.now() - accountIdStartedAt
 
 				// Build Codex-specific headers. Authorization is provided by the SDK apiKey.
 				const codexHeaders = this.buildCodexHeaders(model, effectiveSessionId, accountId)
@@ -499,11 +567,13 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 						timeout: this.timeoutMs,
 					})
 
-				const stream = (await (client as any).responses.create(requestBody, {
-					signal: this.abortController.signal,
+				diagnostics.transport = "sdk"
+				const created: unknown = (client as any).responses.create(requestBody, {
+					signal: abortController.signal,
 					// If the SDK supports per-request overrides, ensure headers are present.
 					headers: codexHeaders,
-				})) as AsyncIterable<any>
+				})
+				const stream = (await this.resolveSdkStream(created, diagnostics)) as AsyncIterable<any>
 
 				if (typeof (stream as any)?.[Symbol.asyncIterator] !== "function") {
 					throw new Error(
@@ -512,15 +582,16 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				}
 
 				for await (const event of stream) {
-					if (this.abortController.signal.aborted) {
+					if (abortController.signal.aborted) {
 						break
 					}
 
 					// Set before the event is processed, not after: `processEvent` also mutates
 					// response state, so a throw from it must not replay either.
 					this.sawSdkEventInCurrentResponse = true
+					recordTransportEvent(diagnostics, event)
 
-					for await (const outChunk of this.processEvent(event, model)) {
+					for await (const outChunk of this.processEvent(event, model, diagnostics)) {
 						if (outChunk.type === "text") {
 							this.sawTextOutputInCurrentResponse = true
 						}
@@ -535,17 +606,40 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				// A cancellation is not a transport failure either. Falling back would spend a
 				// second request on an already-aborted signal and report the cancellation as a
 				// connection error.
-				if (this.sawSdkEventInCurrentResponse || this.abortController?.signal.aborted) {
+				if (this.sawSdkEventInCurrentResponse || abortController.signal.aborted) {
 					throw sdkErr
 				}
 
 				// Fallback to manual SSE via fetch (Codex backend).
-				yield* this.makeCodexRequest(requestBody, model, accessToken, effectiveSessionId)
+				yield* this.makeCodexRequest(
+					requestBody,
+					model,
+					accessToken,
+					effectiveSessionId,
+					diagnostics,
+					abortController.signal,
+				)
 			}
 		} finally {
 			abortSignal?.removeEventListener("abort", abortFromCaller)
-			this.abortController = undefined
 		}
+	}
+
+	getStreamTransportDiagnostics(): Readonly<ApiStreamTransportDiagnostics> | undefined {
+		return this.transportDiagnostics && { ...this.transportDiagnostics }
+	}
+
+	/**
+	 * Awaits the SDK request, capturing request identifiers when the SDK exposes them.
+	 * Injected test clients return a plain iterable, which is passed through unchanged.
+	 */
+	private async resolveSdkStream(created: unknown, diagnostics: ApiStreamTransportDiagnostics): Promise<unknown> {
+		if (!hasWithResponse(created)) {
+			return await created
+		}
+		const { data, response, request_id } = await created.withResponse()
+		recordResponseHeaders(diagnostics, response?.headers, request_id)
+		return data
 	}
 
 	private formatFullConversation(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): any {
@@ -636,6 +730,8 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		model: OpenAiCodexModel,
 		accessToken: string,
 		effectiveSessionId: string,
+		diagnostics: ApiStreamTransportDiagnostics,
+		signal: AbortSignal,
 	): ApiStream {
 		// Per the implementation guide: route to Codex backend with Bearer token
 		const url = `${CODEX_API_BASE_URL}/responses`
@@ -650,13 +746,16 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 			Authorization: `Bearer ${accessToken}`,
 		}
 
+		diagnostics.transport = "sse"
+
 		try {
 			const response = await fetch(url, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(requestBody),
-				signal: this.abortController?.signal,
+				signal,
 			})
+			recordResponseHeaders(diagnostics, response.headers)
 
 			if (!response.ok) {
 				const errorText = await response.text()
@@ -715,7 +814,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				throw new Error(t("common:errors.openAiCodex.noResponseBody"))
 			}
 
-			yield* this.handleStreamResponse(response.body, model)
+			yield* this.handleStreamResponse(response.body, model, diagnostics, signal)
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error)
 			const apiError = new ApiProviderError(errorMessage, this.providerName, model.id, "createMessage")
@@ -731,7 +830,12 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		}
 	}
 
-	private async *handleStreamResponse(body: ReadableStream<Uint8Array>, model: OpenAiCodexModel): ApiStream {
+	private async *handleStreamResponse(
+		body: ReadableStream<Uint8Array>,
+		model: OpenAiCodexModel,
+		diagnostics: ApiStreamTransportDiagnostics,
+		signal: AbortSignal,
+	): ApiStream {
 		const reader = body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ""
@@ -739,11 +843,12 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 
 		try {
 			while (true) {
-				if (this.abortController?.signal.aborted) {
+				if (signal.aborted) {
 					break
 				}
 
 				const { done, value } = await reader.read()
+				diagnostics.lastReadAt = Date.now()
 				if (done) break
 
 				buffer += decoder.decode(value, { stream: true })
@@ -759,14 +864,10 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 
 						try {
 							const parsed = JSON.parse(data)
+							recordTransportEvent(diagnostics, parsed)
 
 							// Capture response metadata
-							if (parsed.response?.output && Array.isArray(parsed.response.output)) {
-								this.lastResponseOutput = parsed.response.output
-							}
-							if (parsed.response?.id) {
-								this.lastResponseId = parsed.response.id as string
-							}
+							this.captureResponseMetadata(parsed.response, diagnostics)
 
 							// Delegate standard event types
 							if (parsed?.type && this.coreHandledEventTypes.has(parsed.type)) {
@@ -782,7 +883,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 									hasContent = true
 								}
 
-								for await (const outChunk of this.processEvent(parsed, model)) {
+								for await (const outChunk of this.processEvent(parsed, model, diagnostics)) {
 									if (outChunk.type === "text" || outChunk.type === "reasoning") {
 										hasContent = true
 										if (outChunk.type === "text") {
@@ -905,12 +1006,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 									)
 								}
 							} else if (parsed.type === "response.completed" || parsed.type === "response.done") {
-								if (parsed.response?.output && Array.isArray(parsed.response.output)) {
-									this.lastResponseOutput = parsed.response.output
-								}
-								if (parsed.response?.id) {
-									this.lastResponseId = parsed.response.id as string
-								}
+								this.captureResponseMetadata(parsed.response, diagnostics)
 
 								if (
 									!hasContent &&
@@ -1020,13 +1116,33 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		return call
 	}
 
-	private async *processEvent(event: any, model: OpenAiCodexModel): ApiStream {
-		if (event?.response?.output && Array.isArray(event.response.output)) {
-			this.lastResponseOutput = event.response.output
+	/**
+	 * Only the newest request may set the response id and output. An older response that Task is
+	 * still draining for usage would otherwise overwrite them, and the next turn would send back
+	 * that response's id and encrypted reasoning.
+	 */
+	private captureResponseMetadata(
+		response: { id?: unknown; output?: unknown } | undefined,
+		request: ApiStreamTransportDiagnostics | undefined,
+	): void {
+		if (request && request.requestSequence !== this.transportRequestSequence) {
+			return
 		}
-		if (event?.response?.id) {
-			this.lastResponseId = event.response.id as string
+		if (Array.isArray(response?.output)) {
+			this.lastResponseOutput = response.output
 		}
+		if (typeof response?.id === "string" && response.id) {
+			this.lastResponseId = response.id
+		}
+	}
+
+	private async *processEvent(
+		event: any,
+		model: OpenAiCodexModel,
+		// Omitted by direct callers outside a request, which always own the response state.
+		request?: ApiStreamTransportDiagnostics,
+	): ApiStream {
+		this.captureResponseMetadata(event?.response, request)
 
 		// Handle text deltas
 		if (event?.type === "response.text.delta" || event?.type === "response.output_text.delta") {

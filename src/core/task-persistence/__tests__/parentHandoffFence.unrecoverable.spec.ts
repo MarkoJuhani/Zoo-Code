@@ -119,4 +119,31 @@ describe("ParentHandoffFence deadline classification", () => {
 		await replaced
 		expect(result).toMatchObject({ reason: "timeout", diagnostic: undefined })
 	})
+
+	it("a backward wall-clock step during the wait neither stretches it nor turns contention into unrecoverable", async () => {
+		// The same replacement as above, plus a 1.7 s backward Date.now() step (a WSL2 time resync seen
+		// in the field). Measured on the wall clock, the wait would run ~1.7 s past its deadline and
+		// observe the replacement for over 1 s.
+		const next = `${lock}.next-instance`
+		await fs.mkdir(next)
+		const wallClock = Date.now.bind(Date)
+		let stepBackMs = 0
+		vi.spyOn(Date, "now").mockImplementation(() => wallClock() - stepBackMs)
+		const stepped = delay(1_000).then(() => void (stepBackMs = 1_700))
+		const replaced = delay(1_500).then(() => fs.rename(next, lock))
+		const started = performance.now()
+
+		let result: Awaited<ReturnType<typeof outcome>>
+		let elapsedMs: number
+		try {
+			result = await outcome(2_000)
+			elapsedMs = performance.now() - started
+			await Promise.all([stepped, replaced])
+		} finally {
+			vi.mocked(Date.now).mockRestore()
+		}
+
+		expect(result).toMatchObject({ reason: "timeout", diagnostic: undefined })
+		expect(elapsedMs).toBeLessThan(3_000)
+	})
 })

@@ -162,6 +162,9 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 			// acquires it with zero wait. Await it here, outside every scope. A failed save is
 			// only logged by the task and does not block delegation.
 			await task.waitForAnsweredAskPersistence()
+			// The turn's background usage save holds the same fence and is not awaited by the
+			// request loop. Await the saves started so far, also outside every scope.
+			await task.waitForUsagePersistence()
 			if (task.abort || task.abandoned) {
 				return
 			}
